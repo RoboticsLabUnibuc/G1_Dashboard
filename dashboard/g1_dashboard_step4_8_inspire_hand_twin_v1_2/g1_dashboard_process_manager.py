@@ -29,7 +29,7 @@ CONTROLLER_BASENAME = (
     "dashboard_telemetry_v1_8.py"
 )
 MANAGER_SCHEMA = "g1_dashboard.controller_process.v1"
-MANAGER_VERSION = "g1_dashboard_process_manager.v1.2.1-finger-ramp-follow"
+MANAGER_VERSION = "g1_dashboard_process_manager.v1.2.2-camera-process-group"
 CONTROLLER_SHA256 = "1e5d92c3c460c4f652e22e8de00ae2305d444f3e4a2485dfa8cebbb68c2b8484"
 
 ACTION_REQUEST_SCHEMA = "g1_dashboard.action_request.v1"
@@ -137,6 +137,26 @@ def _process_alive(pid: int, expected_start_ticks: int | None = None) -> bool:
     return True
 
 
+def _proc_pgid(pid: int) -> int | None:
+    """Return a process-group id without treating worker children as conflicts."""
+    try:
+        return int(os.getpgid(int(pid)))
+    except (ProcessLookupError, PermissionError, OSError, ValueError):
+        return None
+
+
+def _group_pids_by_pgid(pids: list[int]) -> dict[int, list[int]]:
+    groups: dict[int, list[int]] = {}
+    for pid in sorted(set(int(p) for p in pids)):
+        pgid = _proc_pgid(pid)
+        # A process that vanished between /proc scans should not create a fake
+        # conflict group. The next status refresh will rescan it.
+        if pgid is None:
+            continue
+        groups.setdefault(pgid, []).append(pid)
+    return groups
+
+
 def _find_matching_pids(script_path: Path) -> list[int]:
     target = str(script_path.resolve())
     out: list[int] = []
@@ -218,6 +238,32 @@ def _camera_environment(executable: Path) -> dict[str, str]:
     env["CONDA_PREFIX"] = str(prefix)
     env["CONDA_DEFAULT_ENV"] = prefix.name
     return env
+
+
+def _camera_preflight(executable: Path, cwd: Path, env: dict[str, str]) -> str:
+    """Import the server in a fresh isolated interpreter before spawning it."""
+    python = executable.parent / "python"
+    if not (python.is_file() and os.access(python, os.X_OK)):
+        raise RuntimeError(f"teleimager Python is not executable: {python}")
+    try:
+        result = subprocess.run(
+            [str(python), "-c", "import teleimager.image_server; print('teleimager.image_server=OK')"],
+            cwd=str(cwd),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=10.0,
+            check=False,
+            text=True,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("teleimager dependency preflight timed out") from exc
+    output = (result.stdout or "").strip()
+    if result.returncode != 0:
+        tail = "\n".join(output.splitlines()[-12:]) if output else f"python exit {result.returncode}"
+        raise RuntimeError(f"teleimager dependency preflight failed:\n{tail}")
+    return output or "teleimager.image_server=OK"
 
 
 def default_controller_path() -> Path:
@@ -590,7 +636,8 @@ class ControllerProcessManager:
             if requested and not self._camera_managed.get("term_sent_unix_time_s"):
                 if time.time() - float(requested) >= 3.0:
                     try:
-                        os.killpg(pid, signal.SIGTERM)
+                        pgid = _proc_pgid(pid)
+                        os.killpg(pgid if pgid is not None else pid, signal.SIGTERM)
                         self._camera_managed["term_sent_unix_time_s"] = time.time()
                         self._save_camera_state()
                     except ProcessLookupError:
@@ -606,16 +653,25 @@ class ControllerProcessManager:
         with self._lock:
             self._refresh_camera()
             matching = _find_pids_by_basename(CAMERA_BASENAME)
+            groups = _group_pids_by_pgid(matching)
             managed_alive, managed_pid = self._camera_managed_alive()
-            external = [pid for pid in matching if pid != managed_pid]
+            managed_pgid = _proc_pgid(managed_pid) if managed_alive and managed_pid is not None else None
             now = time.time()
             executable_ok = self.camera_executable.is_file() and os.access(self.camera_executable, os.X_OK)
             cwd_ok = self.camera_cwd.is_dir()
             port_ready = _tcp_port_open("127.0.0.1", CAMERA_WEBRTC_PORT)
 
             if managed_alive and self._camera_managed is not None:
+                # teleimager uses multiprocessing and normally creates one or
+                # more worker processes with the same `teleimager-server`
+                # basename. Because the dashboard launches the server in a new
+                # session, every normal worker belongs to the managed process
+                # group. Only another process group is an external conflict.
+                managed_family = groups.get(managed_pgid, []) if managed_pgid is not None else [managed_pid]
+                external_groups = {pgid: pids for pgid, pids in groups.items() if pgid != managed_pgid}
+                external = sorted(pid for pids in external_groups.values() for pid in pids)
                 stop_requested = self._camera_managed.get("stop_requested_unix_time_s")
-                state = "STOPPING" if stop_requested else ("CONFLICT" if external else "RUNNING")
+                state = "STOPPING" if stop_requested else ("CONFLICT" if external_groups else "RUNNING")
                 launched = float(self._camera_managed.get("launched_unix_time_s", now))
                 return {
                     "schema": "g1_dashboard.camera_process.v1",
@@ -624,9 +680,12 @@ class ControllerProcessManager:
                     "state": state,
                     "managed": True,
                     "pid": managed_pid,
+                    "pgid": managed_pgid,
+                    "process_pids": managed_family,
                     "uptime_s": max(0.0, now - launched),
                     "stop_requested_unix_time_s": stop_requested,
                     "external_pids": external,
+                    "external_process_groups": {str(k): v for k, v in external_groups.items()},
                     "executable": str(self.camera_executable),
                     "cwd": str(self.camera_cwd),
                     "log_path": str(self.camera_log_path),
@@ -638,17 +697,22 @@ class ControllerProcessManager:
                     "can_stop": state == "RUNNING",
                 }
 
-            if matching:
-                state = "RUNNING_EXTERNAL" if len(matching) == 1 else "CONFLICT"
+            if groups:
+                external = sorted(pid for pids in groups.values() for pid in pids)
+                state = "RUNNING_EXTERNAL" if len(groups) == 1 else "CONFLICT"
+                only_pgid = next(iter(groups)) if len(groups) == 1 else None
                 return {
                     "schema": "g1_dashboard.camera_process.v1",
                     "manager_version": MANAGER_VERSION,
                     "enabled": self.enabled,
                     "state": state,
                     "managed": False,
-                    "pid": matching[0] if len(matching) == 1 else None,
+                    "pid": external[0] if len(groups) == 1 and external else None,
+                    "pgid": only_pgid,
+                    "process_pids": external if len(groups) == 1 else [],
                     "uptime_s": None,
-                    "external_pids": matching,
+                    "external_pids": external,
+                    "external_process_groups": {str(k): v for k, v in groups.items()},
                     "executable": str(self.camera_executable),
                     "cwd": str(self.camera_cwd),
                     "log_path": str(self.camera_log_path),
@@ -668,8 +732,11 @@ class ControllerProcessManager:
                 "state": "STOPPED" if ready else "UNAVAILABLE",
                 "managed": False,
                 "pid": None,
+                "pgid": None,
+                "process_pids": [],
                 "uptime_s": None,
                 "external_pids": [],
+                "external_process_groups": {},
                 "executable": str(self.camera_executable),
                 "cwd": str(self.camera_cwd),
                 "log_path": str(self.camera_log_path),
@@ -699,6 +766,11 @@ class ControllerProcessManager:
                 return self.camera_status()
 
             env = _camera_environment(self.camera_executable)
+            try:
+                preflight = _camera_preflight(self.camera_executable, self.camera_cwd, env)
+            except Exception as exc:
+                self._camera_last_error = str(exc)
+                raise
             self.camera_log_path.parent.mkdir(parents=True, exist_ok=True)
             log = open(self.camera_log_path, "ab", buffering=0)
             log.write(
@@ -706,6 +778,7 @@ class ControllerProcessManager:
                     f"\n===== dashboard camera launch {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n"
                     f"command: {self.camera_executable}\n"
                     "managed_env: teleimager conda prefix; PYTHONNOUSERSITE=1; PYTHONPATH/PYTHONHOME cleared\n"
+                    f"preflight: {preflight}\n"
                 ).encode("utf-8", "replace")
             )
             try:
@@ -732,6 +805,7 @@ class ControllerProcessManager:
                 time.sleep(0.005)
             self._camera_managed = {
                 "pid": proc.pid,
+                "pgid": _proc_pgid(proc.pid),
                 "start_ticks": ticks,
                 "launched_unix_time_s": time.time(),
                 "stop_requested_unix_time_s": None,
@@ -767,9 +841,11 @@ class ControllerProcessManager:
                 return self.camera_status()
             if self._camera_managed.get("stop_requested_unix_time_s"):
                 return self.camera_status()
-            # Validated manual shutdown is Ctrl+C, so use SIGINT for managed teleimager.
+            # Validated manual shutdown is Ctrl+C, so use SIGINT for the
+            # entire managed teleimager process group (parent + workers).
+            pgid = _proc_pgid(pid)
             try:
-                os.killpg(pid, signal.SIGINT)
+                os.killpg(pgid if pgid is not None else pid, signal.SIGINT)
             except ProcessLookupError:
                 pass
             self._camera_managed["stop_requested_unix_time_s"] = time.time()
