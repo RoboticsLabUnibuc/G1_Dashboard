@@ -56,16 +56,16 @@ PY
   BRIDGE_ARGS+=(--enable-process-actions)
 fi
 
-echo "G1 dashboard Step 5.0 — controller process manager"
+echo "G1 dashboard Step 5.1 — controller process + XR action manager"
 echo "  interface       : $IFACE"
 echo "  monitor python  : $MONITOR_PY"
 echo "  services        : $UNITREE_SERVICES (read-only)"
 echo "  base sensing    : $BASE_SENSING (read-only)"
 echo "  system rate     : ${SYSTEM_HZ} Hz"
 if ((${#BRIDGE_ARGS[@]})); then
-  echo "  process actions : ENABLED (V1.8 start/stop only)"
+  echo "  process actions : ENABLED (start/stop + controller-validated XR actions)"
   echo "  management key  : $G1_DASHBOARD_ACTION_TOKEN"
-  echo "                     paste this key into the Start listener window"
+  echo "                     the site will prompt for this key on first open"
 else
   echo "  process actions : DISABLED"
 fi
@@ -83,7 +83,7 @@ sleep 0.25
 
 echo "System monitor pid: $MONITOR_PID"
 echo "Starting dashboard bridge. Ctrl+C stops dashboard processes only."
-echo "A V1.8 controller launched from the dashboard is intentionally left running."
+echo "A controller launched from the dashboard is intentionally left running."
 echo
 
 "$BRIDGE_PY" "$HERE/g1_dashboard_bridge.py" "${BRIDGE_ARGS[@]}" &

@@ -13,6 +13,9 @@ import json
 import math
 import os
 import signal
+import secrets
+import socket
+import uuid
 import subprocess
 import sys
 import threading
@@ -25,8 +28,14 @@ CONTROLLER_BASENAME = (
     "dashboard_telemetry_v1_8.py"
 )
 MANAGER_SCHEMA = "g1_dashboard.controller_process.v1"
-MANAGER_VERSION = "g1_dashboard_process_manager.v1.0.1-usersite-isolation"
-CONTROLLER_SHA256 = "6c9ca356f00c80f953dae50dcca89d4a17215c3b243938c76b906912bbe44921"
+MANAGER_VERSION = "g1_dashboard_process_manager.v1.1-step5-1-xr-actions"
+CONTROLLER_SHA256 = "66bb5c0bd99e1c034426c2395e46229a54d1f690fe607ed2f513c233e50fa758"
+
+ACTION_REQUEST_SCHEMA = "g1_dashboard.action_request.v1"
+ACTION_RESPONSE_SCHEMA = "g1_dashboard.action_response.v1"
+ACTION_HOST = "127.0.0.1"
+ACTION_PORT = 8767
+ACTION_OPERATIONS = {"REQUEST_XR", "CANCEL_XR_REQUEST", "HAND_BACK_ARMS"}
 
 # These defaults exactly match the last validated V1.8 launch command.
 # Min/max values are dashboard edit bounds only. They are not robot safety
@@ -369,6 +378,12 @@ class ControllerProcessManager:
             "known_good": {spec["name"]: spec["default"] for spec in PARAMETER_SPECS},
             "dashboard_edit_bounds_are_safety_limits": False,
             "management_key_required": True,
+            "xr_action_channel": {
+                "transport": f"udp://{ACTION_HOST}:{ACTION_PORT}",
+                "loopback_only": True,
+                "controller_validated": True,
+                "operations": sorted(ACTION_OPERATIONS),
+            },
             "log_path": str(self.log_path),
         }
 
@@ -423,6 +438,7 @@ class ControllerProcessManager:
                     "external_pids": external,
                     "can_start": False,
                     "can_stop": True,
+                    "can_request_action": bool(self._managed.get("action_token")) and not bool(stop_requested),
                 }
 
             if matching:
@@ -444,6 +460,7 @@ class ControllerProcessManager:
                     "external_pids": matching,
                     "can_start": False,
                     "can_stop": False,
+                    "can_request_action": False,
                 }
 
             script_hash = _sha256_file(self.script_path) if self.script_path.is_file() else None
@@ -472,6 +489,7 @@ class ControllerProcessManager:
                 "external_pids": [],
                 "can_start": ready,
                 "can_stop": False,
+                "can_request_action": False,
             }
 
     def start(self, parameters: Any) -> dict[str, Any]:
@@ -495,6 +513,9 @@ class ControllerProcessManager:
 
             cmd, params = self.build_command(parameters)
             env = _controller_environment(self.python_path)
+            controller_action_token = secrets.token_urlsafe(24)
+            env["G1_DASHBOARD_MANAGED"] = "1"
+            env["G1_DASHBOARD_ACTION_TOKEN"] = controller_action_token
             preflight = _controller_python_preflight(
                 self.python_path, env, self.script_path.parent
             )
@@ -504,7 +525,7 @@ class ControllerProcessManager:
             banner = (
                 f"\n===== dashboard launch {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n"
                 f"command: {' '.join(cmd)}\n"
-                "managed_env: PYTHONNOUSERSITE=1; PYTHONPATH/PYTHONHOME cleared\n"
+                "managed_env: PYTHONNOUSERSITE=1; PYTHONPATH/PYTHONHOME cleared; keyboard disabled; loopback XR actions enabled\n"
                 f"preflight:\n{preflight}\n"
             ).encode("utf-8", "replace")
             log.write(banner)
@@ -538,6 +559,7 @@ class ControllerProcessManager:
                 "parameters": params,
                 "command": cmd,
                 "stop_requested_unix_time_s": None,
+                "action_token": controller_action_token,
             }
             self._last_error = None
             self._last_exit_code = None
@@ -552,6 +574,62 @@ class ControllerProcessManager:
                 self._save_state()
                 raise RuntimeError(f"controller exited immediately with code {rc}; inspect {self.log_path}")
             return self.status()
+
+    def request_xr_action(self, operation: str) -> dict[str, Any]:
+        """Request one controller-owned transition; never touches DDS itself."""
+        operation = str(operation).strip()
+        if operation not in ACTION_OPERATIONS:
+            raise ValueError(f"unsupported XR action {operation!r}")
+
+        with self._lock:
+            if not self.enabled:
+                raise PermissionError("controller process actions are disabled")
+            self._refresh()
+            alive, pid = self._managed_alive()
+            if not alive or pid is None or self._managed is None:
+                raise RuntimeError("dashboard-managed controller is not running")
+            if self._managed.get("stop_requested_unix_time_s"):
+                raise RuntimeError("controller stop/handback is already pending")
+            token = str(self._managed.get("action_token", ""))
+            if len(token) < 16:
+                raise RuntimeError(
+                    "running controller predates the Step 5.1 action token; restart it from this dashboard"
+                )
+
+        request_id = uuid.uuid4().hex
+        payload = {
+            "schema": ACTION_REQUEST_SCHEMA,
+            "request_id": request_id,
+            "operation": operation,
+            "token": token,
+        }
+        encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.bind((ACTION_HOST, 0))
+            sock.settimeout(0.8)
+            sock.sendto(encoded, (ACTION_HOST, ACTION_PORT))
+            raw, address = sock.recvfrom(4096)
+        except socket.timeout as exc:
+            raise RuntimeError(
+                "controller action channel did not respond; confirm the managed controller reached startup"
+            ) from exc
+        finally:
+            sock.close()
+
+        if address[0] != ACTION_HOST:
+            raise RuntimeError("controller action response was not loopback")
+        try:
+            response = json.loads(raw.decode("utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"invalid controller action response: {exc}") from exc
+        if not isinstance(response, dict):
+            raise RuntimeError("invalid controller action response object")
+        if response.get("schema") != ACTION_RESPONSE_SCHEMA:
+            raise RuntimeError("controller action response schema mismatch")
+        if response.get("request_id") != request_id:
+            raise RuntimeError("controller action response request_id mismatch")
+        return response
 
     def stop(self) -> dict[str, Any]:
         with self._lock:

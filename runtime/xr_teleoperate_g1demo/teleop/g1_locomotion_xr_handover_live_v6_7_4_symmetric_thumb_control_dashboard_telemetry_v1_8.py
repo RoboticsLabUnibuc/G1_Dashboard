@@ -61,8 +61,9 @@ Safety model
   hands are hidden. Therefore, hand hiding is NOT treated as a guaranteed
   emergency-stop mechanism.
 - ``c`` is a mode/handover command, not an emergency stop.
-- Dashboard V1.8 exports read-only action readiness for that same ``c`` policy;
-  it does not accept browser action requests or create a new command endpoint.
+- Dashboard Step 5.1 can accept authenticated loopback action requests for the same
+  ``c`` policy. The controller re-validates the current state/readiness before it
+  sets the exact internal toggle request used by the keyboard path.
 - The R3 operator must retain immediate access to the robot's verified damping
   or emergency-stop procedure.
 
@@ -84,6 +85,8 @@ import json
 import logging
 import math
 import multiprocessing as mp
+import queue
+import secrets
 import os
 import signal
 import socket
@@ -1688,7 +1691,12 @@ class SynchronizedDiagnostics:
 
 
 DASHBOARD_TELEMETRY_SCHEMA = "g1_dashboard.telemetry.v1"
-DASHBOARD_CONTROLLER_VERSION = "V6.7.4_SYMMETRIC_THUMB_CONTROL_DASHBOARD_V1.8_ACTION_READINESS"
+DASHBOARD_CONTROLLER_VERSION = "V6.7.4_SYMMETRIC_THUMB_CONTROL_DASHBOARD_STEP5_1_ACTION_REQUESTS"
+DASHBOARD_ACTION_SCHEMA = "g1_dashboard.action_request.v1"
+DASHBOARD_ACTION_RESPONSE_SCHEMA = "g1_dashboard.action_response.v1"
+DASHBOARD_ACTION_HOST = "127.0.0.1"
+DASHBOARD_ACTION_PORT = 8767
+DASHBOARD_ACTION_TOKEN_ENV = "G1_DASHBOARD_ACTION_TOKEN"
 
 
 def _telemetry_float(value: object) -> Optional[float]:
@@ -1807,14 +1815,14 @@ def evaluate_dashboard_action_readiness(
     tracking_hold_reason: str,
     shutdown_after_release: bool,
     args: argparse.Namespace,
+    request_channel_enabled: bool = False,
 ) -> dict[str, object]:
     """Describe the *existing* c-toggle transition without executing it.
 
-    V1.8 intentionally adds no browser command channel.  This function is the
-    single controller-side policy description that the future request handler
-    will reuse before it is allowed to set the same internal toggle request as
-    the keyboard ``c`` path.  Keeping readiness in the controller prevents the
-    browser from inventing robot-state rules.
+    This is the controller-side policy used by both observability and Step 5.1
+    action requests. A loopback request is accepted only when its requested
+    operation matches this function's current operation and ``available`` is
+    true; acceptance then sets the same internal toggle request as keyboard ``c``.
     """
     lowstate_ok = bool(
         lowstate is not None
@@ -1873,9 +1881,7 @@ def evaluate_dashboard_action_readiness(
 
     return {
         "schema": "g1_dashboard.action_readiness.v1",
-        # Deliberately false in V1.8.  Step 5 will add the authenticated/local
-        # request path; until then this is observability only.
-        "request_channel_enabled": False,
+        "request_channel_enabled": bool(request_channel_enabled),
         "xr_handover": {
             "available": bool(available),
             "operation": operation,
@@ -1924,6 +1930,7 @@ def build_dashboard_telemetry_snapshot(
     tracking_hold_stable_count: int,
     safety_fault_reason: str,
     shutdown_after_release: bool,
+    dashboard_action_channel_enabled: bool,
     args: argparse.Namespace,
 ) -> dict[str, object]:
     """Build the dashboard's read-only, JSON-safe telemetry packet.
@@ -2011,6 +2018,7 @@ def build_dashboard_telemetry_snapshot(
         tracking_hold_reason=tracking_hold_reason,
         shutdown_after_release=shutdown_after_release,
         args=args,
+        request_channel_enabled=dashboard_action_channel_enabled,
     )
 
     return {
@@ -2234,6 +2242,187 @@ def build_dashboard_telemetry_snapshot(
             "display_fps": _telemetry_float(args.display_fps),
         },
     }
+
+
+@dataclass
+class DashboardActionRequest:
+    request_id: str
+    operation: str
+    address: tuple[str, int]
+    received_monotonic: float
+
+
+class DashboardActionRequestServer:
+    """Authenticated loopback-only request queue for controller-owned actions.
+
+    The socket thread never mutates robot/controller state. It only validates the
+    transport envelope and queues a request. The main controller loop performs
+    the state/readiness validation and, when accepted, sets the same internal
+    TOGGLE_REQUESTED flag used by keyboard ``c``.
+    """
+
+    ALLOWED_OPERATIONS = {
+        "REQUEST_XR",
+        "CANCEL_XR_REQUEST",
+        "HAND_BACK_ARMS",
+    }
+
+    def __init__(self, token: str, host: str = DASHBOARD_ACTION_HOST, port: int = DASHBOARD_ACTION_PORT) -> None:
+        self.host = str(host)
+        self.port = int(port)
+        self._token = str(token)
+        self.enabled = len(self._token) >= 16
+        self._queue: queue.Queue[DashboardActionRequest] = queue.Queue(maxsize=16)
+        self._stop = threading.Event()
+        self._socket: Optional[socket.socket] = None
+        self._thread: Optional[threading.Thread] = None
+        self._recent_ids: dict[str, float] = {}
+        self._recent_lock = threading.Lock()
+
+        if not self.enabled:
+            return
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((self.host, self.port))
+        sock.settimeout(0.25)
+        self._socket = sock
+        self._thread = threading.Thread(
+            target=self._recv_loop,
+            name="g1-dashboard-action-loopback",
+            daemon=True,
+        )
+        self._thread.start()
+
+    @classmethod
+    def from_environment(cls) -> "DashboardActionRequestServer":
+        token = os.environ.get(DASHBOARD_ACTION_TOKEN_ENV, "").strip()
+        return cls(token=token)
+
+    def _send_payload(self, address: tuple[str, int], payload: dict[str, object]) -> None:
+        sock = self._socket
+        if sock is None:
+            return
+        try:
+            sock.sendto(
+                json.dumps(payload, separators=(",", ":"), allow_nan=False).encode("utf-8"),
+                address,
+            )
+        except Exception as exc:
+            LOG.warning("Dashboard action response send failed: %s", exc)
+
+    def _transport_reject(self, address: tuple[str, int], request_id: str, reason: str) -> None:
+        self._send_payload(address, {
+            "schema": DASHBOARD_ACTION_RESPONSE_SCHEMA,
+            "request_id": request_id or None,
+            "status": "REJECTED",
+            "reason": reason,
+        })
+
+    def _remember_request_id(self, request_id: str) -> bool:
+        now = time.monotonic()
+        with self._recent_lock:
+            self._recent_ids = {
+                rid: ts for rid, ts in self._recent_ids.items()
+                if now - ts <= 30.0
+            }
+            if request_id in self._recent_ids:
+                return False
+            self._recent_ids[request_id] = now
+            return True
+
+    def _recv_loop(self) -> None:
+        sock = self._socket
+        if sock is None:
+            return
+        while not self._stop.is_set():
+            try:
+                raw, address = sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            except Exception as exc:
+                LOG.warning("Dashboard action receive failed: %s", exc)
+                continue
+
+            if address[0] not in ("127.0.0.1", "::1"):
+                continue
+
+            request_id = ""
+            try:
+                data = json.loads(raw.decode("utf-8"))
+                if not isinstance(data, dict):
+                    raise ValueError("request must be a JSON object")
+                request_id = str(data.get("request_id", "")).strip()
+                if data.get("schema") != DASHBOARD_ACTION_SCHEMA:
+                    raise ValueError("invalid action request schema")
+                token = str(data.get("token", ""))
+                if not secrets.compare_digest(token, self._token):
+                    raise PermissionError("invalid controller action token")
+                operation = str(data.get("operation", "")).strip()
+                if operation not in self.ALLOWED_OPERATIONS:
+                    raise ValueError(f"unsupported operation {operation!r}")
+                if not request_id or len(request_id) > 96:
+                    raise ValueError("request_id must be 1..96 characters")
+                if not self._remember_request_id(request_id):
+                    raise ValueError("duplicate request_id")
+                req = DashboardActionRequest(
+                    request_id=request_id,
+                    operation=operation,
+                    address=(address[0], int(address[1])),
+                    received_monotonic=time.monotonic(),
+                )
+                try:
+                    self._queue.put_nowait(req)
+                except queue.Full:
+                    self._transport_reject(req.address, request_id, "controller action queue is full")
+            except PermissionError as exc:
+                self._transport_reject((address[0], int(address[1])), request_id, str(exc))
+            except Exception as exc:
+                self._transport_reject((address[0], int(address[1])), request_id, str(exc))
+
+    def pending(self, max_items: int = 4) -> list[DashboardActionRequest]:
+        out: list[DashboardActionRequest] = []
+        for _ in range(max(1, int(max_items))):
+            try:
+                out.append(self._queue.get_nowait())
+            except queue.Empty:
+                break
+        return out
+
+    def respond(
+        self,
+        req: DashboardActionRequest,
+        *,
+        status: str,
+        state: State,
+        reason: str,
+        would_enter_state: Optional[str] = None,
+    ) -> None:
+        self._send_payload(req.address, {
+            "schema": DASHBOARD_ACTION_RESPONSE_SCHEMA,
+            "request_id": req.request_id,
+            "status": str(status),
+            "operation": req.operation,
+            "controller_state": state.name,
+            "would_enter_state": would_enter_state,
+            "reason": str(reason),
+            "unix_time_s": time.time(),
+        })
+
+    def close(self) -> None:
+        self._stop.set()
+        sock = self._socket
+        self._socket = None
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        self.enabled = False
 
 
 class DashboardTelemetryPublisher:
@@ -4581,6 +4770,7 @@ def main() -> int:
     finger_ctrl: Optional[FingerController] = None
     diagnostics: Optional[SynchronizedDiagnostics] = None
     dashboard_telemetry: Optional[DashboardTelemetryPublisher] = None
+    dashboard_actions: Optional[DashboardActionRequestServer] = None
 
     graceful_release_completed = False
 
@@ -4623,20 +4813,37 @@ def main() -> int:
                 "network interface"
             )
 
-        keyboard_thread = threading.Thread(
-            target=listen_keyboard,
-            kwargs={
-                "on_press": keyboard_press,
-                "until": None,
-                "sequential": False,
-            },
-            daemon=True,
-        )
-        keyboard_thread.start()
+        dashboard_actions = DashboardActionRequestServer.from_environment()
+        if dashboard_actions.enabled:
+            LOG.info(
+                "Dashboard XR action channel ENABLED on udp://%s:%d (loopback only).",
+                DASHBOARD_ACTION_HOST,
+                DASHBOARD_ACTION_PORT,
+            )
+        else:
+            LOG.info(
+                "Dashboard XR action channel disabled: %s is not present/valid.",
+                DASHBOARD_ACTION_TOKEN_ENV,
+            )
+
+        managed_mode = os.environ.get("G1_DASHBOARD_MANAGED", "").strip() == "1"
+        if managed_mode:
+            LOG.info("Dashboard-managed process: terminal keyboard listener disabled.")
+        else:
+            keyboard_thread = threading.Thread(
+                target=listen_keyboard,
+                kwargs={
+                    "on_press": keyboard_press,
+                    "until": None,
+                    "sequential": False,
+                },
+                daemon=True,
+            )
+            keyboard_thread.start()
 
         LOG.info("G1_LOCOMOTION_XR_HANDOVER_LIVE_V6_7_4_SYMMETRIC_THUMB_CONTROL")
         LOG.info(
-            "Dashboard telemetry V1.8: V1.7 direct-callback LowState + read-only action readiness; "
+            "Dashboard Step 5.1: V1.7 direct-callback LowState + controller-owned XR action requests; "
             "isolated direct-callback latest-only LowState acquisition enabled."
         )
         LOG.warning(
@@ -5006,6 +5213,76 @@ def main() -> int:
                     arm_ctrl.set_weight(0.0)
                     graceful_release_completed = True
                     break
+
+            # Step 5.1: consume authenticated loopback requests in the MAIN
+            # controller loop. The socket thread never changes controller state.
+            if dashboard_actions is not None and dashboard_actions.enabled:
+                for action_req in dashboard_actions.pending():
+                    readiness = evaluate_dashboard_action_readiness(
+                        state=state,
+                        xr_valid=xr_valid,
+                        xr_reason=xr_reason,
+                        lowstate=lowstate,
+                        lowstate_age=lowstate_age,
+                        gate_instant=gate_instant,
+                        gate_ready=gate_ready,
+                        gate_elapsed=gate_elapsed,
+                        safety_fault_reason=safety_fault_reason,
+                        tracking_hold_reason=tracking_hold_reason,
+                        shutdown_after_release=shutdown_after_release,
+                        args=args,
+                        request_channel_enabled=True,
+                    )
+                    handover = readiness.get("xr_handover", {})
+                    expected_operation = str(handover.get("operation", "NONE"))
+                    available = bool(handover.get("available", False))
+                    would_enter = handover.get("would_enter_state")
+                    reason = str(handover.get("reason", "Action unavailable."))
+
+                    if TOGGLE_REQUESTED:
+                        dashboard_actions.respond(
+                            action_req,
+                            status="REJECTED",
+                            state=state,
+                            reason="another controller toggle request is already pending",
+                            would_enter_state=(str(would_enter) if would_enter else None),
+                        )
+                    elif not available:
+                        dashboard_actions.respond(
+                            action_req,
+                            status="REJECTED",
+                            state=state,
+                            reason=reason,
+                            would_enter_state=(str(would_enter) if would_enter else None),
+                        )
+                    elif action_req.operation != expected_operation:
+                        dashboard_actions.respond(
+                            action_req,
+                            status="REJECTED",
+                            state=state,
+                            reason=(
+                                f"state changed before request execution; expected "
+                                f"{expected_operation}, received {action_req.operation}"
+                            ),
+                            would_enter_state=(str(would_enter) if would_enter else None),
+                        )
+                    else:
+                        # This is deliberately the SAME internal request consumed by
+                        # the existing keyboard-c state transition block below.
+                        TOGGLE_REQUESTED = True
+                        dashboard_actions.respond(
+                            action_req,
+                            status="ACCEPTED",
+                            state=state,
+                            reason=reason,
+                            would_enter_state=(str(would_enter) if would_enter else None),
+                        )
+                        LOG.info(
+                            "Dashboard action accepted: %s request_id=%s state=%s.",
+                            action_req.operation,
+                            action_req.request_id,
+                            state.name,
+                        )
 
             # A normal q/Ctrl+C requests the same controlled handback as c.
             if QUIT_REQUESTED:
@@ -5925,6 +6202,9 @@ def main() -> int:
                     tracking_hold_stable_count=tracking_hold_stable_count,
                     safety_fault_reason=safety_fault_reason,
                     shutdown_after_release=shutdown_after_release,
+                    dashboard_action_channel_enabled=bool(
+                        dashboard_actions is not None and dashboard_actions.enabled
+                    ),
                     args=args,
                 )
                 dashboard_telemetry.publish(now, telemetry_packet)
@@ -6327,6 +6607,13 @@ def main() -> int:
                 LOG.info("Diagnostic CSV closed: %s", diagnostics.path)
             except Exception as exc:
                 LOG.error("Diagnostic CSV close failed: %s", exc)
+
+        if dashboard_actions is not None:
+            try:
+                dashboard_actions.close()
+                LOG.info("Dashboard XR action channel stopped.")
+            except Exception as exc:
+                LOG.warning("Dashboard XR action channel close failed: %s", exc)
 
         if keyboard_thread is not None and keyboard_thread.is_alive():
             keyboard_thread.join(timeout=1.0)

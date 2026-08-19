@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>G1 Teleop Control Center</title>
   <link rel="icon" href="data:," />
-  <link rel="stylesheet" href="/static/styles.css?v=step5-0-v1" />
+  <link rel="stylesheet" href="/static/styles.css?v=step5-1-auth1" />
 </head>
 <body>
   <header class="topbar">
@@ -197,6 +197,10 @@
               <span id="actionCondXr">XR —</span>
               <span id="actionCondStop">STOP —</span>
               <span id="actionCondFault">FAULT —</span>
+            </div>
+            <div class="xr-action-row">
+              <button id="xrActionBtn" class="primary-btn xr-action-btn" disabled>ENTER TELEOP</button>
+              <span id="xrActionResult" class="xr-action-result">Controller request channel not ready.</span>
             </div>
           </section>
 
@@ -409,7 +413,7 @@
             <div><span>Would enter</span><strong id="statusActionNextState">—</strong></div>
             <div><span>Request channel</span><strong id="statusActionChannel">DISABLED</strong></div>
           </div>
-          <div id="statusActionReason" class="status-action-reason">Controller V1.8 action-readiness telemetry required.</div>
+          <div id="statusActionReason" class="status-action-reason">Controller action-readiness telemetry required.</div>
         </section>
 
         <section class="panel events-panel-full">
@@ -420,13 +424,37 @@
     </section>
   </main>
 
+  <div id="managementKeyModal" class="modal-backdrop hidden" role="presentation">
+    <section class="management-key-modal" role="dialog" aria-modal="true" aria-labelledby="managementKeyTitle">
+      <div class="controller-modal-head">
+        <div>
+          <div class="panel-kicker">DASHBOARD INTERACTIONS</div>
+          <h2 id="managementKeyTitle">Management access</h2>
+          <p>Enter the management key printed by the currently running <strong>./start_dashboard.sh</strong>. The key is required for listener start/stop and ENTER/EXIT TELEOP. Monitoring remains read-only without it.</p>
+        </div>
+      </div>
+
+      <label class="management-key-field">
+        <span>Management key</span>
+        <input id="managementKeyInput" type="password" autocomplete="off" placeholder="Paste current dashboard management key" />
+      </label>
+      <div class="management-key-note">A saved key is verified against the current dashboard on every page load, so restarting the dashboard automatically requires the new key.</div>
+      <div id="managementKeyError" class="controller-modal-error hidden"></div>
+
+      <div class="management-key-actions">
+        <button id="managementKeyReadOnlyBtn" class="ghost-btn">Continue read-only</button>
+        <button id="managementKeySubmitBtn" class="primary-btn">Unlock interactions</button>
+      </div>
+    </section>
+  </div>
+
   <div id="controllerModal" class="modal-backdrop hidden" role="presentation">
     <section class="controller-modal" role="dialog" aria-modal="true" aria-labelledby="controllerModalTitle">
       <div class="controller-modal-head">
         <div>
-          <div class="panel-kicker">STEP 5.0 · PROCESS CONTROL</div>
+          <div class="panel-kicker">STEP 5.1 · PROCESS + XR CONTROL</div>
           <h2 id="controllerModalTitle">Start teleop listener</h2>
-          <p>Starts the exact whitelisted V1.8 controller. This does <strong>not</strong> enter XR arm control; the controller still starts in its normal locomotion-ready state.</p>
+          <p>Starts the exact whitelisted controller. It starts in locomotion-ready state; use <strong>ENTER TELEOP</strong> in Action Readiness after startup.</p>
         </div>
         <button id="controllerModalCloseBtn" class="icon-btn" aria-label="Close">×</button>
       </div>
@@ -469,6 +497,6 @@
     </section>
   </div>
 
-  <script type="module" src="/static/app.js?v=step5-0-v1"></script>
+  <script type="module" src="/static/app.js?v=step5-1-auth1"></script>
 </body>
 </html>

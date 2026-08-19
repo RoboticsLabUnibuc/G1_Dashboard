@@ -37,11 +37,71 @@ document.querySelectorAll('.tab').forEach(b=>b.addEventListener('click',()=>swit
 document.querySelectorAll('[data-view-jump]').forEach(b=>b.addEventListener('click',()=>switchView(b.dataset.viewJump)));
 $('faultDetailsBtn').addEventListener('click',()=>switchView('status'));
 
-/* ---------- Step 5.0 controller process manager ---------- */
+/* ---------- Step 5.1 controller process + XR action manager ---------- */
 let controllerConfig=null;
 let controllerStatus=null;
 let controllerPollBusy=false;
 let controllerActionBusy=false;
+let xrActionBusy=false;
+let latestActionReadiness=null;
+let managementAuthBusy=false;
+let managementAfterAuth=null;
+
+function currentManagementKey(){
+  return sessionStorage.getItem('g1ManagementKey')||'';
+}
+function storeManagementKey(key){
+  const value=String(key||'').trim();
+  if(value)sessionStorage.setItem('g1ManagementKey',value);
+  else sessionStorage.removeItem('g1ManagementKey');
+  if($('managementKeyInput'))$('managementKeyInput').value=value;
+  if($('controllerManagementKey'))$('controllerManagementKey').value=value;
+}
+function setManagementKeyError(message){
+  const el=$('managementKeyError'); if(!el)return;
+  if(!message){el.textContent='';el.classList.add('hidden');return;}
+  el.textContent=message;el.classList.remove('hidden');
+}
+function showManagementKeyPrompt(message='',afterAuth=null){
+  managementAfterAuth=typeof afterAuth==='function'?afterAuth:null;
+  setManagementKeyError(message);
+  $('managementKeyInput').value=currentManagementKey();
+  $('managementKeyModal').classList.remove('hidden');
+  document.body.classList.add('modal-open');
+  setTimeout(()=>$('managementKeyInput').focus(),0);
+}
+function closeManagementKeyPrompt(){
+  $('managementKeyModal').classList.add('hidden');
+  if($('controllerModal').classList.contains('hidden'))document.body.classList.remove('modal-open');
+  managementAfterAuth=null;
+}
+async function verifyManagementKey(key){
+  const value=String(key||'').trim();
+  if(!value)throw new Error('Paste the management key printed by the current ./start_dashboard.sh.');
+  const r=await fetch('/api/controller/auth',{
+    method:'POST',
+    headers:{'Content-Type':'application/json','X-G1-Management-Key':value},
+    body:'{}',
+    cache:'no-store'
+  });
+  let body={};try{body=await r.json();}catch{}
+  if(!r.ok)throw new Error(body.error||`HTTP ${r.status}`);
+  return body;
+}
+async function bootstrapManagementKey(){
+  try{
+    const cfg=await loadControllerConfig();
+    if(!cfg?.enabled||!cfg?.management_key_required)return;
+    const saved=currentManagementKey();
+    if(saved){
+      try{await verifyManagementKey(saved);return;}
+      catch{storeManagementKey('');showManagementKeyPrompt('The saved management key is no longer valid. The dashboard may have restarted; enter the new key printed by ./start_dashboard.sh.');return;}
+    }
+    showManagementKeyPrompt('Enter the current management key to enable Start/Stop and ENTER/EXIT TELEOP controls.');
+  }catch(err){
+    console.debug('management-key bootstrap unavailable',err);
+  }
+}
 
 function controllerStateTone(state){
   if(state==='RUNNING') return 'good';
@@ -63,10 +123,10 @@ function renderControllerProcess(st){
   $('controllerProcessPid').textContent=pid?`pid ${pid}`:'pid —';
   $('controllerProcessUptime').textContent=finite(controllerStatus.uptime_s)?`uptime ${duration(controllerStatus.uptime_s)}`:'uptime —';
   let detail='Process manager unavailable.';
-  if(state==='STOPPED') detail='Ready to launch the whitelisted V1.8 listener.';
-  else if(state==='RUNNING') detail='Dashboard-managed V1.8 listener is running. XR entry remains a separate action.';
-  else if(state==='STOPPING') detail='Controlled stop requested; waiting for V1.8 handback and cleanup.';
-  else if(state==='RUNNING_EXTERNAL') detail='V1.8 is already running outside this dashboard. Start/stop is locked here.';
+  if(state==='STOPPED') detail='Ready to launch the whitelisted teleop listener.';
+  else if(state==='RUNNING') detail='Dashboard-managed listener is running. Use ENTER TELEOP below when controller readiness allows it.';
+  else if(state==='STOPPING') detail='Controlled stop requested; waiting for controller handback and cleanup.';
+  else if(state==='RUNNING_EXTERNAL') detail='Teleop listener is already running outside this dashboard. Lifecycle and XR actions are locked here.';
   else if(controllerStatus.last_error) detail=controllerStatus.last_error;
   else if(controllerStatus.enabled===false) detail='Process actions disabled by dashboard startup configuration.';
   $('controllerProcessDetail').textContent=detail;
@@ -181,34 +241,85 @@ async function openControllerModal(){
   setControllerModalError('');
   $('controllerModal').classList.remove('hidden');
   document.body.classList.add('modal-open');
-  $('controllerManagementKey').value=sessionStorage.getItem('g1ManagementKey')||'';
+  $('controllerManagementKey').value=currentManagementKey();
   $('controllerSafetyAck').checked=false;
   try{
     const cfg=await loadControllerConfig();
     buildControllerModal(cfg);
     if(!cfg.enabled)setControllerModalError('Process actions are disabled. Restart the dashboard with G1_DASHBOARD_PROCESS_ACTIONS=1.');
     else if(!cfg.controller_script_exists)setControllerModalError(`Controller script not found: ${cfg.controller_script}`);
-    else if(!cfg.controller_hash_match)setControllerModalError(`Controller V1.8 hash mismatch. Expected ${cfg.controller_expected_sha256}; got ${cfg.controller_actual_sha256||'unreadable'}. Launch is locked.`);
+    else if(!cfg.controller_hash_match)setControllerModalError(`Controller hash mismatch. Expected ${cfg.controller_expected_sha256}; got ${cfg.controller_actual_sha256||'unreadable'}. Launch is locked.`);
     else if(!cfg.controller_python_exists)setControllerModalError(`Controller Python not executable: ${cfg.controller_python}`);
     updateControllerStartEnabled();
   }catch(err){setControllerModalError(String(err));$('controllerStartBtn').disabled=true;}
 }
 function closeControllerModal(){ $('controllerModal').classList.add('hidden'); document.body.classList.remove('modal-open'); }
 async function controllerPost(path,payload={}){
-  const key=$('controllerManagementKey')?.value||sessionStorage.getItem('g1ManagementKey')||'';
-  if(!key)throw new Error('Paste the management key printed by ./start_dashboard.sh.');
+  const key=String($('controllerManagementKey')?.value||currentManagementKey()||'').trim();
+  if(!key)throw new Error('Enter the management key first.');
   const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-G1-Management-Key':key},body:JSON.stringify(payload)});
   let body={}; try{body=await r.json();}catch{}
+  if(r.status===401){storeManagementKey('');showManagementKeyPrompt('Management key rejected. Enter the key printed by the currently running ./start_dashboard.sh.');}
   if(!r.ok)throw new Error(body.error||`HTTP ${r.status}`);
-  sessionStorage.setItem('g1ManagementKey',key);
+  storeManagementKey(key);
   if(body.controller)renderControllerProcess(body.controller);
   return body;
 }
-$('controllerConfigureBtn').addEventListener('click',()=>openControllerModal());
+
+function xrActionButtonLabel(operation){
+  if(operation==='REQUEST_XR')return 'ENTER TELEOP';
+  if(operation==='CANCEL_XR_REQUEST')return 'CANCEL ENTRY';
+  if(operation==='HAND_BACK_ARMS')return 'EXIT TELEOP';
+  if(operation==='TRANSITION_IN_PROGRESS')return 'TRANSITIONING…';
+  return 'TELEOP ACTION';
+}
+function setXrActionResult(text,tone=null){
+  const el=$('xrActionResult'); if(!el)return;
+  el.textContent=text||'';
+  el.classList.remove('good','warn');
+  if(tone)el.classList.add(tone);
+}
+async function requestXrAction(operation){
+  const key=currentManagementKey();
+  if(!key)throw new Error('Enter the management key first.');
+  const r=await fetch('/api/controller/action',{
+    method:'POST',
+    headers:{'Content-Type':'application/json','X-G1-Management-Key':key},
+    body:JSON.stringify({operation})
+  });
+  let body={}; try{body=await r.json();}catch{}
+  if(body.controller)renderControllerProcess(body.controller);
+  if(r.status===401){storeManagementKey('');showManagementKeyPrompt('Management key rejected. Enter the key printed by the currently running ./start_dashboard.sh.');}
+  if(!r.ok){
+    const reason=body?.action?.reason||body?.error||`HTTP ${r.status}`;
+    throw new Error(reason);
+  }
+  return body.action||{};
+}
+$('managementKeySubmitBtn').addEventListener('click',async()=>{
+  if(managementAuthBusy)return;
+  managementAuthBusy=true;$('managementKeySubmitBtn').disabled=true;setManagementKeyError('');
+  try{
+    const key=$('managementKeyInput').value.trim();
+    await verifyManagementKey(key);
+    storeManagementKey(key);
+    const next=managementAfterAuth;
+    closeManagementKeyPrompt();
+    if(next)setTimeout(next,0);
+  }catch(err){setManagementKeyError(err.message||String(err));}
+  finally{managementAuthBusy=false;$('managementKeySubmitBtn').disabled=false;}
+});
+$('managementKeyInput').addEventListener('keydown',(e)=>{if(e.key==='Enter')$('managementKeySubmitBtn').click();});
+$('managementKeyReadOnlyBtn').addEventListener('click',()=>closeManagementKeyPrompt());
+
+$('controllerConfigureBtn').addEventListener('click',()=>{
+  if(!currentManagementKey()){showManagementKeyPrompt('Enter the management key before configuring a managed listener.',()=>openControllerModal());return;}
+  openControllerModal();
+});
 $('controllerModalCloseBtn').addEventListener('click',closeControllerModal);
 $('controllerModalCancelBtn').addEventListener('click',closeControllerModal);
 $('controllerModal').addEventListener('click',(e)=>{if(e.target===$('controllerModal'))closeControllerModal();});
-$('controllerManagementKey').addEventListener('input',()=>sessionStorage.setItem('g1ManagementKey',$('controllerManagementKey').value));
+$('controllerManagementKey').addEventListener('input',()=>storeManagementKey($('controllerManagementKey').value));
 $('controllerSafetyAck').addEventListener('change',updateControllerStartEnabled);
 $('controllerResetDefaultsBtn').addEventListener('click',resetControllerDefaults);
 $('controllerStartBtn').addEventListener('click',async()=>{
@@ -221,13 +332,33 @@ $('controllerStartBtn').addEventListener('click',async()=>{
 });
 $('controllerStopBtn').addEventListener('click',async()=>{
   if(controllerActionBusy)return;
-  const key=sessionStorage.getItem('g1ManagementKey')||'';
-  if(!key){await openControllerModal();setControllerModalError('Paste the management key first. It is required for both start and controlled stop.');return;}
-  if(!window.confirm('Request a controlled stop of the V1.8 teleop listener? If XR ownership is active, the controller will perform its normal handback before exiting.'))return;
+  if(!currentManagementKey()){showManagementKeyPrompt('Enter the management key to request a controlled listener stop.',$('controllerStopBtn').click.bind($('controllerStopBtn')));return;}
+  if(!window.confirm('Request a controlled stop of the teleop listener? If XR ownership is active, the controller will perform its normal handback before exiting.'))return;
   controllerActionBusy=true;renderControllerProcess(controllerStatus||{});
   try{await controllerPost('/api/controller/stop',{});await pollControllerProcess();}
   catch(err){window.alert(`Stop request failed: ${err.message||err}`);}
   finally{controllerActionBusy=false;renderControllerProcess(controllerStatus||{});}
+});
+
+$('xrActionBtn').addEventListener('click',async()=>{
+  if(xrActionBusy)return;
+  if(!currentManagementKey()){showManagementKeyPrompt('Enter the management key to use ENTER/EXIT TELEOP.',$('xrActionBtn').click.bind($('xrActionBtn')));return;}
+  const handover=latestActionReadiness?.xr_handover||{};
+  const operation=handover.operation||'NONE';
+  if(!['REQUEST_XR','CANCEL_XR_REQUEST','HAND_BACK_ARMS'].includes(operation))return;
+  xrActionBusy=true;
+  $('xrActionBtn').disabled=true;
+  setXrActionResult(`Sending ${xrActionButtonLabel(operation).toLowerCase()} request…`);
+  try{
+    const response=await requestXrAction(operation);
+    setXrActionResult(`${response.status||'ACCEPTED'} · ${response.reason||operation}`,'good');
+  }catch(err){
+    setXrActionResult(err.message||String(err),'warn');
+  }finally{
+    xrActionBusy=false;
+    if(latestEnv?.telemetry)renderActionReadiness(latestEnv.telemetry);
+    await pollControllerProcess();
+  }
 });
 document.addEventListener('keydown',(e)=>{if(e.key==='Escape'&&!$('controllerModal').classList.contains('hidden'))closeControllerModal();});
 
@@ -441,19 +572,23 @@ function updateFaultBanner(env,t){
 
 function renderActionReadiness(t){
   const actions=t?.actions||{}, handover=actions?.xr_handover||{}, cond=actions?.engagement_conditions||{};
+  latestActionReadiness=actions;
   const has=!!actions?.schema;
   const available=has && handover?.available===true;
-  const label=has?(handover?.label||'No action'):'Controller V1.8 required';
+  const label=has?(handover?.label||'No action'):'Controller action telemetry required';
   const operation=has?(handover?.operation||'NONE'):'—';
   const next=has?(handover?.would_enter_state||'—'):'—';
-  const reason=has?(handover?.reason||'—'):'Read-only action readiness requires controller V1.8.';
+  const reason=has?(handover?.reason||'—'):'Controller action-readiness telemetry required.';
   const channel=actions?.request_channel_enabled===true;
+  const managerReady=controllerStatus?.can_request_action===true;
 
   $('actionLabel').textContent=label;
   $('actionOperation').textContent=operation;
   $('actionNextState').textContent=next;
   $('actionReason').textContent=reason;
-  setChip($('actionReadinessChip'),has?(available?'READY':'BLOCKED'):'READ ONLY',has?(available?'good':'warn'):null);
+  const readinessText=!has?'READ ONLY':!channel?'READ ONLY':available?'READY':'BLOCKED';
+  const readinessTone=has&&channel?(available?'good':'warn'):null;
+  setChip($('actionReadinessChip'),readinessText,readinessTone);
 
   const condChip=(id,text,ok,neutral=false)=>{const el=$(id); el.textContent=text; el.classList.toggle('cond-good',!!ok); el.classList.toggle('cond-warn',!ok&&!neutral); el.classList.toggle('cond-neutral',!!neutral);};
   condChip('actionCondLowstate',`LOW ${cond.lowstate_ok?'OK':'BAD'}`,cond.lowstate_ok===true,!has);
@@ -461,13 +596,25 @@ function renderActionReadiness(t){
   condChip('actionCondStop',`STOP ${cond.stop_gate_ready?'READY':cond.stop_gate_instant?'TIMING':'WAIT'}`,cond.stop_gate_ready===true,!has);
   condChip('actionCondFault',`FAULT ${cond.safety_fault_clear?'CLEAR':'HOLD'}`,cond.safety_fault_clear===true,!has);
 
-  setChip($('statusActionChip'),has?(available?'READY':'BLOCKED'):'READ ONLY',has?(available?'good':'warn'):null);
+  const actionBtn=$('xrActionBtn');
+  actionBtn.textContent=xrActionButtonLabel(operation);
+  actionBtn.disabled=xrActionBusy || !channel || !available || !managerReady || !['REQUEST_XR','CANCEL_XR_REQUEST','HAND_BACK_ARMS'].includes(operation);
+  actionBtn.classList.toggle('danger-btn',operation==='HAND_BACK_ARMS');
+  actionBtn.classList.toggle('primary-btn',operation!=='HAND_BACK_ARMS');
+  if(!xrActionBusy){
+    if(!channel)setXrActionResult('Controller request channel disabled.');
+    else if(!managerReady)setXrActionResult('Start the listener from this dashboard to enable XR requests.');
+    else if(!available)setXrActionResult(reason,'warn');
+    else setXrActionResult('Controller will re-check this action when clicked.');
+  }
+
+  setChip($('statusActionChip'),readinessText,readinessTone);
   $('statusActionLabel').textContent=label;
   $('statusActionOperation').textContent=operation;
   $('statusActionNextState').textContent=next;
   $('statusActionChannel').textContent=channel?'ENABLED':'DISABLED';
   setTone($('statusActionChannel'),channel?'good':null);
-  $('statusActionReason').textContent=reason+(channel?'':' Browser requests are intentionally disabled in this revision.');
+  $('statusActionReason').textContent=reason+(channel?'':' Browser requests are unavailable until the controller action channel is enabled.');
 }
 
 function render(env){
@@ -684,6 +831,6 @@ async function poll(){
   finally{pollBusy=false;}
 }
 
-pollPose(); poll(); pollSystem(); pollControllerProcess(); setInterval(poll,250); setInterval(updatePoseHud,250); setInterval(pollSystem,250); setInterval(pollControllerProcess,750);
+pollPose(); poll(); pollSystem(); pollControllerProcess(); bootstrapManagementKey(); setInterval(poll,250); setInterval(updatePoseHud,250); setInterval(pollSystem,250); setInterval(pollControllerProcess,750);
 
 })();
