@@ -100,7 +100,7 @@ async function bootstrapManagementKey(){
       try{await verifyManagementKey(saved);return;}
       catch{storeManagementKey('');showManagementKeyPrompt('The saved management key is no longer valid. The dashboard may have restarted; enter the new key printed by ./start_dashboard.sh.');return;}
     }
-    showManagementKeyPrompt('Enter the current management key to enable listener, camera, and ENTER/EXIT TELEOP controls.');
+    showManagementKeyPrompt('Enter the current management key to enable listener, camera, ENTER/EXIT TELEOP, and allowlisted service controls.');
   }catch(err){
     console.debug('management-key bootstrap unavailable',err);
   }
@@ -781,6 +781,43 @@ const duration = (sec) => {
 function endpointState(id,on){ const el=$(id); if(!el)return; el.textContent=on?'LISTENING':'OFFLINE'; setTone(el,on?'good':'warn'); }
 function processState(id,count){ const el=$(id); if(!el)return; const n=Number(count||0); el.textContent=n>0?`${n} running`:'not found'; setTone(el,n>0?'good':'warn'); }
 let lastRobotServices=[];
+let serviceControlConfig=null;
+let serviceControlPollBusy=false;
+let serviceActionBusyName=null;
+
+const serviceEnabled=(s)=>typeof s?.enabled==='boolean'?s.enabled:Number(s?.status)===0?true:Number(s?.status)===1?false:null;
+function servicePolicyFor(svc){
+  const name=String(svc?.name||'');
+  if(svc?.protect)return 'PROTECTED';
+  const p=serviceControlConfig?.policy||{};
+  if(Array.isArray(p.hard_deny_services)&&p.hard_deny_services.includes(name))return 'PROTECTED';
+  if(Array.isArray(p.read_only_services)&&p.read_only_services.includes(name))return 'READ_ONLY';
+  if(Array.isArray(p.allowed_services)&&p.allowed_services.includes(name))return 'ALLOWED';
+  return 'UNKNOWN';
+}
+function renderServiceControlConfig(cfg){
+  serviceControlConfig=cfg||{};
+  const enabled=!!serviceControlConfig.enabled;
+  const worker=serviceControlConfig.worker||{};
+  const ready=enabled&&worker.status==='READY';
+  setChip($('serviceControlChip'),ready?'CONTROL READY':enabled?'CONTROL OFFLINE':'CONTROL OFF',ready?'good':enabled?'warn':null);
+  if($('serviceControlChip'))$('serviceControlChip').title=worker.reason||'';
+  renderServiceList();
+}
+async function pollServiceControl(){
+  if(serviceControlPollBusy)return;
+  serviceControlPollBusy=true;
+  try{
+    const r=await fetch('/api/services/control',{cache:'no-store'});
+    if(!r.ok)throw new Error(`HTTP ${r.status}`);
+    renderServiceControlConfig(await r.json());
+  }catch(err){
+    serviceControlConfig={enabled:false,worker:{status:'OFFLINE',reason:String(err)},policy:{}};
+    setChip($('serviceControlChip'),'CONTROL OFFLINE','warn');
+    console.debug('service control endpoint unavailable',err);
+    renderServiceList();
+  }finally{serviceControlPollBusy=false;}
+}
 function renderRobotServices(api){
   const available=!!api?.available;
   setChip($('robotStateChip'),available?'API ONLINE':api?.enabled===false?'API OFF':'API UNAVAILABLE',available?'good':api?.enabled===false?null:'warn');
@@ -791,39 +828,99 @@ function renderRobotServices(api){
   setTone($('robotStateVersionMatch'),match===true?'good':match===false?'warn':null);
   $('robotStateServiceCount').textContent=finite(api?.service_count)?String(api.service_count):'—';
   const err=$('robotStateError');
-  if(api?.error){err.textContent=api.error;}else{err.textContent=api?.module?`read-only via ${api.module}`:'read-only service inventory';}
+  if(api?.error){err.textContent=api.error;}else{err.textContent=api?.module?`inventory via ${api.module} · writes isolated in allowlisted worker`:'service inventory';}
   err.classList.remove('hidden');
   lastRobotServices=Array.isArray(api?.services)?api.services:[];
   renderServiceList();
 }
+function servicePolicyClassName(policy){return String(policy||'UNKNOWN').toLowerCase();}
 function renderServiceList(){
   const list=$('robotServiceList'); if(!list)return;
   list.innerHTML='';
-  const filter=String($('serviceFilter')?.value||'').trim().toLowerCase();
+  const textFilter=String($('serviceFilter')?.value||'').trim().toLowerCase();
+  const stateFilter=String($('serviceStateFilter')?.value||'ALL');
+  const policyFilter=String($('servicePolicyFilter')?.value||'ALL');
   const all=Array.isArray(lastRobotServices)?lastRobotServices:[];
-  const services=filter?all.filter(s=>String(s?.name||'').toLowerCase().includes(filter)):all;
-  // Unitree RobotState service status polarity is 0 = ON, 1 = OFF.
-  // New monitor packets publish `enabled`; fall back to the raw Unitree status
-  // for compatibility with a monitor that was started before this UI update.
-  const serviceEnabled=(s)=>typeof s?.enabled==='boolean'?s.enabled:Number(s?.status)===0?true:Number(s?.status)===1?false:null;
-  const on=all.filter(s=>serviceEnabled(s)===true).length;
-  const off=all.filter(s=>serviceEnabled(s)===false).length;
-  const unknown=all.length-on-off;
-  const protectedCount=all.filter(s=>!!s?.protect).length;
+  const classified=all.map(s=>({svc:s,enabled:serviceEnabled(s),policy:servicePolicyFor(s)}));
+  const services=classified.filter(({svc,enabled,policy})=>{
+    if(textFilter&&!String(svc?.name||'').toLowerCase().includes(textFilter))return false;
+    if(stateFilter==='ON'&&enabled!==true)return false;
+    if(stateFilter==='OFF'&&enabled!==false)return false;
+    if(policyFilter!=='ALL'&&policy!==policyFilter)return false;
+    return true;
+  });
+  const on=classified.filter(x=>x.enabled===true).length;
+  const off=classified.filter(x=>x.enabled===false).length;
+  const unknownState=all.length-on-off;
+  const allowedCount=classified.filter(x=>x.policy==='ALLOWED').length;
+  const protectedCount=classified.filter(x=>x.policy==='PROTECTED').length;
   const counts=$('robotServiceCounts');
-  if(counts) counts.textContent=`${on} on · ${off} off${unknown?` · ${unknown} unknown`:''} · ${protectedCount} protected${filter?` · ${services.length} shown`:''}`;
-  if(!services.length){list.innerHTML=`<div class="empty">${all.length?'No matching services':'No service inventory yet'}</div>`;return;}
-  for(const svc of services){
+  const filtering=!!textFilter||stateFilter!=='ALL'||policyFilter!=='ALL';
+  if(counts)counts.textContent=`${on} on · ${off} off${unknownState?` · ${unknownState} state?`:''} · ${allowedCount} allowed · ${protectedCount} protected${filtering?` · ${services.length} shown`:''}`;
+  if(!services.length){list.innerHTML=`<div class="empty">${all.length?'No services match the active filters':'No service inventory yet'}</div>`;return;}
+  const workerReady=!!serviceControlConfig?.enabled&&serviceControlConfig?.worker?.status==='READY';
+  for(const {svc,enabled,policy} of services){
     const row=document.createElement('div'); row.className='service-row';
     const name=document.createElement('span'); name.className='service-name'; name.textContent=String(svc?.name||'?'); name.title=name.textContent;
-    const protect=document.createElement('span'); protect.className='service-protect'; protect.textContent=svc?.protect?'PROTECTED':'—';
+    const policyEl=document.createElement('span'); policyEl.className=`service-policy ${servicePolicyClassName(policy)}`; policyEl.textContent=policy==='READ_ONLY'?'READ ONLY':policy;
+    if(svc?.protect)policyEl.title='Unitree RobotState protect flag is set';
     const state=document.createElement('strong');
-    const enabled=serviceEnabled(svc), rawStatus=Number(svc?.status);
+    const rawStatus=Number(svc?.status);
     state.textContent=enabled===true?'ON':enabled===false?'OFF':`STATE ${Number.isFinite(rawStatus)?rawStatus:'—'}`;
-    state.title=Number.isFinite(rawStatus)?`Unitree raw service status: ${rawStatus} (0=ON, 1=OFF)`:'';
-    if(enabled===true) state.className='good-text'; else if(enabled===false) state.className='dim'; else state.className='warn-text';
-    row.append(name,protect,state); list.appendChild(row);
+    state.title=Number.isFinite(rawStatus)?`Unitree raw service status: ${rawStatus} (0=ON, 1=OFF)`:'unknown service state';
+    if(enabled===true)state.className='good-text';else if(enabled===false)state.className='dim';else state.className='warn-text';
+    const control=document.createElement('span');control.className='service-control-cell';
+    if(serviceActionBusyName===name.textContent){
+      const busy=document.createElement('span');busy.className='service-switching';busy.textContent='SWITCHING…';control.appendChild(busy);
+    }else if(policy==='ALLOWED'&&enabled!==null){
+      const label=document.createElement('label');label.className='service-switch';label.title=workerReady?'Switch service through verified RobotState action worker':'Service action worker is not ready';
+      const input=document.createElement('input');input.type='checkbox';input.checked=enabled===true;input.disabled=!workerReady;
+      const track=document.createElement('span');track.className='service-switch-track';
+      input.addEventListener('change',()=>{
+        const desired=input.checked; input.checked=enabled===true;
+        requestServiceState(name.textContent,desired);
+      });
+      label.append(input,track);control.appendChild(label);
+    }else{
+      const na=document.createElement('span');na.className='service-control-na';na.textContent=policy==='PROTECTED'?'LOCKED':'—';control.appendChild(na);
+    }
+    row.append(name,policyEl,state,control);list.appendChild(row);
   }
+}
+async function postServiceState(name,enabled){
+  const key=currentManagementKey();
+  if(!key)throw new Error('Enter the management key first.');
+  const r=await fetch('/api/services/set',{
+    method:'POST',headers:{'Content-Type':'application/json','X-G1-Management-Key':key},
+    body:JSON.stringify({service:name,enabled})
+  });
+  let body={};try{body=await r.json();}catch{}
+  if(r.status===401){storeManagementKey('');showManagementKeyPrompt('Management key rejected. Enter the key printed by the currently running ./start_dashboard.sh.');}
+  if(!r.ok)throw new Error(body?.service_action?.reason||body.error||`HTTP ${r.status}`);
+  return body.service_action||{};
+}
+async function requestServiceState(name,enabled){
+  if(serviceActionBusyName)return;
+  const desiredWord=enabled?'ON':'OFF';
+  if(!currentManagementKey()){
+    showManagementKeyPrompt(`Enter the management key to switch ${name} ${desiredWord}.`,()=>requestServiceState(name,enabled));
+    return;
+  }
+  if(!window.confirm(`Switch Unitree service "${name}" ${desiredWord}?\n\nOnly explicitly ALLOWED services can reach ServiceSwitch. The worker will re-read ServiceList and report success only if the requested state is verified.`))return;
+  serviceActionBusyName=name;renderServiceList();
+  try{
+    const action=await postServiceState(name,enabled);
+    if(action?.after){
+      const idx=lastRobotServices.findIndex(s=>String(s?.name||'')===name);
+      if(idx>=0)lastRobotServices[idx]={...lastRobotServices[idx],...action.after};
+    }
+    renderServiceList();
+    await pollSystem();
+  }catch(err){
+    window.alert(`Service switch failed: ${err.message||err}`);
+    await pollServiceControl();
+    await pollSystem();
+  }finally{serviceActionBusyName=null;renderServiceList();}
 }
 function renderBaseSensing(base){
   const imu=base?.imu||{}, odom=base?.odometry||{};
@@ -903,6 +1000,8 @@ function renderSystem(env){
   renderBaseSensing(sys.base_sensing||{});
 }
 $('serviceFilter')?.addEventListener('input',renderServiceList);
+$('serviceStateFilter')?.addEventListener('change',renderServiceList);
+$('servicePolicyFilter')?.addEventListener('change',renderServiceList);
 
 let systemBusy=false;
 async function pollSystem(){
@@ -939,6 +1038,6 @@ async function poll(){
   finally{pollBusy=false;}
 }
 
-pollPose(); poll(); pollSystem(); pollControllerProcess(); pollCameraProcess(); bootstrapManagementKey(); setInterval(poll,250); setInterval(updatePoseHud,250); setInterval(pollSystem,250); setInterval(pollControllerProcess,750); setInterval(pollCameraProcess,750);
+pollPose(); poll(); pollSystem(); pollControllerProcess(); pollCameraProcess(); pollServiceControl(); bootstrapManagementKey(); setInterval(poll,250); setInterval(updatePoseHud,250); setInterval(pollSystem,250); setInterval(pollControllerProcess,750); setInterval(pollCameraProcess,750); setInterval(pollServiceControl,2000);
 
 })();

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>G1 Teleop Control Center</title>
   <link rel="icon" href="data:," />
-  <link rel="stylesheet" href="/static/styles.css?v=step5-1-deps1" />
+  <link rel="stylesheet" href="/static/styles.css?v=step5-2-v1" />
 </head>
 <body>
   <header class="topbar">
@@ -13,7 +13,7 @@
       <div class="eyebrow">UNITREE G1 · XR TELEOPERATION</div>
       <div class="title-row">
         <h1>Teleop Control Center</h1>
-        <span class="readonly process-control-label">PROCESS CONTROL · NO DDS</span>
+        <span class="readonly process-control-label">BRIDGE NO DDS · SERVICE WORKER ISOLATED</span>
       </div>
     </div>
 
@@ -338,6 +338,19 @@
             <div><div class="panel-kicker">UNITREE ROBOTSTATE API</div><strong>Service inventory</strong></div>
             <div class="service-head-actions">
               <input id="serviceFilter" class="service-filter" type="search" placeholder="Filter services…" autocomplete="off" />
+              <select id="serviceStateFilter" class="service-select" aria-label="Filter service state">
+                <option value="ALL">STATE · ALL</option>
+                <option value="ON">STATE · ON</option>
+                <option value="OFF">STATE · OFF</option>
+              </select>
+              <select id="servicePolicyFilter" class="service-select" aria-label="Filter service policy">
+                <option value="ALL">POLICY · ALL</option>
+                <option value="ALLOWED">POLICY · ALLOWED</option>
+                <option value="PROTECTED">POLICY · PROTECTED</option>
+                <option value="READ_ONLY">POLICY · READ ONLY</option>
+                <option value="UNKNOWN">POLICY · UNKNOWN</option>
+              </select>
+              <span id="serviceControlChip" class="chip">CONTROL —</span>
               <span id="robotStateChip" class="chip">API —</span>
             </div>
           </div>
@@ -352,7 +365,7 @@
             <div id="robotServiceCounts" class="service-counts">—</div>
           </div>
           <div class="service-table">
-            <div class="service-row service-header"><span>SERVICE</span><span>PROTECTION</span><span>STATE</span></div>
+            <div class="service-row service-header"><span>SERVICE</span><span>POLICY</span><span>STATE</span><span>CONTROL</span></div>
             <div id="robotServiceList" class="service-list"><div class="empty">No service inventory yet</div></div>
           </div>
         </section>
@@ -499,6 +512,6 @@
     </section>
   </div>
 
-  <script type="module" src="/static/app.js?v=step5-1-deps1"></script>
+  <script type="module" src="/static/app.js?v=step5-2-v1"></script>
 </body>
 </html>

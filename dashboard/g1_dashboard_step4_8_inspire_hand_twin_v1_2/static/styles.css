@@ -210,9 +210,23 @@ button,a{font:inherit}.topbar{height:var(--top);display:grid;grid-template-colum
 /* Service inventory gets the full lower row and larger readable text. */
 .service-inventory-wide{grid-column:1/-1;grid-row:2}
 .service-head{margin-bottom:7px}
-.service-head-actions{display:flex;align-items:center;gap:8px}
-.service-filter{width:230px;max-width:30vw;background:#0c131b;color:var(--text);border:1px solid #304051;border-radius:7px;padding:6px 9px;font-size:10px;outline:none}
+.service-head-actions{display:flex;align-items:center;gap:7px;flex-wrap:wrap;justify-content:flex-end}
+.service-filter{width:210px;max-width:27vw;background:#0c131b;color:var(--text);border:1px solid #304051;border-radius:7px;padding:6px 9px;font-size:10px;outline:none}
 .service-filter:focus{border-color:#547ca8;box-shadow:0 0 0 2px rgba(113,167,255,.10)}
+
+.service-select{background:#0c131b;color:var(--text);border:1px solid #304051;border-radius:7px;padding:6px 8px;font-size:9px;outline:none;min-width:104px}
+.service-select:focus{border-color:#547ca8;box-shadow:0 0 0 2px rgba(113,167,255,.10)}
+.service-policy{font-size:8.5px;font-weight:800;letter-spacing:.04em}
+.service-policy.allowed{color:#66dfb3}.service-policy.protected{color:#e6b95e}.service-policy.read_only{color:#8fb6db}.service-policy.unknown{color:#7f8d9d}
+.service-control-cell{display:flex;justify-content:flex-end;align-items:center;min-width:0}
+.service-switch{position:relative;width:34px;height:18px;display:inline-block;flex:none}
+.service-switch input{opacity:0;width:0;height:0;position:absolute}
+.service-switch-track{position:absolute;inset:0;border-radius:999px;background:#263240;border:1px solid #3d4c5e;transition:.14s}
+.service-switch-track:before{content:"";position:absolute;width:12px;height:12px;left:2px;top:2px;border-radius:50%;background:#aeb9c5;transition:.14s}
+.service-switch input:checked + .service-switch-track{background:#164f45;border-color:#277765}
+.service-switch input:checked + .service-switch-track:before{transform:translateX(16px);background:#72e3bd}
+.service-switch input:disabled + .service-switch-track{opacity:.38;cursor:not-allowed}
+.service-control-na{color:#617184;font-size:9px}.service-switching{color:#e6b95e;font-size:8.5px;font-weight:800;letter-spacing:.04em}
 .robotstate-summary{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);border-radius:8px;overflow:hidden;margin:0 0 7px}
 .robotstate-summary>div{background:#101720;padding:7px 9px;min-width:0}
 .robotstate-summary span{display:block;color:var(--muted);font-size:8px;margin-bottom:3px}
@@ -222,10 +236,10 @@ button,a{font:inherit}.topbar{height:var(--top);display:grid;grid-template-colum
 .service-counts{font-size:9px;color:#91a3b7;white-space:nowrap;font-variant-numeric:tabular-nums}
 .service-table{display:flex;flex-direction:column;min-height:0;flex:1;border:1px solid var(--line);border-radius:8px;background:#0b1118;overflow:hidden}
 .service-list{min-height:0;overflow:auto;flex:1}
-.service-row{display:grid;grid-template-columns:minmax(260px,1fr) 130px 90px;gap:12px;align-items:center;padding:7px 11px;border-bottom:1px solid rgba(74,92,111,.25);font-size:10.5px;line-height:1.15}
+.service-row{display:grid;grid-template-columns:minmax(260px,1fr) 120px 72px 86px;gap:12px;align-items:center;padding:7px 11px;border-bottom:1px solid rgba(74,92,111,.25);font-size:10.5px;line-height:1.15}
 .service-row:last-child{border-bottom:0}
 .service-header{position:sticky;top:0;z-index:2;background:#17212c;color:#9cafc3;font-size:8px;font-weight:800;letter-spacing:.08em;border-bottom:1px solid #314154}
-.service-header span:last-child{text-align:right}
+.service-header span:nth-child(3),.service-header span:last-child{text-align:right}
 .service-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#dbe5ef;font-weight:600}
 .service-protect{color:#c1a250;font-size:8.5px;font-weight:700}
 .service-row strong{text-align:right;font-size:10px;white-space:nowrap}
@@ -243,8 +257,8 @@ button,a{font:inherit}.topbar{height:var(--top);display:grid;grid-template-colum
   .metric-tiles{grid-template-columns:repeat(2,1fr)}
   .sensor-split{grid-template-columns:1fr}
   .endpoint-grid{grid-template-columns:1fr 1fr}
-  .service-row{grid-template-columns:minmax(150px,1fr) 95px 70px;font-size:9.5px}
-  .service-filter{width:160px;max-width:42vw}
+  .service-row{grid-template-columns:minmax(150px,1fr) 88px 62px 70px;font-size:9.5px}
+  .service-filter{width:150px;max-width:40vw}.service-select{min-width:92px;font-size:8px}
 }
 
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""G1 dashboard bridge v1.5.2 — Step 5.1 dependency lifecycle + XR actions.
+"""G1 dashboard bridge v1.5.3 — Step 5.2 verified service actions.
 
 Safety boundary:
 - Receives controller telemetry only from localhost UDP (127.0.0.1:8765).
@@ -11,7 +11,8 @@ Safety boundary:
 - Step 5.1 adds an authenticated XR action request endpoint. The bridge does not
   decide robot state or publish DDS: it forwards only a whitelisted operation to
   the controller's loopback action socket, where the controller re-validates it.
-- It still has no Unitree ServiceSwitch endpoint.
+- Step 5.2 adds authenticated, explicitly allowlisted service requests forwarded
+  to a separate g1_xr worker. The bridge itself still imports no Unitree DDS.
 - Browser/client disconnects have no effect on an already running controller.
 """
 from __future__ import annotations
@@ -32,9 +33,11 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from g1_dashboard_process_manager import ControllerProcessManager
+from g1_dashboard_service_client import ServiceActionClient
+from g1_dashboard_service_policy import classify_service, load_policy, public_policy
 
 SCHEMA = "g1_dashboard.telemetry.v1"
-BRIDGE_VERSION = "g1_dashboard_bridge.v1.5.2-dependency-lifecycle"
+BRIDGE_VERSION = "g1_dashboard_bridge.v1.5.3-verified-service-actions"
 SYSTEM_SCHEMA = "g1_dashboard.system.v1"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -513,14 +516,26 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 lines = 80
             self._send_json(HTTPStatus.OK, manager.camera_log_tail(lines))
             return
+        if path == "/api/services/control":
+            client: ServiceActionClient = self.server.service_action_client  # type: ignore[attr-defined]
+            policy = load_policy()
+            worker = client.ping() if self.server.service_actions_enabled else {"status": "DISABLED", "reason": "service actions disabled"}  # type: ignore[attr-defined]
+            self._send_json(HTTPStatus.OK, {
+                "schema": "g1_dashboard.service_control.v1",
+                "enabled": bool(self.server.service_actions_enabled),  # type: ignore[attr-defined]
+                "management_key_required": bool(self.server.service_actions_enabled),  # type: ignore[attr-defined]
+                "policy": public_policy(policy),
+                "worker": worker,
+            })
+            return
         if path == "/api/info":
             env = state.envelope()
             self._send_json(HTTPStatus.OK, {
                 "bridge": env["bridge"],
                 "safety_boundary": {
-                    "robot_dds_read_only": True,
-                    "dds_imported": False,
-                    "robot_dds_command_endpoints": False,
+                    "bridge_imports_robot_dds": False,
+                    "browser_direct_robot_dds_commands": False,
+                    "service_switch_worker_isolated": True,
                     "controller_xr_action_endpoint": bool(self.server.process_actions_enabled),
                     "controller_xr_action_controller_validated": True,
                     "controller_process_actions": bool(self.server.process_actions_enabled),  # type: ignore[attr-defined]
@@ -528,6 +543,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "inspire_dependency_lifecycle": "root-owned fixed helper; controller first on stop",
                     "camera_process_actions": bool(self.server.process_actions_enabled),
                     "camera_process_actions_authenticated": True,
+                    "unitree_service_actions": bool(self.server.service_actions_enabled),  # type: ignore[attr-defined]
+                    "unitree_service_actions_authenticated": True,
+                    "unitree_service_actions_allowlisted": True,
+                    "unitree_service_actions_post_verified": True,
+                    "bridge_imports_unitree_dds": False,
                     "arbitrary_process_launch": False,
                     "telemetry_input": f"udp://127.0.0.1:{self.server.udp_port}",  # type: ignore[attr-defined]
                     "system_input": f"udp://127.0.0.1:{self.server.system_udp_port}",  # type: ignore[attr-defined]
@@ -553,9 +573,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "/api/controller/action",
             "/api/camera/start",
             "/api/camera/stop",
+            "/api/services/set",
         ):
             self._send_json(HTTPStatus.METHOD_NOT_ALLOWED, {
-                "error": "unsupported POST; authenticated process endpoints are controller auth/start/stop/action and camera start/stop"
+                "error": "unsupported POST; authenticated endpoints are controller auth/start/stop/action, camera start/stop, and allowlisted service set"
             })
             return
         if not self._require_process_action_auth():
@@ -583,6 +604,26 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     HTTPStatus.ACCEPTED if accepted else HTTPStatus.CONFLICT,
                     {"ok": accepted, "action": response, "controller": manager.status()},
                 )
+            elif path == "/api/services/set":
+                if not self.server.service_actions_enabled:  # type: ignore[attr-defined]
+                    raise PermissionError("Unitree service actions are disabled")
+                service = str(payload.get("service") or "").strip()
+                enabled = payload.get("enabled")
+                if not service or len(service) > 128:
+                    raise ValueError("service must be a non-empty service name")
+                if not isinstance(enabled, bool):
+                    raise ValueError("enabled must be boolean")
+                policy = load_policy()
+                bridge_policy = classify_service(service, unitree_protect=False, policy=policy)
+                if bridge_policy != "ALLOWED":
+                    raise PermissionError(f"service {service!r} policy is {bridge_policy}; explicit ALLOWED policy is required")
+                client: ServiceActionClient = self.server.service_action_client  # type: ignore[attr-defined]
+                response = client.request("SET_SERVICE", service=service, enabled=enabled)
+                completed = response.get("status") == "COMPLETED" and response.get("verified") is True
+                self._send_json(
+                    HTTPStatus.OK if completed else HTTPStatus.CONFLICT,
+                    {"ok": completed, "service_action": response},
+                )
             elif path == "/api/camera/start":
                 status = manager.start_camera()
                 self._send_json(HTTPStatus.ACCEPTED, {"ok": True, "camera": status})
@@ -598,7 +639,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "error": str(exc), "controller": manager.status(), "camera": manager.camera_status()
             })
         except Exception as exc:
-            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"controller process action failed: {exc}"})
+            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"dashboard action failed: {exc}"})
 
 
 def parse_args() -> argparse.Namespace:
@@ -613,6 +654,11 @@ def parse_args() -> argparse.Namespace:
         "--enable-process-actions",
         action="store_true",
         help="Enable authenticated controller/Inspire/camera lifecycle actions and Step 5.1 XR action forwarding.",
+    )
+    p.add_argument(
+        "--enable-service-actions",
+        action="store_true",
+        help="Enable authenticated, explicitly allowlisted Unitree RobotState service actions through the separate g1_xr worker.",
     )
     return p.parse_args()
 
@@ -646,19 +692,27 @@ def main() -> int:
     server.process_manager = process_manager  # type: ignore[attr-defined]
     server.process_actions_enabled = args.enable_process_actions  # type: ignore[attr-defined]
     server.action_token = action_token  # type: ignore[attr-defined]
+    service_action_client = ServiceActionClient()
+    if args.enable_service_actions and not service_action_client.configured():
+        raise SystemExit("--enable-service-actions requires G1_DASHBOARD_SERVICE_SOCKET and G1_DASHBOARD_SERVICE_TOKEN")
+    if args.enable_service_actions and not args.enable_process_actions:
+        raise SystemExit("--enable-service-actions requires --enable-process-actions so management-key auth is available")
+    server.service_action_client = service_action_client  # type: ignore[attr-defined]
+    server.service_actions_enabled = args.enable_service_actions  # type: ignore[attr-defined]
 
-    print(f"{BRIDGE_VERSION} PROCESS+DEPENDENCY+XR-ACTION-CONTROL")
+    print(f"{BRIDGE_VERSION} PROCESS+DEPENDENCY+XR+SERVICE-ACTION-CONTROL")
     print(f"Telemetry input : udp://127.0.0.1:{args.udp_port}")
     print(f"System input    : udp://127.0.0.1:{args.system_udp_port}")
     print(f"Dashboard HTTP  : http://{args.http_host}:{args.http_port}")
     print("Transport       : dual-rate latest-only HTTP (30 Hz pose / 4 Hz status)")
     print("Dependencies    : Python standard library only")
     print(f"Process actions : {'ENABLED' if args.enable_process_actions else 'DISABLED'}")
+    print(f"Service actions : {'ENABLED (explicit allowlist + post-verification)' if args.enable_service_actions else 'DISABLED'}")
     if args.enable_process_actions:
         print(f"Controller      : {process_manager.script_path}")
         print(f"Controller Py   : {process_manager.python_path}")
         print("Auth            : X-G1-Management-Key required")
-    print("No DDS imports. XR requests are controller-validated; process lifecycle is fixed-command only; no Unitree ServiceSwitch endpoints.")
+    print("Bridge imports no DDS. XR requests are controller-validated; Unitree ServiceSwitch is isolated in the allowlisted service worker and post-verified with ServiceList.")
     try:
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:

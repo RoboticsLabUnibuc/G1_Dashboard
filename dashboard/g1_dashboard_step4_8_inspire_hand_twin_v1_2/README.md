@@ -1,3 +1,29 @@
+# G1 Dashboard Step 5.2 — verified allowlisted Unitree service controls
+
+Step 5.2 keeps the tested listener/Inspire/camera/XR lifecycle and adds an isolated RobotState service action worker. The browser still never imports or publishes DDS. Authenticated service requests flow through the stdlib bridge to a localhost Unix-domain socket owned by the dashboard user; only the g1_xr worker imports `unitree_sdk2py` and may call `RobotStateClient.ServiceSwitch()`.
+
+Service writes are deliberately **deny-by-default**:
+
+- Unitree `protect=true` is always `PROTECTED` and can never be switched.
+- `service_policy.json` contains an additional hard-deny list for critical names.
+- Every other unreviewed service is `UNKNOWN` and has no toggle.
+- Only exact names in `allowed_services` (or the explicit runtime `G1_DASHBOARD_SERVICE_ALLOWLIST`) become `ALLOWED`.
+- A successful ServiceSwitch RPC is not enough: the worker re-runs `ServiceList()` for up to 3 seconds and reports success only after the requested ON/OFF state is observed.
+
+The Inspect service table adds text, state, and policy filters plus a control column. The Unitree inventory remains read-only in `g1_dashboard_system_monitor.py`; service writes are isolated in `g1_dashboard_service_worker.py`.
+
+For a temporary reviewed test without changing Git:
+
+```bash
+G1_DASHBOARD_SERVICE_ALLOWLIST=audio_player_service ./start_dashboard.sh
+```
+
+That line is only an example of the explicit allowlist mechanism; choose a service whose operational effect you have reviewed. To make an approval persistent, edit `service_policy.json` on the development branch and deploy it with the rest of the dashboard.
+
+Setting `G1_DASHBOARD_PROCESS_ACTIONS=0` also disables service actions. They can additionally be disabled independently with `G1_DASHBOARD_SERVICE_ACTIONS=0`.
+
+---
+
 # G1 Dashboard Step 5.1 — XR actions + managed Inspire/camera lifecycle
 
 This branch checkpoint keeps the tested Step 5.1 controller-owned ENTER/EXIT TELEOP request path and adds two fixed-process lifecycle integrations:
@@ -8,7 +34,7 @@ This branch checkpoint keeps the tested Step 5.1 controller-owned ENTER/EXIT TEL
 - **Stop camera** closes the browser stream and sends the managed teleimager process the same primary signal as terminal `Ctrl+C` (`SIGINT`). A bounded `SIGTERM` fallback is used only if the managed camera process does not exit.
 - Externally started Inspire/camera processes are detected and reused, but the dashboard does **not** stop processes it does not own.
 
-The browser still cannot submit an executable path, shell command, PID, environment variable, DDS topic, or Unitree service name. All process paths are server-side fixed/whitelisted. The bridge still imports no Unitree DDS libraries and has no `ServiceSwitch()` endpoint.
+The browser still cannot submit an executable path, shell command, PID, environment variable, or DDS topic. Process paths remain server-side fixed/whitelisted. Step 5.2 adds a narrowly-scoped service-name request, but the stdlib bridge enforces the explicit policy before forwarding it and the isolated worker independently re-checks Unitree protection/policy before calling `ServiceSwitch()`.
 
 ## One-time Inspire helper installation on PC2
 
