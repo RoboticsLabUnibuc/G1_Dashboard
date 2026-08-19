@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>G1 Teleop Control Center</title>
   <link rel="icon" href="data:," />
-  <link rel="stylesheet" href="/static/styles.css?v=step5-1-auth1" />
+  <link rel="stylesheet" href="/static/styles.css?v=step5-1-deps1" />
 </head>
 <body>
   <header class="topbar">
@@ -52,8 +52,9 @@
               <div class="panel-title-line"><strong>Live view</strong><span id="cameraMeta" class="dim">—</span></div>
             </div>
             <div class="camera-actions">
-              <button id="cameraConnectBtn" class="primary-btn">Connect camera</button>
-              <button id="cameraStopBtn" class="ghost-btn hidden">Disconnect</button>
+              <span id="cameraProcessState" class="camera-process-state">SERVER —</span>
+              <button id="cameraConnectBtn" class="primary-btn">Start &amp; connect</button>
+              <button id="cameraStopBtn" class="ghost-btn hidden">Stop camera</button>
               <a id="cameraTrustLink" class="ghost-link" target="_blank" rel="noreferrer">Trust cert</a>
             </div>
           </div>
@@ -63,7 +64,7 @@
             <div id="cameraOverlay" class="camera-overlay">
               <div class="camera-overlay-icon">◉</div>
               <strong id="cameraOverlayTitle">Camera not connected</strong>
-              <span id="cameraOverlayText">Start teleimager, then connect.</span>
+              <span id="cameraOverlayText">Click Start & connect to launch teleimager.</span>
             </div>
             <div class="camera-hud top-left">
               <span id="cameraStateDot" class="dot"></span>
@@ -177,6 +178,7 @@
             <div class="controller-process-meta">
               <span id="controllerProcessPid">pid —</span>
               <span id="controllerProcessUptime">uptime —</span>
+              <span id="controllerInspireState">Inspire —</span>
             </div>
             <div id="controllerProcessDetail" class="controller-process-detail">Checking process manager…</div>
             <div class="controller-process-actions">
@@ -497,6 +499,6 @@
     </section>
   </div>
 
-  <script type="module" src="/static/app.js?v=step5-1-auth1"></script>
+  <script type="module" src="/static/app.js?v=step5-1-deps1"></script>
 </body>
 </html>

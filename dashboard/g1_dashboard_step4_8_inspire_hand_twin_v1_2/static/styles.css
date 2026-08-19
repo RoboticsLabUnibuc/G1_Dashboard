@@ -445,3 +445,10 @@ button,a{font:inherit}.topbar{height:var(--top);display:grid;grid-template-colum
 .xr-action-result.good{color:var(--good)}
 .xr-action-result.warn{color:var(--warn)}
 @media(max-width:900px){.xr-action-row{align-items:stretch;flex-direction:column}.xr-action-result{white-space:normal}.xr-action-btn{width:100%}}
+
+/* Step 5.1 dependency lifecycle — managed teleimager + Inspire status */
+.camera-process-state{font-size:7px;font-weight:800;letter-spacing:.06em;color:#71869a;white-space:nowrap;padding:3px 5px;border:1px solid #263442;border-radius:5px;background:#0d151e}
+.camera-process-state.good{color:#57dba8;border-color:#235342;background:#0d1b18}
+.camera-process-state.warn{color:#e9c35e;border-color:#54451f;background:#1a1710}
+.camera-process-state.bad{color:#ff7b88;border-color:#5f2630;background:#1d1013}
+@media(max-width:1280px){.camera-process-state{display:none}}

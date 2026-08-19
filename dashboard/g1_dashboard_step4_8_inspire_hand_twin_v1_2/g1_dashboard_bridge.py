@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""G1 dashboard bridge v1.5.1 — Step 5.1 controller-owned XR actions.
+"""G1 dashboard bridge v1.5.2 — Step 5.1 dependency lifecycle + XR actions.
 
 Safety boundary:
 - Receives controller telemetry only from localhost UDP (127.0.0.1:8765).
 - Uses only the Python standard library: no FastAPI/Uvicorn/WebSocket packages.
 - Does NOT import Unitree DDS libraries and does NOT publish DDS commands.
 - Keeps authenticated start/stop lifecycle requests for one exact validated controller.
+- Couples a root-helper-managed Inspire service to the managed controller lifecycle.
+- Adds authenticated teleimager process start/stop; browser WebRTC remains separate.
 - Step 5.1 adds an authenticated XR action request endpoint. The bridge does not
   decide robot state or publish DDS: it forwards only a whitelisted operation to
   the controller's loopback action socket, where the controller re-validates it.
@@ -32,7 +34,7 @@ from urllib.parse import parse_qs, urlparse
 from g1_dashboard_process_manager import ControllerProcessManager
 
 SCHEMA = "g1_dashboard.telemetry.v1"
-BRIDGE_VERSION = "g1_dashboard_bridge.v1.5.1.1-management-key-bootstrap"
+BRIDGE_VERSION = "g1_dashboard_bridge.v1.5.2-dependency-lifecycle"
 SYSTEM_SCHEMA = "g1_dashboard.system.v1"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -498,6 +500,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 lines = 80
             self._send_json(HTTPStatus.OK, manager.log_tail(lines))
             return
+        if path == "/api/camera":
+            manager: ControllerProcessManager = self.server.process_manager  # type: ignore[attr-defined]
+            self._send_json(HTTPStatus.OK, manager.camera_status())
+            return
+        if path == "/api/camera/log":
+            manager: ControllerProcessManager = self.server.process_manager  # type: ignore[attr-defined]
+            query = parse_qs(parsed.query)
+            try:
+                lines = int((query.get("lines") or ["80"])[0])
+            except ValueError:
+                lines = 80
+            self._send_json(HTTPStatus.OK, manager.camera_log_tail(lines))
+            return
         if path == "/api/info":
             env = state.envelope()
             self._send_json(HTTPStatus.OK, {
@@ -510,6 +525,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "controller_xr_action_controller_validated": True,
                     "controller_process_actions": bool(self.server.process_actions_enabled),  # type: ignore[attr-defined]
                     "controller_process_actions_authenticated": True,
+                    "inspire_dependency_lifecycle": "root-owned fixed helper; controller first on stop",
+                    "camera_process_actions": bool(self.server.process_actions_enabled),
+                    "camera_process_actions_authenticated": True,
                     "arbitrary_process_launch": False,
                     "telemetry_input": f"udp://127.0.0.1:{self.server.udp_port}",  # type: ignore[attr-defined]
                     "system_input": f"udp://127.0.0.1:{self.server.system_udp_port}",  # type: ignore[attr-defined]
@@ -528,9 +546,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
         path = parsed.path
         manager: ControllerProcessManager = self.server.process_manager  # type: ignore[attr-defined]
 
-        if path not in ("/api/controller/auth", "/api/controller/start", "/api/controller/stop", "/api/controller/action"):
+        if path not in (
+            "/api/controller/auth",
+            "/api/controller/start",
+            "/api/controller/stop",
+            "/api/controller/action",
+            "/api/camera/start",
+            "/api/camera/stop",
+        ):
             self._send_json(HTTPStatus.METHOD_NOT_ALLOWED, {
-                "error": "unsupported POST; available authenticated controller endpoints are auth, start, stop, and action"
+                "error": "unsupported POST; authenticated process endpoints are controller auth/start/stop/action and camera start/stop"
             })
             return
         if not self._require_process_action_auth():
@@ -551,20 +576,26 @@ class DashboardHandler(BaseHTTPRequestHandler):
             elif path == "/api/controller/stop":
                 status = manager.stop()
                 self._send_json(HTTPStatus.ACCEPTED, {"ok": True, "controller": status})
-            else:
+            elif path == "/api/controller/action":
                 response = manager.request_xr_action(payload.get("operation", ""))
                 accepted = response.get("status") == "ACCEPTED"
                 self._send_json(
                     HTTPStatus.ACCEPTED if accepted else HTTPStatus.CONFLICT,
                     {"ok": accepted, "action": response, "controller": manager.status()},
                 )
+            elif path == "/api/camera/start":
+                status = manager.start_camera()
+                self._send_json(HTTPStatus.ACCEPTED, {"ok": True, "camera": status})
+            else:
+                status = manager.stop_camera()
+                self._send_json(HTTPStatus.ACCEPTED, {"ok": True, "camera": status})
         except PermissionError as exc:
-            self._send_json(HTTPStatus.FORBIDDEN, {"error": str(exc), "controller": manager.status()})
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": str(exc), "controller": manager.status(), "camera": manager.camera_status()})
         except FileNotFoundError as exc:
-            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc), "controller": manager.status()})
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc), "controller": manager.status(), "camera": manager.camera_status()})
         except (ValueError, RuntimeError) as exc:
             self._send_json(HTTPStatus.CONFLICT if isinstance(exc, RuntimeError) else HTTPStatus.BAD_REQUEST, {
-                "error": str(exc), "controller": manager.status()
+                "error": str(exc), "controller": manager.status(), "camera": manager.camera_status()
             })
         except Exception as exc:
             self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"controller process action failed: {exc}"})
@@ -581,7 +612,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--enable-process-actions",
         action="store_true",
-        help="Enable authenticated controller process start/stop and Step 5.1 XR action forwarding.",
+        help="Enable authenticated controller/Inspire/camera lifecycle actions and Step 5.1 XR action forwarding.",
     )
     return p.parse_args()
 
@@ -616,7 +647,7 @@ def main() -> int:
     server.process_actions_enabled = args.enable_process_actions  # type: ignore[attr-defined]
     server.action_token = action_token  # type: ignore[attr-defined]
 
-    print(f"{BRIDGE_VERSION} PROCESS+XR-ACTION-CONTROL")
+    print(f"{BRIDGE_VERSION} PROCESS+DEPENDENCY+XR-ACTION-CONTROL")
     print(f"Telemetry input : udp://127.0.0.1:{args.udp_port}")
     print(f"System input    : udp://127.0.0.1:{args.system_udp_port}")
     print(f"Dashboard HTTP  : http://{args.http_host}:{args.http_port}")
@@ -627,7 +658,7 @@ def main() -> int:
         print(f"Controller      : {process_manager.script_path}")
         print(f"Controller Py   : {process_manager.python_path}")
         print("Auth            : X-G1-Management-Key required")
-    print("No DDS imports. XR requests are controller-validated over loopback; no Unitree service command endpoints.")
+    print("No DDS imports. XR requests are controller-validated; process lifecycle is fixed-command only; no Unitree ServiceSwitch endpoints.")
     try:
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:

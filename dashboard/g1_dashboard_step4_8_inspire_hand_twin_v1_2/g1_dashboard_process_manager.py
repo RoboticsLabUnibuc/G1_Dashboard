@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Whitelisted lifecycle manager for the validated G1 XR controller.
+"""Whitelisted lifecycle manager for G1 XR controller dependencies.
 
 This module intentionally does not import Unitree DDS libraries. It can only
-start/stop one exact controller script and only with server-defined arguments.
-The browser never supplies an executable path, shell fragment, environment
-variable, or arbitrary command-line token.
+start/stop the exact validated controller, the exact teleimager executable, and
+the installed root-owned Inspire helper. The browser never supplies an
+executable path, shell fragment, environment variable, PID, or arbitrary
+command-line token.
 """
 from __future__ import annotations
 
@@ -28,7 +29,7 @@ CONTROLLER_BASENAME = (
     "dashboard_telemetry_v1_8.py"
 )
 MANAGER_SCHEMA = "g1_dashboard.controller_process.v1"
-MANAGER_VERSION = "g1_dashboard_process_manager.v1.1-step5-1-xr-actions"
+MANAGER_VERSION = "g1_dashboard_process_manager.v1.2-dependency-lifecycle"
 CONTROLLER_SHA256 = "66bb5c0bd99e1c034426c2395e46229a54d1f690fe607ed2f513c233e50fa758"
 
 ACTION_REQUEST_SCHEMA = "g1_dashboard.action_request.v1"
@@ -36,6 +37,10 @@ ACTION_RESPONSE_SCHEMA = "g1_dashboard.action_response.v1"
 ACTION_HOST = "127.0.0.1"
 ACTION_PORT = 8767
 ACTION_OPERATIONS = {"REQUEST_XR", "CANCEL_XR_REQUEST", "HAND_BACK_ARMS"}
+
+INSPIRE_SERVICE_BASENAME = "inspire_g1"
+CAMERA_BASENAME = "teleimager-server"
+CAMERA_WEBRTC_PORT = 60001
 
 # These defaults exactly match the last validated V1.8 launch command.
 # Min/max values are dashboard edit bounds only. They are not robot safety
@@ -158,6 +163,63 @@ def _find_matching_pids(script_path: Path) -> list[int]:
     return sorted(set(out))
 
 
+def _find_pids_by_basename(basename: str) -> list[int]:
+    out: list[int] = []
+    proc = Path("/proc")
+    if not proc.exists():
+        return out
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        args = _proc_cmdline(pid)
+        if any(Path(arg).name == basename for arg in args):
+            out.append(pid)
+    return sorted(set(out))
+
+
+def _tcp_port_open(host: str, port: int, timeout_s: float = 0.08) -> bool:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(timeout_s)
+        return sock.connect_ex((host, int(port))) == 0
+    except Exception:
+        return False
+    finally:
+        sock.close()
+
+
+def default_camera_executable() -> Path:
+    override = os.environ.get("G1_DASHBOARD_CAMERA_EXECUTABLE", "").strip()
+    if override:
+        path = Path(override).expanduser()
+        if path.name != CAMERA_BASENAME:
+            raise RuntimeError(f"camera executable must be {CAMERA_BASENAME}; got {path.name!r}")
+        return path
+    candidates = [
+        Path.home() / "miniconda3" / "envs" / "teleimager" / "bin" / CAMERA_BASENAME,
+        Path.home() / "miniforge3" / "envs" / "teleimager" / "bin" / CAMERA_BASENAME,
+        Path.home() / "anaconda3" / "envs" / "teleimager" / "bin" / CAMERA_BASENAME,
+    ]
+    for path in candidates:
+        if path.is_file() and os.access(path, os.X_OK):
+            return path
+    return candidates[0]
+
+
+def _camera_environment(executable: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONNOUSERSITE"] = "1"
+    env.pop("PYTHONPATH", None)
+    env.pop("PYTHONHOME", None)
+    prefix = executable.parent.parent
+    env["PATH"] = f"{prefix / 'bin'}:{env.get('PATH', '')}"
+    env["CONDA_PREFIX"] = str(prefix)
+    env["CONDA_DEFAULT_ENV"] = prefix.name
+    return env
+
+
 def default_controller_path() -> Path:
     override = os.environ.get("G1_DASHBOARD_CONTROLLER_SCRIPT", "").strip()
     path = Path(override).expanduser() if override else Path.home() / "xr_teleoperate_g1demo" / "teleop" / CONTROLLER_BASENAME
@@ -270,14 +332,40 @@ class ControllerProcessManager:
             "G1_DASHBOARD_CONTROLLER_LOG",
             str(Path.home() / ".local" / "state" / "g1_dashboard" / "controller_v1_8.log"),
         )).expanduser()
+
+        self.inspire_helper_path = Path(os.environ.get(
+            "G1_DASHBOARD_INSPIRE_HELPER",
+            "/usr/local/libexec/g1-dashboard/g1_dashboard_inspire_helper.py",
+        ))
+        self.camera_executable = default_camera_executable()
+        self.camera_cwd = Path(os.environ.get(
+            "G1_DASHBOARD_CAMERA_CWD",
+            str(Path.home() / "teleimager"),
+        )).expanduser()
+        self.camera_state_path = Path(os.environ.get(
+            "G1_DASHBOARD_CAMERA_STATE",
+            "/tmp/g1_dashboard_camera_teleimager_state.json",
+        ))
+        self.camera_log_path = Path(os.environ.get(
+            "G1_DASHBOARD_CAMERA_LOG",
+            str(Path.home() / ".local" / "state" / "g1_dashboard" / "camera_teleimager.log"),
+        )).expanduser()
+
         self._lock = threading.RLock()
         self._popen: subprocess.Popen[bytes] | None = None
         self._managed: dict[str, Any] | None = None
         self._last_error: str | None = None
         self._last_exit_code: int | None = None
+        self._camera_popen: subprocess.Popen[bytes] | None = None
+        self._camera_managed: dict[str, Any] | None = None
+        self._camera_last_error: str | None = None
+        self._camera_last_exit_code: int | None = None
         self._load_state()
+        self._load_camera_state()
 
+    # ---------- persisted controller state ----------
     def _load_state(self) -> None:
+        stale: dict[str, Any] | None = None
         try:
             data = json.loads(self.state_path.read_text())
             pid = int(data.get("pid", 0))
@@ -288,6 +376,7 @@ class ControllerProcessManager:
                 if any(Path(a).name == CONTROLLER_BASENAME for a in args[1:]):
                     self._managed = data
                     return
+            stale = data
         except Exception:
             pass
         self._managed = None
@@ -295,6 +384,13 @@ class ControllerProcessManager:
             self.state_path.unlink(missing_ok=True)
         except Exception:
             pass
+        # If the dashboard restarted during an explicit controller stop, finish
+        # the dependency cleanup only after confirming the controller is gone.
+        if stale and stale.get("stop_requested_unix_time_s") and stale.get("inspire_stop_with_controller"):
+            try:
+                self._stop_inspire_managed_dependency()
+            except Exception as exc:
+                self._last_error = f"controller stopped, but Inspire cleanup failed after dashboard restart: {exc}"
 
     def _save_state(self) -> None:
         if self._managed is None:
@@ -312,6 +408,375 @@ class ControllerProcessManager:
         except Exception as exc:
             self._last_error = f"failed to persist process state: {exc}"
 
+    # ---------- Inspire privileged dependency ----------
+    def _inspire_status(self) -> dict[str, Any]:
+        helper = self.inspire_helper_path
+        if helper.is_file() and os.access(helper, os.X_OK):
+            try:
+                result = subprocess.run(
+                    [str(helper), "status"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    timeout=1.5,
+                    check=False,
+                    text=True,
+                )
+                text = (result.stdout or "").strip()
+                data = json.loads(text.splitlines()[-1]) if text else {}
+                if result.returncode == 0 and isinstance(data, dict):
+                    data["helper_installed"] = True
+                    data["helper_path"] = str(helper)
+                    return data
+                return {
+                    "schema": "g1_dashboard.inspire_service.v1",
+                    "state": "UNAVAILABLE",
+                    "managed": False,
+                    "pid": None,
+                    "external_pids": _find_pids_by_basename(INSPIRE_SERVICE_BASENAME),
+                    "helper_installed": True,
+                    "helper_path": str(helper),
+                    "error": data.get("error") if isinstance(data, dict) else text or f"helper exit {result.returncode}",
+                }
+            except Exception as exc:
+                return {
+                    "schema": "g1_dashboard.inspire_service.v1",
+                    "state": "UNAVAILABLE",
+                    "managed": False,
+                    "pid": None,
+                    "external_pids": _find_pids_by_basename(INSPIRE_SERVICE_BASENAME),
+                    "helper_installed": True,
+                    "helper_path": str(helper),
+                    "error": str(exc),
+                }
+
+        external = _find_pids_by_basename(INSPIRE_SERVICE_BASENAME)
+        if len(external) == 1:
+            state = "RUNNING_EXTERNAL"
+        elif len(external) > 1:
+            state = "CONFLICT"
+        else:
+            state = "UNAVAILABLE"
+        return {
+            "schema": "g1_dashboard.inspire_service.v1",
+            "state": state,
+            "managed": False,
+            "pid": external[0] if len(external) == 1 else None,
+            "external_pids": external,
+            "helper_installed": False,
+            "helper_path": str(helper),
+            "error": None if external else "privileged Inspire helper is not installed",
+        }
+
+    def _run_inspire_privileged(self, action: str, timeout: float = 8.0) -> dict[str, Any]:
+        if action not in {"start", "stop"}:
+            raise ValueError("unsupported Inspire helper action")
+        helper = self.inspire_helper_path
+        if not (helper.is_file() and os.access(helper, os.X_OK)):
+            raise RuntimeError(
+                "Inspire lifecycle helper is not installed. Run sudo ./install_inspire_helper.sh once on PC2."
+            )
+        sudo = Path("/usr/bin/sudo")
+        if not sudo.is_file():
+            raise RuntimeError("/usr/bin/sudo not found; cannot use the installed Inspire lifecycle helper")
+        try:
+            result = subprocess.run(
+                [str(sudo), "-n", str(helper), action],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=timeout,
+                check=False,
+                text=True,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"Inspire {action} helper timed out") from exc
+        text = (result.stdout or "").strip()
+        data: dict[str, Any] = {}
+        if text:
+            try:
+                candidate = json.loads(text.splitlines()[-1])
+                if isinstance(candidate, dict):
+                    data = candidate
+            except Exception:
+                pass
+        if result.returncode != 0:
+            detail = data.get("error") or text or f"sudo/helper exit {result.returncode}"
+            if "password" in detail.lower() or "sudoers" in detail.lower() or "not allowed" in detail.lower():
+                detail += "; run sudo ./install_inspire_helper.sh once on PC2"
+            raise RuntimeError(f"Inspire {action} failed: {detail}")
+        return data if data else self._inspire_status()
+
+    def _ensure_inspire_for_controller(self) -> tuple[dict[str, Any], bool]:
+        """Return (status, newly_started_by_this_call)."""
+        st = self._inspire_status()
+        state = st.get("state")
+        if state == "RUNNING_MANAGED":
+            return st, False
+        if state == "RUNNING_EXTERNAL":
+            return st, False
+        if state == "CONFLICT":
+            raise RuntimeError(f"multiple/conflicting Inspire processes detected: {st.get('external_pids', [])}")
+        if not st.get("helper_installed"):
+            raise RuntimeError(
+                "Inspire server is not running and the privileged lifecycle helper is not installed. "
+                "Run sudo ./install_inspire_helper.sh once on PC2."
+            )
+        started = self._run_inspire_privileged("start")
+        if started.get("state") != "RUNNING_MANAGED":
+            raise RuntimeError(f"Inspire helper did not reach RUNNING_MANAGED: {started}")
+        return started, True
+
+    def _stop_inspire_managed_dependency(self) -> dict[str, Any]:
+        st = self._inspire_status()
+        if st.get("state") == "RUNNING_MANAGED":
+            return self._run_inspire_privileged("stop")
+        # Never stop a service that was not started by the root-owned helper.
+        return st
+
+    # ---------- camera process state ----------
+    def _load_camera_state(self) -> None:
+        try:
+            data = json.loads(self.camera_state_path.read_text())
+            pid = int(data.get("pid", 0))
+            ticks = data.get("start_ticks")
+            ticks = int(ticks) if ticks is not None else None
+            if _process_alive(pid, ticks) and any(
+                Path(a).name == CAMERA_BASENAME for a in _proc_cmdline(pid)
+            ):
+                self._camera_managed = data
+                return
+        except Exception:
+            pass
+        self._camera_managed = None
+        try:
+            self.camera_state_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    def _save_camera_state(self) -> None:
+        if self._camera_managed is None:
+            try:
+                self.camera_state_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return
+        try:
+            self.camera_state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.camera_state_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self._camera_managed, indent=2, sort_keys=True))
+            os.chmod(tmp, 0o600)
+            tmp.replace(self.camera_state_path)
+        except Exception as exc:
+            self._camera_last_error = f"failed to persist camera process state: {exc}"
+
+    def _camera_managed_alive(self) -> tuple[bool, int | None]:
+        if self._camera_managed is None:
+            return False, None
+        pid = int(self._camera_managed.get("pid", 0))
+        ticks = self._camera_managed.get("start_ticks")
+        ticks = int(ticks) if ticks is not None else None
+        return _process_alive(pid, ticks), pid
+
+    def _refresh_camera(self) -> None:
+        if self._camera_popen is not None:
+            rc = self._camera_popen.poll()
+            if rc is not None:
+                self._camera_last_exit_code = int(rc)
+                self._camera_popen = None
+        alive, pid = self._camera_managed_alive()
+        if self._camera_managed is not None and alive and pid is not None:
+            requested = self._camera_managed.get("stop_requested_unix_time_s")
+            if requested and not self._camera_managed.get("term_sent_unix_time_s"):
+                if time.time() - float(requested) >= 3.0:
+                    try:
+                        os.killpg(pid, signal.SIGTERM)
+                        self._camera_managed["term_sent_unix_time_s"] = time.time()
+                        self._save_camera_state()
+                    except ProcessLookupError:
+                        pass
+                    except Exception as exc:
+                        self._camera_last_error = f"camera SIGTERM fallback failed: {exc}"
+        alive, _pid = self._camera_managed_alive()
+        if self._camera_managed is not None and not alive:
+            self._camera_managed = None
+            self._save_camera_state()
+
+    def camera_status(self) -> dict[str, Any]:
+        with self._lock:
+            self._refresh_camera()
+            matching = _find_pids_by_basename(CAMERA_BASENAME)
+            managed_alive, managed_pid = self._camera_managed_alive()
+            external = [pid for pid in matching if pid != managed_pid]
+            now = time.time()
+            executable_ok = self.camera_executable.is_file() and os.access(self.camera_executable, os.X_OK)
+            cwd_ok = self.camera_cwd.is_dir()
+            port_ready = _tcp_port_open("127.0.0.1", CAMERA_WEBRTC_PORT)
+
+            if managed_alive and self._camera_managed is not None:
+                stop_requested = self._camera_managed.get("stop_requested_unix_time_s")
+                state = "STOPPING" if stop_requested else ("CONFLICT" if external else "RUNNING")
+                launched = float(self._camera_managed.get("launched_unix_time_s", now))
+                return {
+                    "schema": "g1_dashboard.camera_process.v1",
+                    "manager_version": MANAGER_VERSION,
+                    "enabled": self.enabled,
+                    "state": state,
+                    "managed": True,
+                    "pid": managed_pid,
+                    "uptime_s": max(0.0, now - launched),
+                    "stop_requested_unix_time_s": stop_requested,
+                    "external_pids": external,
+                    "executable": str(self.camera_executable),
+                    "cwd": str(self.camera_cwd),
+                    "log_path": str(self.camera_log_path),
+                    "port": CAMERA_WEBRTC_PORT,
+                    "port_ready": port_ready,
+                    "last_error": self._camera_last_error,
+                    "last_exit_code": self._camera_last_exit_code,
+                    "can_start": False,
+                    "can_stop": state == "RUNNING",
+                }
+
+            if matching:
+                state = "RUNNING_EXTERNAL" if len(matching) == 1 else "CONFLICT"
+                return {
+                    "schema": "g1_dashboard.camera_process.v1",
+                    "manager_version": MANAGER_VERSION,
+                    "enabled": self.enabled,
+                    "state": state,
+                    "managed": False,
+                    "pid": matching[0] if len(matching) == 1 else None,
+                    "uptime_s": None,
+                    "external_pids": matching,
+                    "executable": str(self.camera_executable),
+                    "cwd": str(self.camera_cwd),
+                    "log_path": str(self.camera_log_path),
+                    "port": CAMERA_WEBRTC_PORT,
+                    "port_ready": port_ready,
+                    "last_error": self._camera_last_error,
+                    "last_exit_code": self._camera_last_exit_code,
+                    "can_start": False,
+                    "can_stop": False,
+                }
+
+            ready = self.enabled and executable_ok and cwd_ok
+            return {
+                "schema": "g1_dashboard.camera_process.v1",
+                "manager_version": MANAGER_VERSION,
+                "enabled": self.enabled,
+                "state": "STOPPED" if ready else "UNAVAILABLE",
+                "managed": False,
+                "pid": None,
+                "uptime_s": None,
+                "external_pids": [],
+                "executable": str(self.camera_executable),
+                "cwd": str(self.camera_cwd),
+                "log_path": str(self.camera_log_path),
+                "port": CAMERA_WEBRTC_PORT,
+                "port_ready": port_ready,
+                "last_error": self._camera_last_error,
+                "last_exit_code": self._camera_last_exit_code,
+                "can_start": ready,
+                "can_stop": False,
+            }
+
+    def start_camera(self) -> dict[str, Any]:
+        with self._lock:
+            if not self.enabled:
+                raise PermissionError("dashboard process actions are disabled")
+            st = self.camera_status()
+            if st["state"] in {"RUNNING", "RUNNING_EXTERNAL"}:
+                return st
+            if st["state"] == "CONFLICT":
+                raise RuntimeError(f"multiple/conflicting teleimager processes detected: {st.get('external_pids', [])}")
+            if not (self.camera_executable.is_file() and os.access(self.camera_executable, os.X_OK)):
+                raise FileNotFoundError(f"teleimager-server not executable: {self.camera_executable}")
+            if not self.camera_cwd.is_dir():
+                raise FileNotFoundError(f"teleimager working directory not found: {self.camera_cwd}")
+            matching = _find_pids_by_basename(CAMERA_BASENAME)
+            if matching:
+                return self.camera_status()
+
+            env = _camera_environment(self.camera_executable)
+            self.camera_log_path.parent.mkdir(parents=True, exist_ok=True)
+            log = open(self.camera_log_path, "ab", buffering=0)
+            log.write(
+                (
+                    f"\n===== dashboard camera launch {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n"
+                    f"command: {self.camera_executable}\n"
+                    "managed_env: teleimager conda prefix; PYTHONNOUSERSITE=1; PYTHONPATH/PYTHONHOME cleared\n"
+                ).encode("utf-8", "replace")
+            )
+            try:
+                proc = subprocess.Popen(
+                    [str(self.camera_executable)],
+                    cwd=str(self.camera_cwd),
+                    stdin=subprocess.DEVNULL,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+            except Exception:
+                log.close()
+                raise
+            log.close()
+            self._camera_popen = proc
+            ticks = None
+            for _ in range(20):
+                ticks = _proc_start_ticks(proc.pid)
+                if ticks is not None:
+                    break
+                time.sleep(0.005)
+            self._camera_managed = {
+                "pid": proc.pid,
+                "start_ticks": ticks,
+                "launched_unix_time_s": time.time(),
+                "stop_requested_unix_time_s": None,
+                "term_sent_unix_time_s": None,
+            }
+            self._camera_last_error = None
+            self._camera_last_exit_code = None
+            self._save_camera_state()
+            time.sleep(0.12)
+            rc = proc.poll()
+            if rc is not None:
+                self._camera_last_exit_code = int(rc)
+                self._camera_managed = None
+                self._camera_popen = None
+                self._save_camera_state()
+                raise RuntimeError(
+                    f"teleimager-server exited immediately with code {rc}; inspect {self.camera_log_path}"
+                )
+            return self.camera_status()
+
+    def stop_camera(self) -> dict[str, Any]:
+        with self._lock:
+            if not self.enabled:
+                raise PermissionError("dashboard process actions are disabled")
+            self._refresh_camera()
+            alive, pid = self._camera_managed_alive()
+            if not alive or pid is None or self._camera_managed is None:
+                matching = _find_pids_by_basename(CAMERA_BASENAME)
+                if matching:
+                    raise PermissionError(
+                        f"teleimager pid {matching[0]} was not launched/adopted by this dashboard; disconnect only or stop it from its owning terminal"
+                    )
+                return self.camera_status()
+            if self._camera_managed.get("stop_requested_unix_time_s"):
+                return self.camera_status()
+            # Validated manual shutdown is Ctrl+C, so use SIGINT for managed teleimager.
+            try:
+                os.killpg(pid, signal.SIGINT)
+            except ProcessLookupError:
+                pass
+            self._camera_managed["stop_requested_unix_time_s"] = time.time()
+            self._save_camera_state()
+            return self.camera_status()
+
+    # ---------- controller configuration ----------
     def _validate_parameters(self, supplied: Any) -> dict[str, Any]:
         if supplied is None:
             supplied = {}
@@ -360,6 +825,7 @@ class ControllerProcessManager:
         return cmd, params
 
     def config_schema(self) -> dict[str, Any]:
+        inspire = self._inspire_status()
         return {
             "schema": MANAGER_SCHEMA,
             "manager_version": MANAGER_VERSION,
@@ -373,20 +839,30 @@ class ControllerProcessManager:
             "controller_python_exists": self.python_path.is_file() and os.access(self.python_path, os.X_OK),
             "controller_user_site_disabled": True,
             "fixed_args": list(FIXED_ARGS),
-            "locked_settings": list(LOCKED_SETTINGS),
+            "locked_settings": list(LOCKED_SETTINGS) + [
+                {"label": "Inspire service", "value": "starts before listener · stops after controlled listener shutdown"},
+            ],
             "parameter_specs": PARAMETER_SPECS,
             "known_good": {spec["name"]: spec["default"] for spec in PARAMETER_SPECS},
             "dashboard_edit_bounds_are_safety_limits": False,
             "management_key_required": True,
+            "inspire_dependency": inspire,
             "xr_action_channel": {
                 "transport": f"udp://{ACTION_HOST}:{ACTION_PORT}",
                 "loopback_only": True,
                 "controller_validated": True,
                 "operations": sorted(ACTION_OPERATIONS),
             },
+            "camera_process": {
+                "executable": str(self.camera_executable),
+                "cwd": str(self.camera_cwd),
+                "webrtc_port": CAMERA_WEBRTC_PORT,
+                "managed_from_camera_buttons": True,
+            },
             "log_path": str(self.log_path),
         }
 
+    # ---------- controller lifecycle ----------
     def _managed_alive(self) -> tuple[bool, int | None]:
         if self._managed is None:
             return False, None
@@ -403,8 +879,19 @@ class ControllerProcessManager:
                 self._popen = None
         alive, _pid = self._managed_alive()
         if self._managed is not None and not alive:
+            finished = self._managed
             self._managed = None
             self._save_state()
+            if finished.get("stop_requested_unix_time_s") and finished.get("inspire_stop_with_controller"):
+                try:
+                    self._stop_inspire_managed_dependency()
+                except Exception as exc:
+                    self._last_error = f"controller stopped, but Inspire dependency stop failed: {exc}"
+            elif finished.get("inspire_stop_with_controller"):
+                # Unexpected controller exit: do not silently kill a hardware service.
+                self._last_error = (
+                    "controller exited without an explicit dashboard stop; dashboard-managed Inspire service was left running for operator inspection"
+                )
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -413,6 +900,7 @@ class ControllerProcessManager:
             managed_alive, managed_pid = self._managed_alive()
             external = [pid for pid in matching if pid != managed_pid]
             now = time.time()
+            inspire = self._inspire_status()
 
             if managed_alive and self._managed is not None:
                 stop_requested = self._managed.get("stop_requested_unix_time_s")
@@ -439,6 +927,7 @@ class ControllerProcessManager:
                     "can_start": False,
                     "can_stop": True,
                     "can_request_action": bool(self._managed.get("action_token")) and not bool(stop_requested),
+                    "dependencies": {"inspire": inspire},
                 }
 
             if matching:
@@ -461,15 +950,25 @@ class ControllerProcessManager:
                     "can_start": False,
                     "can_stop": False,
                     "can_request_action": False,
+                    "dependencies": {"inspire": inspire},
                 }
 
             script_hash = _sha256_file(self.script_path) if self.script_path.is_file() else None
+            inspire_state = inspire.get("state")
+            inspire_startable = inspire_state in {"RUNNING_MANAGED", "RUNNING_EXTERNAL"} or (
+                inspire_state in {"STOPPED", "UNAVAILABLE"}
+                and bool(inspire.get("helper_installed"))
+                and inspire.get("binary_exists", True) is not False
+            )
+            if inspire_state == "CONFLICT":
+                inspire_startable = False
             ready = (
                 self.enabled
                 and self.script_path.is_file()
                 and script_hash == CONTROLLER_SHA256
                 and self.python_path.is_file()
                 and os.access(self.python_path, os.X_OK)
+                and inspire_startable
             )
             return {
                 "schema": MANAGER_SCHEMA,
@@ -490,6 +989,7 @@ class ControllerProcessManager:
                 "can_start": ready,
                 "can_stop": False,
                 "can_request_action": False,
+                "dependencies": {"inspire": inspire},
             }
 
     def start(self, parameters: Any) -> dict[str, Any]:
@@ -520,12 +1020,18 @@ class ControllerProcessManager:
                 self.python_path, env, self.script_path.parent
             )
 
+            # Hardware dependency is started only after Python/controller preflight
+            # succeeds, but always before the teleop controller itself.
+            inspire, inspire_started_now = self._ensure_inspire_for_controller()
+            inspire_stop_with_controller = inspire.get("state") == "RUNNING_MANAGED"
+
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
             log = open(self.log_path, "ab", buffering=0)
             banner = (
                 f"\n===== dashboard launch {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n"
                 f"command: {' '.join(cmd)}\n"
                 "managed_env: PYTHONNOUSERSITE=1; PYTHONPATH/PYTHONHOME cleared; keyboard disabled; loopback XR actions enabled\n"
+                f"inspire_dependency: state={inspire.get('state')} pid={inspire.get('pid')} stop_with_controller={inspire_stop_with_controller}\n"
                 f"preflight:\n{preflight}\n"
             ).encode("utf-8", "replace")
             log.write(banner)
@@ -542,11 +1048,15 @@ class ControllerProcessManager:
                 )
             except Exception:
                 log.close()
+                if inspire_started_now:
+                    try:
+                        self._stop_inspire_managed_dependency()
+                    except Exception as cleanup_exc:
+                        self._last_error = f"controller spawn failed and Inspire rollback also failed: {cleanup_exc}"
                 raise
             log.close()
             self._popen = proc
             ticks = None
-            # /proc can appear a few milliseconds after Popen returns.
             for _ in range(20):
                 ticks = _proc_start_ticks(proc.pid)
                 if ticks is not None:
@@ -560,11 +1070,11 @@ class ControllerProcessManager:
                 "command": cmd,
                 "stop_requested_unix_time_s": None,
                 "action_token": controller_action_token,
+                "inspire_stop_with_controller": inspire_stop_with_controller,
             }
             self._last_error = None
             self._last_exit_code = None
             self._save_state()
-            # Detect immediate import/startup failures without blocking normal launches.
             time.sleep(0.08)
             rc = proc.poll()
             if rc is not None:
@@ -572,6 +1082,11 @@ class ControllerProcessManager:
                 self._managed = None
                 self._popen = None
                 self._save_state()
+                if inspire_started_now:
+                    try:
+                        self._stop_inspire_managed_dependency()
+                    except Exception as cleanup_exc:
+                        self._last_error = f"controller exited immediately and Inspire rollback failed: {cleanup_exc}"
                 raise RuntimeError(f"controller exited immediately with code {rc}; inspect {self.log_path}")
             return self.status()
 
@@ -631,6 +1146,37 @@ class ControllerProcessManager:
             raise RuntimeError("controller action response request_id mismatch")
         return response
 
+    def _watch_controller_stop_cleanup(self, pid: int, ticks: int | None) -> None:
+        """Finish Inspire cleanup after an explicit listener stop without relying on browser polling."""
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline and _process_alive(pid, ticks):
+            time.sleep(0.10)
+        if _process_alive(pid, ticks):
+            with self._lock:
+                self._last_error = (
+                    f"controller pid {pid} did not exit within 30 s after stop request; Inspire was left running"
+                )
+            return
+        with self._lock:
+            current = self._managed
+            if not current or int(current.get("pid", 0)) != pid:
+                return
+            if not current.get("stop_requested_unix_time_s"):
+                return
+            should_stop_inspire = bool(current.get("inspire_stop_with_controller"))
+            if self._popen is not None:
+                rc = self._popen.poll()
+                if rc is not None:
+                    self._last_exit_code = int(rc)
+                    self._popen = None
+            self._managed = None
+            self._save_state()
+            if should_stop_inspire:
+                try:
+                    self._stop_inspire_managed_dependency()
+                except Exception as exc:
+                    self._last_error = f"controller stopped, but Inspire dependency stop failed: {exc}"
+
     def stop(self) -> dict[str, Any]:
         with self._lock:
             if not self.enabled:
@@ -646,11 +1192,19 @@ class ControllerProcessManager:
                 return self.status()
             if self._managed.get("stop_requested_unix_time_s"):
                 return self.status()
-            # One SIGTERM requests the controller's normal controlled handback.
-            # It must not be replaced with SIGKILL: the controller owns release.
+            # Controller must stop first.  _refresh() stops a helper-managed
+            # Inspire service only after the controlled controller process exits.
+            ticks = self._managed.get("start_ticks")
+            ticks = int(ticks) if ticks is not None else None
             os.kill(pid, signal.SIGTERM)
             self._managed["stop_requested_unix_time_s"] = time.time()
             self._save_state()
+            threading.Thread(
+                target=self._watch_controller_stop_cleanup,
+                args=(pid, ticks),
+                name="g1-dashboard-controller-stop-cleanup",
+                daemon=True,
+            ).start()
             return self.status()
 
     def log_tail(self, max_lines: int = 80) -> dict[str, Any]:
@@ -659,7 +1213,6 @@ class ControllerProcessManager:
             if not self.log_path.exists():
                 lines: list[str] = []
             else:
-                # Log sizes are small in normal use; cap the read to the final 128 KiB.
                 with self.log_path.open("rb") as f:
                     try:
                         f.seek(0, os.SEEK_END)
@@ -672,3 +1225,22 @@ class ControllerProcessManager:
         except Exception as exc:
             lines = [f"log unavailable: {exc}"]
         return {"schema": MANAGER_SCHEMA, "log_path": str(self.log_path), "lines": lines}
+
+    def camera_log_tail(self, max_lines: int = 80) -> dict[str, Any]:
+        max_lines = max(1, min(200, int(max_lines)))
+        try:
+            if not self.camera_log_path.exists():
+                lines: list[str] = []
+            else:
+                with self.camera_log_path.open("rb") as f:
+                    try:
+                        f.seek(0, os.SEEK_END)
+                        size = f.tell()
+                        f.seek(max(0, size - 131072), os.SEEK_SET)
+                    except OSError:
+                        pass
+                    text = f.read().decode("utf-8", "replace")
+                lines = text.splitlines()[-max_lines:]
+        except Exception as exc:
+            lines = [f"log unavailable: {exc}"]
+        return {"schema": "g1_dashboard.camera_process.v1", "log_path": str(self.camera_log_path), "lines": lines}

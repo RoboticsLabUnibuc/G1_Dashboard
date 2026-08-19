@@ -56,16 +56,21 @@ PY
   BRIDGE_ARGS+=(--enable-process-actions)
 fi
 
-echo "G1 dashboard Step 5.1 — controller process + XR action manager"
+echo "G1 dashboard Step 5.1 — controller + Inspire + camera lifecycle + XR actions"
 echo "  interface       : $IFACE"
 echo "  monitor python  : $MONITOR_PY"
 echo "  services        : $UNITREE_SERVICES (read-only)"
 echo "  base sensing    : $BASE_SENSING (read-only)"
 echo "  system rate     : ${SYSTEM_HZ} Hz"
 if ((${#BRIDGE_ARGS[@]})); then
-  echo "  process actions : ENABLED (start/stop + controller-validated XR actions)"
+  echo "  process actions : ENABLED (listener/Inspire/camera + controller-validated XR actions)"
   echo "  management key  : $G1_DASHBOARD_ACTION_TOKEN"
   echo "                     the site will prompt for this key on first open"
+  if [[ -x "/usr/local/libexec/g1-dashboard/g1_dashboard_inspire_helper.py" ]]; then
+    echo "  Inspire helper  : installed"
+  else
+    echo "  Inspire helper  : NOT INSTALLED — run: sudo ./install_inspire_helper.sh"
+  fi
 else
   echo "  process actions : DISABLED"
 fi
@@ -83,7 +88,8 @@ sleep 0.25
 
 echo "System monitor pid: $MONITOR_PID"
 echo "Starting dashboard bridge. Ctrl+C stops dashboard processes only."
-echo "A controller launched from the dashboard is intentionally left running."
+echo "Managed controller/camera processes are intentionally left running if the dashboard itself exits."
+echo "A helper-managed Inspire service follows the controller lifecycle, not the browser lifecycle."
 echo
 
 "$BRIDGE_PY" "$HERE/g1_dashboard_bridge.py" "${BRIDGE_ARGS[@]}" &

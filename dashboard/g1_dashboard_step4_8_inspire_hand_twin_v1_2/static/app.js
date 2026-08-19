@@ -25,6 +25,9 @@ let cameraFallback=false;
 let cameraUrl=null;
 let cameraFrameWatch=null;
 let cameraConnecting=false;
+let cameraProcessStatus=null;
+let cameraProcessPollBusy=false;
+let cameraProcessActionBusy=false;
 let selectedJointIndex=18;
 
 function switchView(name){
@@ -97,7 +100,7 @@ async function bootstrapManagementKey(){
       try{await verifyManagementKey(saved);return;}
       catch{storeManagementKey('');showManagementKeyPrompt('The saved management key is no longer valid. The dashboard may have restarted; enter the new key printed by ./start_dashboard.sh.');return;}
     }
-    showManagementKeyPrompt('Enter the current management key to enable Start/Stop and ENTER/EXIT TELEOP controls.');
+    showManagementKeyPrompt('Enter the current management key to enable listener, camera, and ENTER/EXIT TELEOP controls.');
   }catch(err){
     console.debug('management-key bootstrap unavailable',err);
   }
@@ -122,12 +125,18 @@ function renderControllerProcess(st){
   const pid=controllerStatus.pid;
   $('controllerProcessPid').textContent=pid?`pid ${pid}`:'pid —';
   $('controllerProcessUptime').textContent=finite(controllerStatus.uptime_s)?`uptime ${duration(controllerStatus.uptime_s)}`:'uptime —';
+  const inspire=controllerStatus?.dependencies?.inspire||{};
+  const inspireState=inspire.state||'—';
+  const inspireLabel=inspireState==='RUNNING_MANAGED'?'Inspire MANAGED':inspireState==='RUNNING_EXTERNAL'?'Inspire EXTERNAL':inspireState==='STOPPED'?'Inspire STOPPED':inspireState==='CONFLICT'?'Inspire CONFLICT':inspireState==='UNAVAILABLE'?'Inspire SETUP':'Inspire —';
+  $('controllerInspireState').textContent=inspireLabel;
+  setTone($('controllerInspireState'),inspireState==='RUNNING_MANAGED'||inspireState==='RUNNING_EXTERNAL'?'good':inspireState==='CONFLICT'?'bad':inspireState==='UNAVAILABLE'?'warn':null);
   let detail='Process manager unavailable.';
-  if(state==='STOPPED') detail='Ready to launch the whitelisted teleop listener.';
-  else if(state==='RUNNING') detail='Dashboard-managed listener is running. Use ENTER TELEOP below when controller readiness allows it.';
-  else if(state==='STOPPING') detail='Controlled stop requested; waiting for controller handback and cleanup.';
+  if(state==='STOPPED') detail=inspireState==='RUNNING_EXTERNAL'?'Ready; external Inspire service will be reused and left running on stop.':'Ready; Start launches Inspire first, then the whitelisted teleop listener.';
+  else if(state==='RUNNING') detail=inspireState==='RUNNING_MANAGED'?'Listener + dashboard-managed Inspire service are running.':'Dashboard-managed listener is running; Inspire is externally owned.';
+  else if(state==='STOPPING') detail='Controlled listener stop requested; Inspire stops only after controller handback/exit.';
   else if(state==='RUNNING_EXTERNAL') detail='Teleop listener is already running outside this dashboard. Lifecycle and XR actions are locked here.';
   else if(controllerStatus.last_error) detail=controllerStatus.last_error;
+  else if(inspire.error) detail=`Inspire dependency: ${inspire.error}`;
   else if(controllerStatus.enabled===false) detail='Process actions disabled by dashboard startup configuration.';
   $('controllerProcessDetail').textContent=detail;
   $('controllerConfigureBtn').disabled=controllerActionBusy || !controllerStatus.can_start;
@@ -250,6 +259,8 @@ async function openControllerModal(){
     else if(!cfg.controller_script_exists)setControllerModalError(`Controller script not found: ${cfg.controller_script}`);
     else if(!cfg.controller_hash_match)setControllerModalError(`Controller hash mismatch. Expected ${cfg.controller_expected_sha256}; got ${cfg.controller_actual_sha256||'unreadable'}. Launch is locked.`);
     else if(!cfg.controller_python_exists)setControllerModalError(`Controller Python not executable: ${cfg.controller_python}`);
+    else if(cfg?.inspire_dependency?.state==='CONFLICT')setControllerModalError('Multiple/conflicting inspire_g1 processes detected. Resolve them before launching the managed listener.');
+    else if(cfg?.inspire_dependency?.state==='UNAVAILABLE'&&!cfg?.inspire_dependency?.helper_installed)setControllerModalError('Inspire lifecycle setup required on PC2: run sudo ./install_inspire_helper.sh once, then reopen this window.');
     updateControllerStartEnabled();
   }catch(err){setControllerModalError(String(err));$('controllerStartBtn').disabled=true;}
 }
@@ -333,7 +344,7 @@ $('controllerStartBtn').addEventListener('click',async()=>{
 $('controllerStopBtn').addEventListener('click',async()=>{
   if(controllerActionBusy)return;
   if(!currentManagementKey()){showManagementKeyPrompt('Enter the management key to request a controlled listener stop.',$('controllerStopBtn').click.bind($('controllerStopBtn')));return;}
-  if(!window.confirm('Request a controlled stop of the teleop listener? If XR ownership is active, the controller will perform its normal handback before exiting.'))return;
+  if(!window.confirm('Request a controlled stop? The controller performs its normal handback first; a dashboard-managed Inspire server is stopped only after the controller exits.'))return;
   controllerActionBusy=true;renderControllerProcess(controllerStatus||{});
   try{await controllerPost('/api/controller/stop',{});await pollControllerProcess();}
   catch(err){window.alert(`Stop request failed: ${err.message||err}`);}
@@ -362,7 +373,7 @@ $('xrActionBtn').addEventListener('click',async()=>{
 });
 document.addEventListener('keydown',(e)=>{if(e.key==='Escape'&&!$('controllerModal').classList.contains('hidden'))closeControllerModal();});
 
-/* ---------- Camera / teleimager ---------- */
+/* ---------- Camera / teleimager process + WebRTC ---------- */
 function fallbackCameraOffer(){
   const host=window.location.hostname;
   return host ? `https://${host}:60001/offer` : null;
@@ -373,13 +384,65 @@ function cameraBaseFromTelemetry(t){
   try{ const u=new URL(offer); u.pathname='/'; u.search=''; u.hash=''; return u.toString().replace(/\/$/,''); }catch{return null;}
 }
 function cameraOfferFromTelemetry(t){ return val(t,['camera','webrtc_offer_url']) || fallbackCameraOffer(); }
+function cameraProcessTone(state){
+  if(state==='RUNNING'||state==='RUNNING_EXTERNAL')return 'good';
+  if(state==='STOPPING')return 'warn';
+  if(state==='CONFLICT'||state==='UNAVAILABLE')return 'bad';
+  return null;
+}
+function renderCameraProcess(st){
+  cameraProcessStatus=st||{};
+  const state=cameraProcessStatus.state||'UNAVAILABLE';
+  const badge=$('cameraProcessState');
+  const text=state==='RUNNING'?'SERVER ON':state==='RUNNING_EXTERNAL'?'SERVER EXT':state==='STOPPED'?'SERVER OFF':state==='STOPPING'?'SERVER STOPPING':state==='CONFLICT'?'SERVER CONFLICT':'SERVER SETUP';
+  badge.textContent=text;badge.className=`camera-process-state${cameraProcessTone(state)?` ${cameraProcessTone(state)}`:''}`;
+  const connected=!!cameraPc && ['connected','connecting','new'].includes(cameraPc.connectionState||'new');
+  if(state==='RUNNING'){
+    $('cameraStopBtn').textContent='Stop camera';
+    if(!connected)$('cameraStopBtn').classList.remove('hidden');
+  }else if(state==='RUNNING_EXTERNAL'){
+    $('cameraStopBtn').textContent='Disconnect';
+    if(!connected)$('cameraStopBtn').classList.add('hidden');
+  }else if(!connected){
+    $('cameraStopBtn').classList.add('hidden');
+  }
+  if(state==='STOPPED')$('cameraConnectBtn').textContent='Start & connect';
+  else $('cameraConnectBtn').textContent='Connect camera';
+  updateCameraButtons(latestEnv?.telemetry||{});
+}
+async function pollCameraProcess(){
+  if(cameraProcessPollBusy)return cameraProcessStatus;
+  cameraProcessPollBusy=true;
+  try{
+    const r=await fetch('/api/camera',{cache:'no-store'});
+    if(!r.ok)throw new Error(`HTTP ${r.status}`);
+    const st=await r.json();renderCameraProcess(st);return st;
+  }catch(err){
+    cameraProcessStatus={state:'UNAVAILABLE',can_start:false,can_stop:false,last_error:String(err)};
+    renderCameraProcess(cameraProcessStatus);
+    console.debug('camera process endpoint unavailable',err);
+    return cameraProcessStatus;
+  }finally{cameraProcessPollBusy=false;}
+}
+async function cameraProcessPost(path){
+  const key=currentManagementKey();
+  if(!key)throw new Error('Enter the management key first.');
+  const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-G1-Management-Key':key},body:'{}'});
+  let body={};try{body=await r.json();}catch{}
+  if(r.status===401){storeManagementKey('');showManagementKeyPrompt('Management key rejected. Enter the key printed by the currently running ./start_dashboard.sh.');}
+  if(!r.ok)throw new Error(body.error||`HTTP ${r.status}`);
+  if(body.camera)renderCameraProcess(body.camera);
+  return body.camera||cameraProcessStatus;
+}
 function updateCameraButtons(t){
   const base=cameraBaseFromTelemetry(t);
   cameraUrl=cameraOfferFromTelemetry(t);
   const link=$('cameraTrustLink');
   if(base){ link.href=base; link.classList.remove('hidden'); } else { link.removeAttribute('href'); link.classList.add('hidden'); }
   const configured=val(t,['camera','webrtc_enabled'], cameraUrl?true:false);
-  $('cameraConnectBtn').disabled=!configured || !cameraUrl || cameraConnecting;
+  const state=cameraProcessStatus?.state||'UNAVAILABLE';
+  const serverActionable=state==='RUNNING'||state==='RUNNING_EXTERNAL'||(state==='STOPPED'&&cameraProcessStatus?.can_start);
+  $('cameraConnectBtn').disabled=!configured || !cameraUrl || cameraConnecting || cameraProcessActionBusy || !serverActionable;
 }
 function cameraState(text,tone,detail){
   $('cameraStateText').textContent=text;
@@ -394,8 +457,10 @@ function stopCamera({silent=false}={}){
   cameraConnecting=false; cameraFallback=false;
   $('cameraOverlay').classList.remove('hidden');
   $('cameraOverlayTitle').textContent='Camera not connected';
-  $('cameraOverlayText').textContent='Start teleimager, then connect.';
-  $('cameraConnectBtn').classList.remove('hidden'); $('cameraStopBtn').classList.add('hidden');
+  $('cameraOverlayText').textContent=cameraProcessStatus?.state==='RUNNING'?'teleimager is running; connect when ready.':'Click Start & connect to launch teleimager.';
+  $('cameraConnectBtn').classList.remove('hidden');
+  if(cameraProcessStatus?.state==='RUNNING'){$('cameraStopBtn').textContent='Stop camera';$('cameraStopBtn').classList.remove('hidden');}
+  else $('cameraStopBtn').classList.add('hidden');
   if(!silent) cameraState('OFFLINE',null);
 }
 async function waitIceComplete(pc,timeoutMs=3500){
@@ -431,6 +496,7 @@ async function connectCamera(codec=null){
       const v=$('cameraVideo'); v.srcObject=evt.streams[0]; v.play().catch(()=>{});
       $('cameraOverlay').classList.add('hidden');
       $('cameraConnectBtn').classList.add('hidden'); $('cameraStopBtn').classList.remove('hidden');
+      $('cameraStopBtn').textContent=cameraProcessStatus?.state==='RUNNING'?'Stop camera':'Disconnect';
       cameraState('LIVE','good');
       const t0=v.currentTime;
       cameraFrameWatch=setTimeout(()=>{
@@ -444,12 +510,54 @@ async function connectCamera(codec=null){
   }catch(err){
     console.error('camera connection failed',err); stopCamera({silent:true});
     $('cameraOverlayTitle').textContent='Camera connection failed';
-    $('cameraOverlayText').textContent='Camera may be occupied, teleimager may be down, or its certificate may need trust.';
+    $('cameraOverlayText').textContent='teleimager may still be starting, the camera may be occupied, or its certificate may need trust.';
     cameraState('ERROR','bad');
-  }finally{ cameraConnecting=false; $('cameraConnectBtn').disabled=false; }
+  }finally{ cameraConnecting=false; updateCameraButtons(latestEnv?.telemetry||{}); }
 }
-$('cameraConnectBtn').addEventListener('click',()=>connectCamera());
-$('cameraStopBtn').addEventListener('click',()=>stopCamera());
+async function startAndConnectCamera(){
+  if(cameraProcessActionBusy||cameraConnecting)return;
+  let st=await pollCameraProcess();
+  if(st?.state==='STOPPED'){
+    if(!currentManagementKey()){showManagementKeyPrompt('Enter the management key to start the camera server.',()=>startAndConnectCamera());return;}
+    cameraProcessActionBusy=true;updateCameraButtons(latestEnv?.telemetry||{});
+    $('cameraOverlayTitle').textContent='Starting camera server…';
+    $('cameraOverlayText').textContent='Launching the fixed teleimager-server process on PC2.';
+    cameraState('STARTING','warn');
+    try{st=await cameraProcessPost('/api/camera/start');}
+    catch(err){cameraState('ERROR','bad',err.message||String(err));window.alert(`Camera server start failed: ${err.message||err}`);return;}
+    finally{cameraProcessActionBusy=false;}
+  }
+  if(st?.state==='CONFLICT'||st?.state==='UNAVAILABLE'||st?.state==='STOPPING'){
+    cameraState('ERROR','bad',st?.last_error||`Camera process state: ${st?.state||'unknown'}`);return;
+  }
+  // teleimager process starts before its HTTPS/WebRTC socket. Give it a bounded
+  // readiness window, then attempt the normal WebRTC negotiation.
+  for(let i=0;i<24;i++){
+    st=await pollCameraProcess();
+    if(st?.port_ready)break;
+    if(!['RUNNING','RUNNING_EXTERNAL'].includes(st?.state))break;
+    await new Promise(resolve=>setTimeout(resolve,250));
+  }
+  await connectCamera();
+}
+async function stopCameraButton(){
+  if(cameraProcessActionBusy)return;
+  const st=await pollCameraProcess();
+  if(st?.state==='RUNNING'){
+    if(!currentManagementKey()){showManagementKeyPrompt('Enter the management key to stop the camera server.',()=>stopCameraButton());return;}
+    if(!window.confirm('Stop the dashboard-managed camera server? The browser video connection will close first.'))return;
+    stopCamera({silent:true});
+    cameraProcessActionBusy=true;updateCameraButtons(latestEnv?.telemetry||{});
+    try{await cameraProcessPost('/api/camera/stop');cameraState('OFFLINE',null,'teleimager stop requested.');}
+    catch(err){window.alert(`Camera stop failed: ${err.message||err}`);}
+    finally{cameraProcessActionBusy=false;await pollCameraProcess();}
+    return;
+  }
+  // Never stop an externally-owned camera server from the dashboard.
+  stopCamera();
+}
+$('cameraConnectBtn').addEventListener('click',()=>startAndConnectCamera());
+$('cameraStopBtn').addEventListener('click',()=>stopCameraButton());
 
 /* ---------- Robot twin ---------- */
 function jointGroup(i){
@@ -831,6 +939,6 @@ async function poll(){
   finally{pollBusy=false;}
 }
 
-pollPose(); poll(); pollSystem(); pollControllerProcess(); bootstrapManagementKey(); setInterval(poll,250); setInterval(updatePoseHud,250); setInterval(pollSystem,250); setInterval(pollControllerProcess,750);
+pollPose(); poll(); pollSystem(); pollControllerProcess(); pollCameraProcess(); bootstrapManagementKey(); setInterval(poll,250); setInterval(updatePoseHud,250); setInterval(pollSystem,250); setInterval(pollControllerProcess,750); setInterval(pollCameraProcess,750);
 
 })();

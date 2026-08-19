@@ -1,3 +1,79 @@
+# G1 Dashboard Step 5.1 — XR actions + managed Inspire/camera lifecycle
+
+This branch checkpoint keeps the tested Step 5.1 controller-owned ENTER/EXIT TELEOP request path and adds two fixed-process lifecycle integrations:
+
+- **Teleop listener Start** now ensures the RH56DFX `inspire_g1` service is running **before** the V1.8 controller starts.
+- **Teleop listener Stop** still stops the controller first; a dashboard-managed Inspire service is stopped only after the controller has completed its controlled shutdown and exited.
+- **Connect camera** starts the exact `teleimager-server` from the `teleimager` conda environment when needed, then performs the existing browser WebRTC negotiation.
+- **Stop camera** closes the browser stream and sends the managed teleimager process the same primary signal as terminal `Ctrl+C` (`SIGINT`). A bounded `SIGTERM` fallback is used only if the managed camera process does not exit.
+- Externally started Inspire/camera processes are detected and reused, but the dashboard does **not** stop processes it does not own.
+
+The browser still cannot submit an executable path, shell command, PID, environment variable, DDS topic, or Unitree service name. All process paths are server-side fixed/whitelisted. The bridge still imports no Unitree DDS libraries and has no `ServiceSwitch()` endpoint.
+
+## One-time Inspire helper installation on PC2
+
+The validated Inspire service command historically requires root privileges:
+
+```bash
+cd "$HOME/dfx_inspire_service/build"
+unset CYCLONEDDS_URI
+sudo env CYCLONEDDS_URI= LD_LIBRARY_PATH=/usr/local/lib ./inspire_g1
+```
+
+A web process must not be given arbitrary passwordless `sudo`. This revision therefore includes a narrow root-owned helper. Install it once from the dashboard directory on PC2:
+
+```bash
+sudo ./install_inspire_helper.sh
+```
+
+The installer:
+
+1. copies the current working `/home/unitree/dfx_inspire_service/build/inspire_g1` binary to the root-owned `/usr/local/libexec/g1-dashboard/inspire_g1`;
+2. installs the root-owned fixed-action helper beside it;
+3. installs a sudoers rule allowing user `unitree` to invoke only `helper start` and `helper stop` without a password.
+
+The dashboard never runs a user-writable executable as root. Re-run the installer intentionally if the Inspire service binary is rebuilt and you want the dashboard to use that new binary.
+
+Check the helper at any time:
+
+```bash
+/usr/local/libexec/g1-dashboard/g1_dashboard_inspire_helper.py status | python3 -m json.tool
+```
+
+Uninstall the helper/rule with:
+
+```bash
+sudo ./install_inspire_helper.sh --uninstall
+```
+
+## Lifecycle ordering
+
+Managed start:
+
+```text
+controller Python preflight
+        ↓
+Inspire service running
+        ↓
+V1.8 teleop listener running
+```
+
+Managed stop:
+
+```text
+V1.8 controlled stop / handback
+        ↓
+controller process exited
+        ↓
+Inspire SIGINT shutdown
+```
+
+The second ordering is deliberate: the finger dependency is never intentionally killed before the controller gets its normal release/cleanup opportunity.
+
+Camera lifecycle is independent of listener lifecycle. Starting the listener does not start the camera, and stopping the listener does not stop the camera.
+
+---
+
 # G1 Dashboard Step 5.0 v1 — Whitelisted V1.8 process manager
 
 Step 5.0 is the first dashboard interaction layer. It adds authenticated browser requests to **start and gracefully stop one exact controller process**:
