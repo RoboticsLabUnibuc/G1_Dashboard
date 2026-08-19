@@ -29,8 +29,8 @@ CONTROLLER_BASENAME = (
     "dashboard_telemetry_v1_8.py"
 )
 MANAGER_SCHEMA = "g1_dashboard.controller_process.v1"
-MANAGER_VERSION = "g1_dashboard_process_manager.v1.2-dependency-lifecycle"
-CONTROLLER_SHA256 = "66bb5c0bd99e1c034426c2395e46229a54d1f690fe607ed2f513c233e50fa758"
+MANAGER_VERSION = "g1_dashboard_process_manager.v1.2.1-finger-ramp-follow"
+CONTROLLER_SHA256 = "1e5d92c3c460c4f652e22e8de00ae2305d444f3e4a2485dfa8cebbb68c2b8484"
 
 ACTION_REQUEST_SCHEMA = "g1_dashboard.action_request.v1"
 ACTION_RESPONSE_SCHEMA = "g1_dashboard.action_response.v1"

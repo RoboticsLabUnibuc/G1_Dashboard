@@ -1691,7 +1691,7 @@ class SynchronizedDiagnostics:
 
 
 DASHBOARD_TELEMETRY_SCHEMA = "g1_dashboard.telemetry.v1"
-DASHBOARD_CONTROLLER_VERSION = "V6.7.4_SYMMETRIC_THUMB_CONTROL_DASHBOARD_STEP5_1_ACTION_REQUESTS"
+DASHBOARD_CONTROLLER_VERSION = "V6.7.4_SYMMETRIC_THUMB_CONTROL_DASHBOARD_STEP5_1_3_FINGER_RAMP_FOLLOW"
 DASHBOARD_ACTION_SCHEMA = "g1_dashboard.action_request.v1"
 DASHBOARD_ACTION_RESPONSE_SCHEMA = "g1_dashboard.action_response.v1"
 DASHBOARD_ACTION_HOST = "127.0.0.1"
@@ -3730,7 +3730,12 @@ class FingerController:
 
 
 def finger_mode_for_arm_state(state: State) -> FingerMode:
-    if state == State.XR_ACTIVE:
+    # Once XR alignment has been accepted, start the independently guarded
+    # Inspire hand FOLLOW path during the arm ownership ramp instead of
+    # holding the fingers OPEN until XR_ACTIVE. This removes the artificial
+    # arm-ramp delay from finger engagement without changing the stop gate,
+    # alignment, tracking/reacquire guards, rate limit, or arm ownership ramp.
+    if state in (State.ARM_RAMP_UP, State.XR_ACTIVE):
         return FingerMode.FOLLOW
     if state == State.XR_TRACKING_HOLD:
         return FingerMode.REACQUIRE
