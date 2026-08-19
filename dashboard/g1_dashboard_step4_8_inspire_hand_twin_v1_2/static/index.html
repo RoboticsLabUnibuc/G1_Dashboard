@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>G1 Teleop Control Center</title>
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="/static/styles.css?v=step4-8-v1.2" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="eyebrow">UNITREE G1 · XR TELEOPERATION</div>
+      <div class="title-row">
+        <h1>Teleop Control Center</h1>
+        <span class="readonly">READ ONLY</span>
+      </div>
+    </div>
+
+    <nav class="tabs" aria-label="Dashboard sections">
+      <button class="tab active" data-view="live">Live</button>
+      <button class="tab" data-view="inspect">Inspect</button>
+      <button class="tab" data-view="status">Status</button>
+    </nav>
+
+    <div class="header-status">
+      <span id="bridgeChip" class="chip">BRIDGE —</span>
+      <span id="telemetryChip" class="chip">TELEMETRY —</span>
+      <span id="cameraChip" class="chip">CAMERA —</span>
+      <span id="versionText" class="version">—</span>
+    </div>
+  </header>
+
+  <section id="faultBanner" class="fault-banner hidden" role="status">
+    <div>
+      <span id="faultKind" class="fault-kind">ATTENTION</span>
+      <strong id="faultTitle">—</strong>
+      <span id="faultText">—</span>
+    </div>
+    <button id="faultDetailsBtn" class="ghost-btn">Open status</button>
+  </section>
+
+  <main class="app-shell">
+    <!-- COMBINED LIVE / OPERATOR VIEW -->
+    <section id="view-live" class="view active">
+      <div class="combined-live-grid">
+        <section class="panel camera-panel">
+          <div class="panel-head compact-head">
+            <div>
+              <div class="panel-kicker">HEAD CAMERA</div>
+              <div class="panel-title-line"><strong>Live view</strong><span id="cameraMeta" class="dim">—</span></div>
+            </div>
+            <div class="camera-actions">
+              <button id="cameraConnectBtn" class="primary-btn">Connect camera</button>
+              <button id="cameraStopBtn" class="ghost-btn hidden">Disconnect</button>
+              <a id="cameraTrustLink" class="ghost-link" target="_blank" rel="noreferrer">Trust cert</a>
+            </div>
+          </div>
+
+          <div class="camera-stage">
+            <video id="cameraVideo" autoplay playsinline muted></video>
+            <div id="cameraOverlay" class="camera-overlay">
+              <div class="camera-overlay-icon">◉</div>
+              <strong id="cameraOverlayTitle">Camera not connected</strong>
+              <span id="cameraOverlayText">Start teleimager, then connect.</span>
+            </div>
+            <div class="camera-hud top-left">
+              <span id="cameraStateDot" class="dot"></span>
+              <span id="cameraStateText">OFFLINE</span>
+            </div>
+            <div class="camera-hud bottom-left" id="cameraHudInfo">—</div>
+          </div>
+        </section>
+
+        <section class="panel twin-panel">
+          <div class="panel-head twin-head">
+            <div class="twin-title-block">
+              <div class="panel-kicker">ROBOT · 29 DOF</div>
+              <div class="panel-title-line"><strong>Live G1 + Inspire twin</strong><span id="robotModelStatus" class="dim">waiting for V1.4 telemetry</span></div>
+            </div>
+          </div>
+          <div class="twin-controlbar" aria-label="Robot twin display controls">
+            <div class="twin-control-group">
+              <span class="twin-control-label">OVERLAYS</span>
+              <label class="toggle"><input id="ghostToggle" type="checkbox" checked><span>Command ghost</span></label>
+              <label class="toggle" title="Show the 29 kinematic joint centers on top of the G1 mesh"><input id="jointToggle" type="checkbox"><span>Joint markers</span></label>
+              <label class="toggle health-toggle"><input id="healthToggle" type="checkbox" checked><span>Health</span></label>
+            </div>
+            <div class="twin-control-group health-control-group">
+              <span class="twin-control-label">HEALTH VIEW</span>
+              <select id="healthModeSelect" class="health-mode-select" aria-label="Joint health overlay mode">
+                <option value="composite">Composite</option>
+                <option value="temperature">Temperature</option>
+                <option value="torque">Torque</option>
+              </select>
+            </div>
+            <button id="twinResetBtn" class="ghost-btn twin-reset-btn">Reset view</button>
+          </div>
+          <div class="twin-stage">
+            <canvas id="robotTwinCanvas" aria-label="Live Unitree G1 with Inspire RH56DFX hand digital twin"></canvas>
+            <div class="twin-hud top-left">drag orbit · wheel zoom · click link/joint · double-click reset</div>
+            <div class="twin-hud top-right twin-perf">
+              <span>POSE <strong id="poseAgeStat">—</strong></span>
+              <span>RX <strong id="poseRxStat">—</strong></span>
+              <span>RENDER <strong id="poseFpsStat">—</strong></span>
+              <span>SEQ <strong id="poseSeqStat">—</strong></span>
+            </div>
+            <div class="twin-legend bottom-left">
+              <span><i class="legend-line measured"></i>measured body + hand</span>
+              <span><i class="legend-line ghost"></i>published arm + hand command</span>
+            </div>
+            <div id="healthLegend" class="twin-health-legend bottom-right">
+              <span><i class="health-dot h0"></i>nominal</span>
+              <span><i class="health-dot h1"></i>watch</span>
+              <span><i class="health-dot h2"></i>high</span>
+              <span><i class="health-dot h3"></i>very high</span>
+              <small>display bands · not safety limits</small>
+            </div>
+          </div>
+          <div class="robot-mini-grid twin-stats">
+            <div><span>MODE MACHINE</span><strong id="robotModeMachine">—</strong></div>
+            <div><span>OWNERSHIP</span><strong id="robotWeight">—</strong></div>
+            <div><span>MAX ARM Δq</span><strong id="robotMaxError">—</strong></div>
+            <div><span>PEAK τ UTIL</span><strong id="robotPeakTorque">—</strong></div>
+            <div><span>MAX TEMP</span><strong id="robotMaxTemp">—</strong></div>
+            <div><span>JOINT HEALTH</span><strong id="robotHealthSummary">—</strong></div>
+          </div>
+        </section>
+
+        <aside class="operator-rail combined-rail">
+          <section class="hero-state panel">
+            <div class="hero-top">
+              <div>
+                <div class="panel-kicker">MODE</div>
+                <div id="modeValue" class="mode-value">—</div>
+              </div>
+              <div class="ownership-box">
+                <span>ARM OWNERSHIP</span>
+                <strong id="ownershipValue">—</strong>
+              </div>
+            </div>
+            <div class="progress ownership"><div id="ownershipBar" class="progress-fill"></div></div>
+          </section>
+
+          <section class="panel health-panel">
+            <div class="mini-health-grid">
+              <div class="health-item"><span>XR</span><strong id="xrValue">—</strong><small id="xrReason">—</small></div>
+              <div class="health-item"><span>LOWSTATE</span><strong id="lowstateValue">—</strong><small id="lowstateAge">—</small></div>
+              <div class="health-item"><span>HANDS</span><strong id="handsValue">—</strong><small id="handsReason">—</small></div>
+              <div class="health-item"><span>GUARD</span><strong id="guardValue">—</strong><small id="guardReason">—</small></div>
+            </div>
+          </section>
+
+          <section id="recoveryPanel" class="panel recovery-panel hidden">
+            <div class="panel-head"><strong>Recovery</strong><span id="recoveryState" class="chip warn">HOLD</span></div>
+            <div class="recovery-row"><span>Position</span><strong id="holdPosition">—</strong></div>
+            <div class="recovery-row"><span>Rotation</span><strong id="holdRotation">—</strong></div>
+            <div class="recovery-row"><span>Stable frames</span><strong id="resumeFrames">—</strong></div>
+            <div class="progress"><div id="resumeBar" class="progress-fill"></div></div>
+          </section>
+
+          <section class="panel quick-panel">
+            <div class="quick-grid">
+              <div><span>Stop gate</span><strong id="stopGate">—</strong></div>
+              <div><span>Finger worker</span><strong id="fingerPhase">—</strong></div>
+              <div><span>Inspire</span><strong id="fingerFeedback">—</strong></div>
+              <div><span>Packet</span><strong id="packetAge">—</strong></div>
+            </div>
+          </section>
+
+          <section class="panel action-readiness-panel">
+            <div class="panel-head action-readiness-head">
+              <div><div class="panel-kicker">ACTION READINESS</div><strong id="actionLabel">Controller V1.8 required</strong></div>
+              <span id="actionReadinessChip" class="chip">READ ONLY</span>
+            </div>
+            <div class="action-route"><span id="actionOperation">—</span><b>→</b><strong id="actionNextState">—</strong></div>
+            <div id="actionReason" class="action-reason">No browser command channel is enabled in this revision.</div>
+            <div class="action-condition-strip">
+              <span id="actionCondLowstate">LOW —</span>
+              <span id="actionCondXr">XR —</span>
+              <span id="actionCondStop">STOP —</span>
+              <span id="actionCondFault">FAULT —</span>
+            </div>
+          </section>
+
+          <section class="panel hand-panel twin-hands rail-hand-panel">
+            <div class="panel-head hand-panel-head">
+              <div><strong>Hands</strong><span class="hand-subtitle">command / feedback</span></div>
+              <span id="handTrackingSummary" class="chip hand-track-chip">—</span>
+            </div>
+            <div class="hand-matrix" aria-label="Inspire hand command and feedback">
+              <div class="hand-matrix-head"><span>FINGER</span><strong>LEFT</strong><strong>RIGHT</strong></div>
+              <div id="handMatrixBody" class="hand-matrix-body"></div>
+            </div>
+            <div class="hand-legend"><span><i class="hand-legend-fill"></i> command</span><span><i class="hand-legend-marker"></i> feedback</span></div>
+            <div class="quick-grid hand-meta">
+              <div><span>Mode</span><strong id="handModeDetail">—</strong></div>
+              <div><span>Feedback</span><strong id="handFeedbackDetail">—</strong></div>
+              <div><span>Reacquire</span><strong id="handReacquire">—</strong></div>
+              <div><span>Retargets</span><strong id="handRetargets">—</strong></div>
+              <div class="hand-meta-wide"><span>Sym thumb</span><strong id="thumbStatus">—</strong></div>
+            </div>
+          </section>
+
+          <section class="panel joint-inspector rail-joint-inspector">
+            <div class="panel-head">
+              <div><div class="panel-kicker">SELECTED JOINT</div><strong id="selectedJointName">L_elbow</strong></div>
+              <div class="joint-head-chips"><span id="selectedHealthChip" class="chip">HEALTH —</span><span id="selectedJointIndex" class="chip">#18</span></div>
+            </div>
+            <div class="joint-group-line"><span id="selectedJointGroup">LEFT ARM</span><span id="selectedMotorState">motor —</span></div>
+            <div class="joint-primary">
+              <span>Measured q</span><strong id="selectedMeasuredQ">—</strong>
+            </div>
+            <div class="joint-kv-grid">
+              <div><span>Published</span><strong id="selectedPublishedQ">—</strong></div>
+              <div><span>Target</span><strong id="selectedTargetQ">—</strong></div>
+              <div><span>IK</span><strong id="selectedIkQ">—</strong></div>
+              <div><span>Δ published</span><strong id="selectedErrorQ">—</strong></div>
+              <div><span>dq</span><strong id="selectedDq">—</strong></div>
+              <div><span>τ est</span><strong id="selectedTau">—</strong></div>
+              <div><span>Temp</span><strong id="selectedTemp">—</strong></div>
+              <div><span>τ util</span><strong id="selectedTorqueUtil">—</strong></div>
+              <div><span>URDF effort</span><strong id="selectedEffortLimit">—</strong></div>
+            </div>
+            <div class="joint-health-bars">
+              <div><span>Temperature</span><div class="health-bar"><i id="selectedTempBar"></i></div></div>
+              <div><span>Torque utilization</span><div class="health-bar"><i id="selectedTorqueBar"></i></div></div>
+            </div>
+            <div class="joint-note" id="selectedJointNote">Click a link or joint marker on the live G1 twin to inspect it here.</div>
+            <div class="joint-health-disclaimer">Health colors are diagnostic display bands; controller/Unitree safety limits remain authoritative.</div>
+          </section>
+        </aside>
+      </div>
+    </section>
+
+    <!-- INSPECT VIEW: deeper read-only robot/system diagnostics -->
+    <section id="view-inspect" class="view">
+      <div class="inspect-health-grid inspect-v45">
+        <section class="panel system-health-card">
+          <div class="panel-head">
+            <div><div class="panel-kicker">PC2 · SYSTEM HEALTH</div><strong id="systemHostname">—</strong></div>
+            <span id="systemMonitorChip" class="chip">MONITOR —</span>
+          </div>
+          <div class="metric-tiles">
+            <div><span>CPU</span><strong id="systemCpu">—</strong><small id="systemLoad">load —</small></div>
+            <div><span>RAM</span><strong id="systemRam">—</strong><small id="systemRamDetail">—</small></div>
+            <div><span>ROOT DISK</span><strong id="systemDisk">—</strong><small id="systemDiskDetail">—</small></div>
+            <div><span>MAX TEMP</span><strong id="systemTemp">—</strong><small id="systemTempZone">—</small></div>
+          </div>
+          <div class="kv-list compact-kv system-kv">
+            <div><span>Uptime</span><strong id="systemUptime">—</strong></div>
+            <div><span>Interface</span><strong id="systemInterface">—</strong></div>
+            <div><span>IPv4</span><strong id="systemIpv4">—</strong></div>
+            <div><span>Network traffic</span><strong id="systemTraffic">—</strong></div>
+            <div><span>Monitor age</span><strong id="systemAge">—</strong></div>
+          </div>
+        </section>
+
+        <section class="panel base-sensing-card">
+          <div class="panel-head">
+            <div><div class="panel-kicker">BASE SENSING</div><strong>Torso IMU + odometry</strong></div>
+            <span id="baseSensorChip" class="chip">SENSORS —</span>
+          </div>
+
+          <div class="sensor-split">
+            <div class="sensor-block">
+              <div class="sensor-block-head"><span>TORSO IMU</span><strong id="imuTopic">rt/secondary_imu</strong></div>
+              <div class="attitude-grid">
+                <div><span>ROLL</span><strong id="imuRoll">—</strong></div>
+                <div><span>PITCH</span><strong id="imuPitch">—</strong></div>
+                <div><span>YAW</span><strong id="imuYaw">—</strong></div>
+              </div>
+              <div class="sensor-vector-grid">
+                <div><span>GYRO X</span><strong id="imuGyroX">—</strong></div>
+                <div><span>GYRO Y</span><strong id="imuGyroY">—</strong></div>
+                <div><span>GYRO Z</span><strong id="imuGyroZ">—</strong></div>
+                <div><span>ACC X</span><strong id="imuAccelX">—</strong></div>
+                <div><span>ACC Y</span><strong id="imuAccelY">—</strong></div>
+                <div><span>ACC Z</span><strong id="imuAccelZ">—</strong></div>
+              </div>
+              <div class="sensor-foot"><span id="imuQuaternion">q —</span><span id="imuMeta">—</span></div>
+            </div>
+
+            <div class="sensor-block odom-block">
+              <div class="sensor-block-head"><span>ODOMETRY</span><strong id="odomTopic">waiting</strong></div>
+              <div class="sensor-vector-grid odom-values">
+                <div><span>POS X</span><strong id="odomPosX">—</strong></div>
+                <div><span>POS Y</span><strong id="odomPosY">—</strong></div>
+                <div><span>POS Z</span><strong id="odomPosZ">—</strong></div>
+                <div><span>VEL X</span><strong id="odomVelX">—</strong></div>
+                <div><span>VEL Y</span><strong id="odomVelY">—</strong></div>
+                <div><span>VEL Z</span><strong id="odomVelZ">—</strong></div>
+              </div>
+              <div class="sensor-foot"><span id="odomYawRate">yaw rate —</span><span id="odomMeta">—</span></div>
+              <div id="odomNote" class="sensor-note">Best-effort read-only odometry; availability depends on the active Unitree odometer service/firmware.</div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel runtime-card">
+          <div class="panel-head"><div><div class="panel-kicker">RUNTIME</div><strong>Endpoints & processes</strong></div><span class="dim">read-only</span></div>
+          <div class="endpoint-grid">
+            <div><span>TeleVuer · 8012</span><strong id="endpointTelevuer">—</strong></div>
+            <div><span>Camera · 60001</span><strong id="endpointCamera">—</strong></div>
+            <div><span>Dashboard · 8080</span><strong id="endpointDashboard">—</strong></div>
+            <div><span>Controller</span><strong id="processController">—</strong></div>
+            <div><span>teleimager</span><strong id="processTeleimager">—</strong></div>
+            <div><span>Inspire service</span><strong id="processInspire">—</strong></div>
+          </div>
+          <div class="runtime-note">Dashboard stack can now be launched with one script; robot controller remains a separate safety-critical process.</div>
+        </section>
+
+        <section class="panel unitree-services-card service-inventory-wide">
+          <div class="panel-head service-head">
+            <div><div class="panel-kicker">UNITREE ROBOTSTATE API</div><strong>Service inventory</strong></div>
+            <div class="service-head-actions">
+              <input id="serviceFilter" class="service-filter" type="search" placeholder="Filter services…" autocomplete="off" />
+              <span id="robotStateChip" class="chip">API —</span>
+            </div>
+          </div>
+          <div class="robotstate-summary">
+            <div><span>Client API</span><strong id="robotStateClientVersion">—</strong></div>
+            <div><span>Server API</span><strong id="robotStateServerVersion">—</strong></div>
+            <div><span>Version match</span><strong id="robotStateVersionMatch">—</strong></div>
+            <div><span>Services</span><strong id="robotStateServiceCount">—</strong></div>
+          </div>
+          <div class="service-status-row">
+            <div id="robotStateError" class="diagnostic-note">Start the read-only system monitor to query service state.</div>
+            <div id="robotServiceCounts" class="service-counts">—</div>
+          </div>
+          <div class="service-table">
+            <div class="service-row service-header"><span>SERVICE</span><span>PROTECTION</span><span>STATE</span></div>
+            <div id="robotServiceList" class="service-list"><div class="empty">No service inventory yet</div></div>
+          </div>
+        </section>
+      </div>
+    </section>
+
+    <!-- STATUS VIEW -->
+    <section id="view-status" class="view">
+      <div class="status-grid">
+        <section class="panel status-card">
+          <div class="panel-head"><strong>Mode & safety</strong><span id="statusModeChip" class="chip">—</span></div>
+          <div class="kv-list">
+            <div><span>Safety fault</span><strong id="safetyFault">none</strong></div>
+            <div><span>Tracking hold</span><strong id="trackingHoldReason">none</strong></div>
+            <div><span>Shutdown pending</span><strong id="shutdownPending">NO</strong></div>
+            <div><span>Stop gate</span><strong id="statusStopGate">—</strong></div>
+            <div><span>Ownership</span><strong id="statusOwnership">—</strong></div>
+          </div>
+        </section>
+
+        <section class="panel status-card">
+          <div class="panel-head"><strong>Tracking</strong><span id="statusXrChip" class="chip">—</span></div>
+          <div class="kv-list">
+            <div><span>XR reason</span><strong id="statusXrReason">—</strong></div>
+            <div><span>Guard</span><strong id="statusGuard">—</strong></div>
+            <div><span>Alignment</span><strong id="alignmentFrames">—</strong></div>
+            <div><span>Hold position</span><strong id="statusHoldPosition">—</strong></div>
+            <div><span>Hold rotation</span><strong id="statusHoldRotation">—</strong></div>
+          </div>
+        </section>
+
+        <section class="panel status-card">
+          <div class="panel-head"><strong>Robot motion / R3</strong><span id="statusLowstateChip" class="chip">—</span></div>
+          <div class="kv-list">
+            <div><span>R3 max axis</span><strong id="r3Max">—</strong></div>
+            <div><span>Left stick</span><strong id="leftStick">—</strong></div>
+            <div><span>Right stick</span><strong id="rightStick">—</strong></div>
+            <div><span>dq max / RMS</span><strong id="dqCombined">—</strong></div>
+            <div><span>Yaw rate</span><strong id="yawRate">—</strong></div>
+            <div><span>Mode machine</span><strong id="statusModeMachine">—</strong></div>
+          </div>
+        </section>
+
+        <section class="panel status-card">
+          <div class="panel-head"><strong>Services</strong><span class="dim">read-only</span></div>
+          <div class="kv-list">
+            <div><span>Finger phase</span><strong id="statusFingerPhase">—</strong></div>
+            <div><span>Inspire feedback</span><strong id="statusInspire">—</strong></div>
+            <div><span>Arm publisher</span><strong id="statusArmPublisher">—</strong></div>
+            <div><span>Camera config</span><strong id="statusCamera">—</strong></div>
+            <div><span>Telemetry age</span><strong id="statusPacketAge">—</strong></div>
+          </div>
+        </section>
+
+        <section class="panel status-card action-status-card">
+          <div class="panel-head"><strong>Action readiness</strong><span id="statusActionChip" class="chip">READ ONLY</span></div>
+          <div class="kv-list">
+            <div><span>Next action</span><strong id="statusActionLabel">—</strong></div>
+            <div><span>Operation</span><strong id="statusActionOperation">—</strong></div>
+            <div><span>Would enter</span><strong id="statusActionNextState">—</strong></div>
+            <div><span>Request channel</span><strong id="statusActionChannel">DISABLED</strong></div>
+          </div>
+          <div id="statusActionReason" class="status-action-reason">Controller V1.8 action-readiness telemetry required.</div>
+        </section>
+
+        <section class="panel events-panel-full">
+          <div class="panel-head"><strong>Event timeline</strong><span class="dim">RAM only</span></div>
+          <div id="allEvents" class="events"><div class="empty">No events yet</div></div>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <script type="module" src="/static/app.js?v=step4-8-v1.2"></script>
+</body>
+</html>

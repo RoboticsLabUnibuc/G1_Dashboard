@@ -1,0 +1,11 @@
+=== PC2 ===
+unitree-g1-nx
+Linux unitree-g1-nx 5.15.148-tegra #1 SMP PREEMPT Thu Sep 18 15:08:33 PDT 2025 aarch64 aarch64 aarch64 GNU/Linux
+
+=== PYTHON ENVIRONMENTS ===
+python=/home/unitree/miniconda3/envs/g1_xr/bin/python
+Python 3.10.20
+executable: /home/unitree/miniconda3/envs/g1_xr/bin/python
+numpy 1.26.4
+cyclonedds version unavailable
+pinocchio 0.1

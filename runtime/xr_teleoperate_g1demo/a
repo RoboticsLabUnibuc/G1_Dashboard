@@ -1,0 +1,134 @@
+[1mdiff --git a/teleop/teleop_hand_and_arm.py b/teleop/teleop_hand_and_arm.py[m
+[1mindex 40ee290..f088135 100644[m
+[1m--- a/teleop/teleop_hand_and_arm.py[m
+[1m+++ b/teleop/teleop_hand_and_arm.py[m
+[36m@@ -1,5 +1,7 @@[m
+ import time[m
+ import argparse[m
+[32m+[m[32mimport numpy as np[m
+[32m+[m[32mimport pinocchio as pin[m
+ from multiprocessing import Value, Array, Lock[m
+ import threading[m
+ import logging_mp[m
+[36m@@ -70,6 +72,31 @@[m [mdef get_state() -> dict:[m
+         "RECORD_RUNNING": RECORD_RUNNING,[m
+     }[m
+ [m
+[32m+[m
+[32m+[m[32m# ARM_RELATIVE_CALIBRATION_V1[m
+[32m+[m[32mdef get_current_wrist_poses_from_fk(arm_ik, arm_q):[m
+[32m+[m[32m    """Return the current left and right robot end-effector poses."""[m
+[32m+[m[32m    q = np.asarray(arm_q, dtype=float).reshape(-1)[m
+[32m+[m
+[32m+[m[32m    model = arm_ik.reduced_robot.model[m
+[32m+[m[32m    data = arm_ik.reduced_robot.data[m
+[32m+[m
+[32m+[m[32m    pin.forwardKinematics(model, data, q)[m
+[32m+[m[32m    pin.updateFramePlacements(model, data)[m
+[32m+[m
+[32m+[m[32m    def frame_matrix(frame_id):[m
+[32m+[m[32m        placement = data.oMf[frame_id][m
+[32m+[m[32m        pose = np.eye(4, dtype=float)[m
+[32m+[m[32m        pose[:3, :3] = placement.rotation[m
+[32m+[m[32m        pose[:3, 3] = placement.translation[m
+[32m+[m[32m        return pose[m
+[32m+[m
+[32m+[m[32m    return ([m
+[32m+[m[32m        frame_matrix(arm_ik.L_hand_id),[m
+[32m+[m[32m        frame_matrix(arm_ik.R_hand_id),[m
+[32m+[m[32m    )[m
+[32m+[m
+[32m+[m
+ if __name__ == '__main__':[m
+     parser = argparse.ArgumentParser()[m
+     # basic control parameters[m
+[36m@@ -281,6 +308,16 @@[m [mif __name__ == '__main__':[m
+         left_wrist_img = None[m
+         right_wrist_img = None[m
+ [m
+[32m+[m[32m        # Relative XR-to-robot arm calibration state.[m
+[32m+[m[32m        arm_calibrated = False[m
+[32m+[m[32m        calibration_ready_frames = 0[m
+[32m+[m[32m        xr_left_start_pose = None[m
+[32m+[m[32m        xr_right_start_pose = None[m
+[32m+[m[32m        robot_left_start_pose = None[m
+[32m+[m[32m        robot_right_start_pose = None[m
+[32m+[m[32m        arm_position_gain = 1.0[m
+[32m+[m
+[32m+[m
+         # main loop. robot start to follow VR user's motion[m
+         while not STOP:[m
+             start_time = time.time()[m
+[36m@@ -362,7 +399,71 @@[m [mif __name__ == '__main__':[m
+ [m
+             # solve ik using motor data and wrist pose, then use ik results to control arms.[m
+             time_ik_start = time.time()[m
+[31m-            sol_q, sol_tauff  = arm_ik.solve_ik(tele_data.left_wrist_pose, tele_data.right_wrist_pose, current_lr_arm_q, current_lr_arm_dq)[m
+[32m+[m[32m            # Ignore missing or temporarily lost XR tracking frames.[m
+[32m+[m[32m            if not tele_data.motion_data_ready:[m
+[32m+[m[32m                time.sleep(0.01)[m
+[32m+[m[32m                continue[m
+[32m+[m
+[32m+[m[32m            # Let WebXR tracking settle for about one second after [r].[m
+[32m+[m[32m            if not arm_calibrated:[m
+[32m+[m[32m                calibration_ready_frames += 1[m
+[32m+[m[32m                if calibration_ready_frames == 1:[m
+[32m+[m[32m                    logger_mp.info("[Arm calibration] Hold both hands still...")[m
+[32m+[m[32m                if calibration_ready_frames < 30:[m
+[32m+[m[32m                    time.sleep(0.01)[m
+[32m+[m[32m                    continue[m
+[32m+[m
+[32m+[m[32m                xr_left_start_pose = tele_data.left_wrist_pose.copy()[m
+[32m+[m[32m                xr_right_start_pose = tele_data.right_wrist_pose.copy()[m
+[32m+[m
+[32m+[m[32m                robot_left_start_pose, robot_right_start_pose = ([m
+[32m+[m[32m                    get_current_wrist_poses_from_fk([m
+[32m+[m[32m                        arm_ik,[m
+[32m+[m[32m                        current_lr_arm_q,[m
+[32m+[m[32m                    )[m
+[32m+[m[32m                )[m
+[32m+[m
+[32m+[m[32m                arm_calibrated = True[m
+[32m+[m[32m                logger_mp.info("[Arm calibration] Complete.")[m
+[32m+[m[32m                logger_mp.info("[Arm calibration] The current operator pose is now neutral.")[m
+[32m+[m
+[32m+[m[32m            left_wrist_target = tele_data.left_wrist_pose.copy()[m
+[32m+[m[32m            right_wrist_target = tele_data.right_wrist_pose.copy()[m
+[32m+[m
+[32m+[m[32m            # Translation is relative to the Quest pose captured at calibration.[m
+[32m+[m[32m            left_wrist_target[:3, 3] = ([m
+[32m+[m[32m                robot_left_start_pose[:3, 3][m
+[32m+[m[32m                + arm_position_gain[m
+[32m+[m[32m                * (tele_data.left_wrist_pose[:3, 3][m
+[32m+[m[32m                   - xr_left_start_pose[:3, 3])[m
+[32m+[m[32m            )[m
+[32m+[m
+[32m+[m[32m            right_wrist_target[:3, 3] = ([m
+[32m+[m[32m                robot_right_start_pose[:3, 3][m
+[32m+[m[32m                + arm_position_gain[m
+[32m+[m[32m                * (tele_data.right_wrist_pose[:3, 3][m
+[32m+[m[32m                   - xr_right_start_pose[:3, 3])[m
+[32m+[m[32m            )[m
+[32m+[m
+[32m+[m[32m            # Apply wrist rotation relative to the calibration orientation.[m
+[32m+[m[32m            left_wrist_target[:3, :3] = ([m
+[32m+[m[32m                robot_left_start_pose[:3, :3][m
+[32m+[m[32m                @ xr_left_start_pose[:3, :3].T[m
+[32m+[m[32m                @ tele_data.left_wrist_pose[:3, :3][m
+[32m+[m[32m            )[m
+[32m+[m
+[32m+[m[32m            right_wrist_target[:3, :3] = ([m
+[32m+[m[32m                robot_right_start_pose[:3, :3][m
+[32m+[m[32m                @ xr_right_start_pose[:3, :3].T[m
+[32m+[m[32m                @ tele_data.right_wrist_pose[:3, :3][m
+[32m+[m[32m            )[m
+[32m+[m
+[32m+[m[32m            sol_q, sol_tauff = arm_ik.solve_ik([m
+[32m+[m[32m                left_wrist_target,[m
+[32m+[m[32m                right_wrist_target,[m
+[32m+[m[32m                current_lr_arm_q,[m
+[32m+[m[32m                current_lr_arm_dq,[m
+[32m+[m[32m            )[m
+             time_ik_end = time.time()[m
+             logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")[m
+             arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)[m

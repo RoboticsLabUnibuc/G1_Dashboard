@@ -1,0 +1,28 @@
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Runtime output
+*.log
+*.csv
+*.part
+core
+core.*
+
+# Local environments
+.venv/
+venv/
+env/
+
+# Credentials / local configuration
+.env
+*.pem
+*.key
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

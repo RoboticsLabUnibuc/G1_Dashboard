@@ -1,0 +1,2 @@
+# No third-party Python dependencies.
+# The bridge uses only the Python standard library.

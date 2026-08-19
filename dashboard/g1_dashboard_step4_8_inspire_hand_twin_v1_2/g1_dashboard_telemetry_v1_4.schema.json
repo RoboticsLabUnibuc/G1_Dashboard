@@ -1,0 +1,982 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openai.example/g1-dashboard/telemetry/v1.4/schema.json",
+  "title": "G1 XR Dashboard Telemetry v1.4 (full-body twin)",
+  "description": "Read-only telemetry emitted by the V6.7.4 dashboard V1.4 full-body twin controller. Extends g1_dashboard.telemetry.v1 with 29-DoF measured LowState robot telemetry.",
+  "type": "object",
+  "required": [
+    "schema",
+    "sequence",
+    "unix_time_s",
+    "monotonic_s",
+    "controller",
+    "mode",
+    "health",
+    "motion",
+    "tracking",
+    "robot",
+    "arms",
+    "hands",
+    "camera"
+  ],
+  "properties": {
+    "schema": {
+      "const": "g1_dashboard.telemetry.v1"
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "unix_time_s": {
+      "$ref": "#/$defs/nullableNumber"
+    },
+    "monotonic_s": {
+      "$ref": "#/$defs/nullableNumber"
+    },
+    "controller": {
+      "type": "object",
+      "required": [
+        "version",
+        "pid",
+        "main_loop_hz",
+        "teleop_weight_limit",
+        "allow_locomotion_during_xr",
+        "symmetric_thumb_rotation"
+      ],
+      "properties": {
+        "version": {
+          "const": "V6.7.4_SYMMETRIC_THUMB_CONTROL_DASHBOARD_V1.4_FULL_BODY_TWIN"
+        },
+        "pid": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "main_loop_hz": {
+          "$ref": "#/$defs/nullableNumber"
+        },
+        "teleop_weight_limit": {
+          "$ref": "#/$defs/nullableNumber"
+        },
+        "allow_locomotion_during_xr": {
+          "type": "boolean"
+        },
+        "symmetric_thumb_rotation": {
+          "const": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "mode": {
+      "type": "object",
+      "required": [
+        "state",
+        "arm_ownership_weight",
+        "shutdown_pending",
+        "safety_fault_reason",
+        "tracking_hold_reason"
+      ],
+      "properties": {
+        "state": {
+          "enum": [
+            "LOCOMOTION_READY",
+            "WAITING_FOR_STOP",
+            "XR_ALIGNMENT",
+            "ARM_RAMP_UP",
+            "XR_ACTIVE",
+            "XR_TRACKING_HOLD",
+            "SAFETY_FAULT_HOLD",
+            "RETURN_ARMS_HOME",
+            "ARM_RAMP_DOWN"
+          ]
+        },
+        "arm_ownership_weight": {
+          "$ref": "#/$defs/nullableNumber"
+        },
+        "shutdown_pending": {
+          "type": "boolean"
+        },
+        "safety_fault_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tracking_hold_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "actions": {
+      "type": "object",
+      "properties": {
+        "schema": {
+          "const": "g1_dashboard.action_readiness.v1"
+        },
+        "request_channel_enabled": {
+          "type": "boolean"
+        },
+        "xr_handover": {
+          "type": "object",
+          "properties": {
+            "available": {
+              "type": "boolean"
+            },
+            "operation": {
+              "type": "string"
+            },
+            "label": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "would_enter_state": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "source": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": true
+        },
+        "engagement_conditions": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "health": {
+      "type": "object",
+      "required": [
+        "lowstate",
+        "xr",
+        "tracking_guard",
+        "finger_worker",
+        "arm_publisher"
+      ],
+      "properties": {
+        "lowstate": {
+          "type": "object",
+          "required": [
+            "ok",
+            "age_s",
+            "count"
+          ],
+          "properties": {
+            "ok": {
+              "type": "boolean"
+            },
+            "age_s": {
+              "$ref": "#/$defs/nullableNumber"
+            },
+            "count": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "xr": {
+          "type": "object",
+          "required": [
+            "ok",
+            "reason"
+          ],
+          "properties": {
+            "ok": {
+              "type": "boolean"
+            },
+            "reason": {
+              "type": "string"
+            }
+          }
+        },
+        "tracking_guard": {
+          "type": "object",
+          "required": [
+            "active",
+            "rejected_left",
+            "rejected_right",
+            "pending_frames"
+          ],
+          "properties": {
+            "active": {
+              "type": "boolean"
+            },
+            "rejected_left": {
+              "type": "boolean"
+            },
+            "rejected_right": {
+              "type": "boolean"
+            },
+            "pending_frames": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "finger_worker": {
+          "type": "object",
+          "required": [
+            "started",
+            "phase",
+            "worker_age_s",
+            "error",
+            "feedback_fault",
+            "feedback_age_s"
+          ],
+          "properties": {
+            "started": {
+              "type": "boolean"
+            },
+            "phase": {
+              "type": "string"
+            },
+            "worker_age_s": {
+              "$ref": "#/$defs/nullableNumber"
+            },
+            "error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "feedback_fault": {
+              "type": "boolean"
+            },
+            "feedback_age_s": {
+              "$ref": "#/$defs/nullableNumber"
+            }
+          }
+        },
+        "arm_publisher": {
+          "type": "object",
+          "required": [
+            "write_count",
+            "error"
+          ],
+          "properties": {
+            "write_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "motion": {
+      "type": "object",
+      "required": [
+        "stop_gate",
+        "r3",
+        "lower_body"
+      ],
+      "properties": {
+        "stop_gate": {
+          "type": "object",
+          "required": [
+            "instant",
+            "ready",
+            "elapsed_s",
+            "required_s"
+          ],
+          "properties": {
+            "instant": {
+              "type": "boolean"
+            },
+            "ready": {
+              "type": "boolean"
+            },
+            "elapsed_s": {
+              "$ref": "#/$defs/nullableNumber"
+            },
+            "required_s": {
+              "$ref": "#/$defs/nullableNumber"
+            }
+          }
+        },
+        "r3": {
+          "type": "object",
+          "required": [
+            "valid",
+            "lx",
+            "ly",
+            "rx",
+            "ry",
+            "max_abs_axis"
+          ],
+          "properties": {
+            "valid": {
+              "type": "boolean"
+            },
+            "lx": {
+              "$ref": "#/$defs/nullableNumber"
+            },
+            "ly": {
+              "$ref": "#/$defs/nullableNumber"
+            },
+            "rx": {
+              "$ref": "#/$defs/nullableNumber"
+            },
+            "ry": {
+              "$ref": "#/$defs/nullableNumber"
+            },
+            "max_abs_axis": {
+              "$ref": "#/$defs/nullableNumber"
+            }
+          }
+        },
+        "lower_body": {
+          "type": "object",
+          "required": [
+            "dq_max_rps",
+            "dq_rms_rps",
+            "yaw_rate_rps"
+          ],
+          "properties": {
+            "dq_max_rps": {
+              "$ref": "#/$defs/nullableNumber"
+            },
+            "dq_rms_rps": {
+              "$ref": "#/$defs/nullableNumber"
+            },
+            "yaw_rate_rps": {
+              "$ref": "#/$defs/nullableNumber"
+            }
+          }
+        }
+      }
+    },
+    "tracking": {
+      "type": "object",
+      "required": [
+        "accepted_translation_bias_xyz_m",
+        "alignment",
+        "hold",
+        "poses_row_major_4x4"
+      ],
+      "properties": {
+        "accepted_translation_bias_xyz_m": {
+          "$ref": "#/$defs/nullableVec3"
+        },
+        "alignment": {
+          "type": "object",
+          "required": [
+            "stable_frames",
+            "required_frames",
+            "position_limit_m"
+          ],
+          "properties": {
+            "stable_frames": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "required_frames": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "position_limit_m": {
+              "$ref": "#/$defs/nullableNumber"
+            }
+          }
+        },
+        "hold": {
+          "type": "object",
+          "required": [
+            "position_error_m",
+            "rotation_error_deg",
+            "stable_frames",
+            "required_frames",
+            "position_limit_m",
+            "rotation_limit_deg"
+          ],
+          "properties": {
+            "position_error_m": {
+              "$ref": "#/$defs/nullableNumber"
+            },
+            "rotation_error_deg": {
+              "$ref": "#/$defs/nullableNumber"
+            },
+            "stable_frames": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "required_frames": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "position_limit_m": {
+              "$ref": "#/$defs/nullableNumber"
+            },
+            "rotation_limit_deg": {
+              "$ref": "#/$defs/nullableNumber"
+            }
+          }
+        },
+        "poses_row_major_4x4": {
+          "type": "object",
+          "required": [
+            "raw_left",
+            "raw_right",
+            "registered_left",
+            "registered_right",
+            "guarded_left",
+            "guarded_right",
+            "command_left",
+            "command_right"
+          ],
+          "properties": {
+            "raw_left": {
+              "$ref": "#/$defs/nullablePose"
+            },
+            "raw_right": {
+              "$ref": "#/$defs/nullablePose"
+            },
+            "registered_left": {
+              "$ref": "#/$defs/nullablePose"
+            },
+            "registered_right": {
+              "$ref": "#/$defs/nullablePose"
+            },
+            "guarded_left": {
+              "$ref": "#/$defs/nullablePose"
+            },
+            "guarded_right": {
+              "$ref": "#/$defs/nullablePose"
+            },
+            "command_left": {
+              "$ref": "#/$defs/nullablePose"
+            },
+            "command_right": {
+              "$ref": "#/$defs/nullablePose"
+            }
+          }
+        }
+      }
+    },
+    "arms": {
+      "type": "object",
+      "required": [
+        "joint_names",
+        "measured_q_rad",
+        "measured_dq_rps",
+        "target_q_rad",
+        "published_q_rad",
+        "ik_q_rad",
+        "ik_tau_ff",
+        "tau_est",
+        "temperatures_c",
+        "motor_state",
+        "target_error_rad",
+        "published_error_rad",
+        "max_abs_target_error_rad",
+        "max_abs_published_error_rad"
+      ],
+      "properties": {
+        "joint_names": {
+          "type": "array",
+          "minItems": 14,
+          "maxItems": 14,
+          "items": {
+            "type": "string"
+          }
+        },
+        "measured_q_rad": {
+          "$ref": "#/$defs/nullableVec14"
+        },
+        "measured_dq_rps": {
+          "$ref": "#/$defs/nullableVec14"
+        },
+        "target_q_rad": {
+          "$ref": "#/$defs/nullableVec14"
+        },
+        "published_q_rad": {
+          "$ref": "#/$defs/nullableVec14"
+        },
+        "ik_q_rad": {
+          "$ref": "#/$defs/nullableVec14"
+        },
+        "ik_tau_ff": {
+          "$ref": "#/$defs/nullableVec14"
+        },
+        "tau_est": {
+          "$ref": "#/$defs/nullableVec14"
+        },
+        "temperatures_c": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "array",
+              "minItems": 14,
+              "maxItems": 14,
+              "items": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 2,
+                "items": {
+                  "$ref": "#/$defs/nullableNumber"
+                }
+              }
+            }
+          ]
+        },
+        "motor_state": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "array",
+              "minItems": 14,
+              "maxItems": 14,
+              "items": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            }
+          ]
+        },
+        "target_error_rad": {
+          "$ref": "#/$defs/nullableVec14"
+        },
+        "published_error_rad": {
+          "$ref": "#/$defs/nullableVec14"
+        },
+        "max_abs_target_error_rad": {
+          "$ref": "#/$defs/nullableNumber"
+        },
+        "max_abs_published_error_rad": {
+          "$ref": "#/$defs/nullableNumber"
+        }
+      }
+    },
+    "hands": {
+      "type": "object",
+      "required": [
+        "mode",
+        "tracking_valid",
+        "tracking_reason",
+        "finger_resume_pending",
+        "reacquire_ready",
+        "reacquire_count",
+        "reacquire_required_frames",
+        "reacquire_max_error",
+        "reacquire_tolerance",
+        "current_left",
+        "current_right",
+        "target_left",
+        "target_right",
+        "normalized_left",
+        "normalized_right",
+        "feedback_state",
+        "write_count",
+        "retarget_count",
+        "thumb_rotation_control"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "OPEN",
+            "FOLLOW",
+            "HOLD",
+            "REACQUIRE"
+          ]
+        },
+        "tracking_valid": {
+          "type": "boolean"
+        },
+        "tracking_reason": {
+          "type": "string"
+        },
+        "finger_resume_pending": {
+          "type": "boolean"
+        },
+        "reacquire_ready": {
+          "type": "boolean"
+        },
+        "reacquire_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reacquire_required_frames": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "reacquire_max_error": {
+          "$ref": "#/$defs/nullableNumber"
+        },
+        "reacquire_tolerance": {
+          "$ref": "#/$defs/nullableNumber"
+        },
+        "current_left": {
+          "$ref": "#/$defs/nullableVec6"
+        },
+        "current_right": {
+          "$ref": "#/$defs/nullableVec6"
+        },
+        "target_left": {
+          "$ref": "#/$defs/nullableVec6"
+        },
+        "target_right": {
+          "$ref": "#/$defs/nullableVec6"
+        },
+        "normalized_left": {
+          "$ref": "#/$defs/nullableVec6"
+        },
+        "normalized_right": {
+          "$ref": "#/$defs/nullableVec6"
+        },
+        "feedback_state": {
+          "$ref": "#/$defs/nullableVec12"
+        },
+        "write_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "retarget_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "thumb_rotation_control": {
+          "const": "symmetric"
+        }
+      }
+    },
+    "camera": {
+      "type": "object",
+      "required": [
+        "display_mode",
+        "webrtc_enabled",
+        "webrtc_offer_url",
+        "width",
+        "height",
+        "display_fps"
+      ],
+      "properties": {
+        "display_mode": {
+          "enum": [
+            "immersive",
+            "ego",
+            "pass-through"
+          ]
+        },
+        "webrtc_enabled": {
+          "type": "boolean"
+        },
+        "webrtc_offer_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "width": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "display_fps": {
+          "$ref": "#/$defs/nullableNumber"
+        }
+      }
+    },
+    "robot": {
+      "type": "object",
+      "required": [
+        "model_family",
+        "joint_count",
+        "mode_machine",
+        "motor_indices",
+        "joint_names",
+        "measured_q_rad",
+        "measured_dq_rps",
+        "tau_est",
+        "temperatures_c",
+        "motor_state"
+      ],
+      "properties": {
+        "model_family": {
+          "const": "Unitree G1"
+        },
+        "joint_count": {
+          "const": 29
+        },
+        "mode_machine": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "motor_indices": {
+          "type": "array",
+          "minItems": 29,
+          "maxItems": 29,
+          "prefixItems": [
+            {
+              "const": 0
+            },
+            {
+              "const": 1
+            },
+            {
+              "const": 2
+            },
+            {
+              "const": 3
+            },
+            {
+              "const": 4
+            },
+            {
+              "const": 5
+            },
+            {
+              "const": 6
+            },
+            {
+              "const": 7
+            },
+            {
+              "const": 8
+            },
+            {
+              "const": 9
+            },
+            {
+              "const": 10
+            },
+            {
+              "const": 11
+            },
+            {
+              "const": 12
+            },
+            {
+              "const": 13
+            },
+            {
+              "const": 14
+            },
+            {
+              "const": 15
+            },
+            {
+              "const": 16
+            },
+            {
+              "const": 17
+            },
+            {
+              "const": 18
+            },
+            {
+              "const": 19
+            },
+            {
+              "const": 20
+            },
+            {
+              "const": 21
+            },
+            {
+              "const": 22
+            },
+            {
+              "const": 23
+            },
+            {
+              "const": 24
+            },
+            {
+              "const": 25
+            },
+            {
+              "const": 26
+            },
+            {
+              "const": 27
+            },
+            {
+              "const": 28
+            }
+          ],
+          "items": false
+        },
+        "joint_names": {
+          "type": "array",
+          "minItems": 29,
+          "maxItems": 29,
+          "items": {
+            "type": "string"
+          }
+        },
+        "measured_q_rad": {
+          "$ref": "#/$defs/nullableVec29"
+        },
+        "measured_dq_rps": {
+          "$ref": "#/$defs/nullableVec29"
+        },
+        "tau_est": {
+          "$ref": "#/$defs/nullableVec29"
+        },
+        "temperatures_c": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "array",
+              "minItems": 29,
+              "maxItems": 29,
+              "items": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 2,
+                "items": {
+                  "$ref": "#/$defs/nullableNumber"
+                }
+              }
+            }
+          ]
+        },
+        "motor_state": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "array",
+              "minItems": 29,
+              "maxItems": 29,
+              "items": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "nullableNumber": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "nullableVec3": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": {
+            "$ref": "#/$defs/nullableNumber"
+          }
+        }
+      ]
+    },
+    "nullableVec6": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "array",
+          "minItems": 6,
+          "maxItems": 6,
+          "items": {
+            "$ref": "#/$defs/nullableNumber"
+          }
+        }
+      ]
+    },
+    "nullableVec12": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "array",
+          "minItems": 12,
+          "maxItems": 12,
+          "items": {
+            "$ref": "#/$defs/nullableNumber"
+          }
+        }
+      ]
+    },
+    "nullableVec14": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "array",
+          "minItems": 14,
+          "maxItems": 14,
+          "items": {
+            "$ref": "#/$defs/nullableNumber"
+          }
+        }
+      ]
+    },
+    "nullablePose": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "array",
+          "minItems": 16,
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/nullableNumber"
+          }
+        }
+      ]
+    },
+    "nullableVec29": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "array",
+          "minItems": 29,
+          "maxItems": 29,
+          "items": {
+            "$ref": "#/$defs/nullableNumber"
+          }
+        }
+      ]
+    }
+  }
+}

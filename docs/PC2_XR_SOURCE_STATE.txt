@@ -1,0 +1,10 @@
+=== XR TELEOPERATE SOURCE ===
+host: unitree-g1-nx
+path: /home/unitree/xr_teleoperate_g1demo
+
+=== GIT COMMIT ===
+not available
+
+=== GIT BRANCH ===
+
+=== LOCAL CHANGES ===
