@@ -396,3 +396,39 @@ button,a{font:inherit}.topbar{height:var(--top);display:grid;grid-template-colum
   .rail-hand-panel .hand-meta>div{padding:3px 4px}
 }
 
+
+/* Step 5.0 — whitelisted controller process lifecycle controls */
+.process-control-label{color:#f0c978;border-color:#6b5526;background:#211b0d}
+.danger-btn{border:1px solid #6a3038;border-radius:7px;padding:6px 9px;background:#281317;color:#ff8d98;cursor:pointer;font-size:10px;font-weight:750}
+.danger-btn:hover:not(:disabled){background:#35171d;border-color:#87404a;color:#ffc0c6}
+.danger-btn:disabled,.primary-btn:disabled,.ghost-btn:disabled{opacity:.42;cursor:not-allowed}
+
+.controller-process-panel{padding:7px 8px;min-height:108px;overflow:hidden}
+.controller-process-head{margin-bottom:5px}.controller-process-head strong{display:block;font-size:10px;margin-top:1px}
+.controller-process-meta{display:flex;gap:9px;color:#71869a;font-size:7px;font-variant-numeric:tabular-nums}
+.controller-process-detail{margin-top:4px;min-height:18px;color:#8296aa;font-size:7.2px;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.controller-process-actions{display:flex;gap:6px;margin-top:6px}.controller-process-actions button{flex:1;padding:5px 6px;font-size:8px;white-space:nowrap}
+.combined-rail .controller-process-panel{flex:none}
+
+.modal-backdrop{position:fixed;inset:0;z-index:100;background:rgba(3,6,10,.78);backdrop-filter:blur(6px);display:flex;align-items:center;justify-content:center;padding:20px}
+.controller-modal{width:min(980px,96vw);max-height:min(900px,92vh);overflow:auto;background:#0d141c;border:1px solid #304052;border-radius:14px;box-shadow:0 28px 80px rgba(0,0,0,.62);padding:14px}
+.controller-modal-head{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;padding-bottom:10px;border-bottom:1px solid var(--line)}
+.controller-modal-head h2{font-size:18px;margin:3px 0 3px}.controller-modal-head p{margin:0;max-width:740px;color:#8193a5;font-size:9px;line-height:1.45}
+.icon-btn{border:1px solid var(--line);background:#101821;color:#a9b8c8;border-radius:7px;width:30px;height:30px;font-size:20px;line-height:1;cursor:pointer}.icon-btn:hover{color:#fff;border-color:#4a6076}
+.controller-modal-notice{margin-top:10px;padding:7px 9px;border:1px solid #594c24;background:#211d10;color:#e0c46d;border-radius:7px;font-size:8px;line-height:1.35}
+.controller-auth-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:end;margin-top:10px}
+.controller-auth-row label{display:grid;gap:4px}.controller-auth-row label span,.controller-section-title{font-size:7px;letter-spacing:.11em;font-weight:800;color:#6f8498}
+.controller-auth-row input{height:31px;border:1px solid #2c3a49;border-radius:7px;background:#0a1118;color:#d9e6f3;padding:0 9px;font:inherit;font-size:10px;outline:none}.controller-auth-row input:focus{border-color:#5278a2}
+.controller-locked-block{margin-top:10px}.controller-locked-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px;margin-top:5px}
+.controller-locked-grid>div{background:#101821;border:1px solid #1e2a36;border-radius:6px;padding:6px 7px;min-width:0}.controller-locked-grid span{display:block;color:#687c90;font-size:6.5px}.controller-locked-grid strong{display:block;margin-top:2px;color:#c0cedc;font-size:7.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.controller-parameter-sections{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;margin-top:11px}.controller-param-section{border:1px solid #202e3b;border-radius:8px;background:#0b1219;overflow:hidden}.controller-param-section>header{padding:6px 8px;background:#111a24;border-bottom:1px solid #202e3b;font-size:7px;letter-spacing:.11em;color:#8297ab;font-weight:800}.controller-param-list{display:grid}
+.controller-param-row{display:grid;grid-template-columns:150px minmax(90px,1fr) 86px;gap:8px;align-items:center;padding:5px 7px;border-bottom:1px solid #17222c}.controller-param-row:last-child{border-bottom:0}.controller-param-row>label{font-size:8px;color:#a4b4c4;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.controller-param-row input[type=range]{width:100%;accent-color:#4f83ba}.controller-param-number{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;border:1px solid #263747;border-radius:6px;background:#0c141c;overflow:hidden}.controller-param-number input{width:100%;height:25px;border:0;background:transparent;color:#d8e5f2;padding:0 5px;font:inherit;font-size:8px;text-align:right;outline:none}.controller-param-number span{padding-right:5px;color:#65798d;font-size:6.8px;white-space:nowrap}
+.controller-bool-row{grid-template-columns:150px 1fr}.controller-bool-row .toggle{justify-self:start}
+.controller-command-details{margin-top:10px;border:1px solid #202e3b;border-radius:8px;background:#0a1017}.controller-command-details summary{cursor:pointer;padding:7px 9px;color:#8297ab;font-size:8px}.controller-command-details pre{margin:0;border-top:1px solid #202e3b;padding:8px 9px;max-height:120px;overflow:auto;white-space:pre-wrap;word-break:break-word;color:#9fb5c9;font-size:7px;line-height:1.4}
+.controller-modal-error{margin-top:9px;padding:7px 9px;border:1px solid #6a3038;background:#281317;color:#ff9aa4;border-radius:7px;font-size:8px;line-height:1.4}
+.controller-modal-footer{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-top:11px;padding-top:10px;border-top:1px solid var(--line)}.controller-modal-footer>div{display:flex;gap:7px}.controller-modal-footer .primary-btn,.controller-modal-footer .ghost-btn{padding:7px 11px}
+
+@media(max-width:1450px){.controller-process-panel{min-height:102px}.controller-process-detail{font-size:6.8px}}
+@media(max-width:900px){.controller-modal{width:98vw}.controller-parameter-sections{grid-template-columns:1fr}.controller-locked-grid{grid-template-columns:1fr 1fr}}
+@media(max-width:560px){.modal-backdrop{padding:8px}.controller-modal{max-height:96vh}.controller-auth-row{grid-template-columns:1fr}.controller-locked-grid{grid-template-columns:1fr}.controller-param-row{grid-template-columns:110px minmax(70px,1fr) 78px}.controller-modal-footer{align-items:flex-end;flex-direction:column}.controller-modal-footer>div{width:100%}.controller-modal-footer button{flex:1}}
+.controller-safety-ack{display:flex;gap:7px;align-items:flex-start;margin-top:8px;padding:7px 9px;border:1px solid #334252;border-radius:7px;background:#0e161f;color:#9fb0c0;font-size:8px;line-height:1.35;cursor:pointer}.controller-safety-ack input{margin-top:1px;accent-color:#4f83ba}

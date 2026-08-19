@@ -1,3 +1,74 @@
+# G1 Dashboard Step 5.0 v1 — Whitelisted V1.8 process manager
+
+Step 5.0 is the first dashboard interaction layer. It adds authenticated browser requests to **start and gracefully stop one exact controller process**:
+
+```text
+g1_locomotion_xr_handover_live_v6_7_4_symmetric_thumb_control_dashboard_telemetry_v1_8.py
+```
+
+It does not add an XR `c`/mode request endpoint and it does not add Unitree `ServiceSwitch()` calls. The HTTP bridge still imports no Unitree DDS library.
+
+## Safety / architecture boundary
+
+- The browser cannot supply an executable path, Python path, environment variable, or raw shell command.
+- The server constructs the command from one hard-coded V1.8 basename, fixed working settings, and whitelisted numeric/boolean parameters.
+- `teleop_weight` stays locked at the validated value `1.00`.
+- Start/stop POST requests require a per-dashboard-start management key sent in `X-G1-Management-Key`.
+- `start_dashboard.sh` generates that key and prints it in the PC2 terminal. The browser stores it only in `sessionStorage` for the current tab/session.
+- Stopping sends one `SIGTERM`, which V1.8 handles as its normal controlled handback/shutdown request. Step 5.0 never uses `SIGKILL`.
+- A controller started by the dashboard is detached from the bridge. Closing the browser or stopping/restarting the dashboard does **not** stop the controller. A small `/tmp` state file allows a restarted dashboard bridge to adopt a still-running controller that it launched previously.
+- A manually/external V1.8 process is detected as `RUNNING_EXTERNAL`; the dashboard will not stop it.
+
+## Important Step 5.0 limitation
+
+A controller launched from the dashboard is intentionally detached with no interactive stdin. Therefore the old terminal keyboard `c` path is not the intended way to enter XR for a dashboard-launched process. Step 5.0 is for lifecycle management. Step 5.1 will add a controller-owned `REQUEST_XR` / return request channel that reuses the same internal transition policy as `c`. Until then, use this revision to validate start/stop and telemetry lifecycle; use a manually launched controller if you need the existing terminal keyboard interaction.
+
+## Known-good defaults exposed in the modal
+
+The modal starts from the last validated launch settings and exposes bounded edits for control/status rate, wrist speed, wrist rotation speed, joint target speed, IK jump guard, inward offset, tracking reacquisition values, and Inspire finger rate/guards. The displayed min/max values are **dashboard editing bounds, not Unitree safety limits**.
+
+Locked working settings include:
+
+```text
+DDS interface          enP8p1s0
+display mode           immersive
+camera                 192.168.0.116:60001, 640x480, 30 fps
+arm ownership          1.00
+dashboard telemetry    loopback, 30 Hz
+```
+
+The modal also requires a fresh operator acknowledgement before every launch that the robot is prepared and the R3 safety operator is ready.
+
+## Controller runtime selection
+
+The process manager prefers the existing `g1_xr` conda Python, then `g1_deploy`, then its own Python. The runtime may be pinned explicitly without exposing it to the browser:
+
+```bash
+G1_DASHBOARD_CONTROLLER_PYTHON="$HOME/miniconda3/envs/g1_xr/bin/python" ./start_dashboard.sh
+```
+
+The script path may be overridden only server-side and must still end in the exact V1.8 basename:
+
+```bash
+G1_DASHBOARD_CONTROLLER_SCRIPT="$HOME/xr_teleoperate_g1demo/teleop/g1_locomotion_xr_handover_live_v6_7_4_symmetric_thumb_control_dashboard_telemetry_v1_8.py" ./start_dashboard.sh
+```
+
+## Start dashboard
+
+```bash
+./start_dashboard.sh
+```
+
+The terminal prints a line like:
+
+```text
+management key  : <random key>
+```
+
+Paste that key into **Live → Teleop Listener → Configure & start**.
+
+---
+
 # Step 4.8 — Live Inspire RH56DFX hand twin (read-only)
 
 This revision extends the working G1 body twin with the actual Inspire RH56DFX hand URDF/STL assets supplied from the robot's installed `xr_teleoperate_g1demo/assets/inspire_hand` directory. The browser now animates both physical hand feedback and the published finger command. Controller V1.8 is unchanged.

@@ -8,6 +8,7 @@ IFACE="${G1_DASHBOARD_INTERFACE:-enP8p1s0}"
 UNITREE_SERVICES="${G1_DASHBOARD_UNITREE_SERVICES:-auto}"
 BASE_SENSING="${G1_DASHBOARD_BASE_SENSING:-auto}"
 SYSTEM_HZ="${G1_DASHBOARD_SYSTEM_HZ:-5}"
+PROCESS_ACTIONS="${G1_DASHBOARD_PROCESS_ACTIONS:-1}"
 
 if [[ -n "${G1_DASHBOARD_MONITOR_PYTHON:-}" ]]; then
   MONITOR_PY="$G1_DASHBOARD_MONITOR_PYTHON"
@@ -36,16 +37,38 @@ cleanup() {
     kill "$MONITOR_PID" 2>/dev/null || true
     wait "$MONITOR_PID" 2>/dev/null || true
   fi
+  # Deliberately do NOT stop a controller launched by the dashboard here.
+  # Browser/bridge/dashboard disconnects must not become a robot-control input.
   exit "$code"
 }
 trap cleanup EXIT INT TERM
 
-echo "G1 dashboard Step 4.6"
+BRIDGE_ARGS=()
+if [[ "$PROCESS_ACTIONS" == "1" || "$PROCESS_ACTIONS" == "true" || "$PROCESS_ACTIONS" == "yes" ]]; then
+  if [[ -z "${G1_DASHBOARD_ACTION_TOKEN:-}" ]]; then
+    G1_DASHBOARD_ACTION_TOKEN="$("$BRIDGE_PY" - <<'PY'
+import secrets
+print(secrets.token_urlsafe(18))
+PY
+)"
+  fi
+  export G1_DASHBOARD_ACTION_TOKEN
+  BRIDGE_ARGS+=(--enable-process-actions)
+fi
+
+echo "G1 dashboard Step 5.0 — controller process manager"
 echo "  interface       : $IFACE"
 echo "  monitor python  : $MONITOR_PY"
 echo "  services        : $UNITREE_SERVICES (read-only)"
 echo "  base sensing    : $BASE_SENSING (read-only)"
 echo "  system rate     : ${SYSTEM_HZ} Hz"
+if ((${#BRIDGE_ARGS[@]})); then
+  echo "  process actions : ENABLED (V1.8 start/stop only)"
+  echo "  management key  : $G1_DASHBOARD_ACTION_TOKEN"
+  echo "                     paste this key into the Start listener window"
+else
+  echo "  process actions : DISABLED"
+fi
 echo
 
 "$MONITOR_PY" "$HERE/g1_dashboard_system_monitor.py" \
@@ -59,9 +82,10 @@ MONITOR_PID=$!
 sleep 0.25
 
 echo "System monitor pid: $MONITOR_PID"
-echo "Starting dashboard bridge. Ctrl+C stops both dashboard processes."
+echo "Starting dashboard bridge. Ctrl+C stops dashboard processes only."
+echo "A V1.8 controller launched from the dashboard is intentionally left running."
 echo
 
-"$BRIDGE_PY" "$HERE/g1_dashboard_bridge.py" &
+"$BRIDGE_PY" "$HERE/g1_dashboard_bridge.py" "${BRIDGE_ARGS[@]}" &
 BRIDGE_PID=$!
 wait "$BRIDGE_PID"

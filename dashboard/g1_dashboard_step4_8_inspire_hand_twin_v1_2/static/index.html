@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>G1 Teleop Control Center</title>
   <link rel="icon" href="data:," />
-  <link rel="stylesheet" href="/static/styles.css?v=step4-8-v1.2" />
+  <link rel="stylesheet" href="/static/styles.css?v=step5-0-v1" />
 </head>
 <body>
   <header class="topbar">
@@ -13,7 +13,7 @@
       <div class="eyebrow">UNITREE G1 · XR TELEOPERATION</div>
       <div class="title-row">
         <h1>Teleop Control Center</h1>
-        <span class="readonly">READ ONLY</span>
+        <span class="readonly process-control-label">PROCESS CONTROL · NO DDS</span>
       </div>
     </div>
 
@@ -25,6 +25,7 @@
 
     <div class="header-status">
       <span id="bridgeChip" class="chip">BRIDGE —</span>
+      <span id="controllerProcessChip" class="chip">CTRL —</span>
       <span id="telemetryChip" class="chip">TELEMETRY —</span>
       <span id="cameraChip" class="chip">CAMERA —</span>
       <span id="versionText" class="version">—</span>
@@ -165,6 +166,22 @@
               <div><span>Finger worker</span><strong id="fingerPhase">—</strong></div>
               <div><span>Inspire</span><strong id="fingerFeedback">—</strong></div>
               <div><span>Packet</span><strong id="packetAge">—</strong></div>
+            </div>
+          </section>
+
+          <section class="panel controller-process-panel">
+            <div class="panel-head controller-process-head">
+              <div><div class="panel-kicker">TELEOP LISTENER</div><strong id="controllerProcessTitle">Controller process</strong></div>
+              <span id="controllerProcessState" class="chip">—</span>
+            </div>
+            <div class="controller-process-meta">
+              <span id="controllerProcessPid">pid —</span>
+              <span id="controllerProcessUptime">uptime —</span>
+            </div>
+            <div id="controllerProcessDetail" class="controller-process-detail">Checking process manager…</div>
+            <div class="controller-process-actions">
+              <button id="controllerConfigureBtn" class="primary-btn">Configure &amp; start</button>
+              <button id="controllerStopBtn" class="danger-btn" disabled>Stop listener</button>
             </div>
           </section>
 
@@ -403,6 +420,55 @@
     </section>
   </main>
 
-  <script type="module" src="/static/app.js?v=step4-8-v1.2"></script>
+  <div id="controllerModal" class="modal-backdrop hidden" role="presentation">
+    <section class="controller-modal" role="dialog" aria-modal="true" aria-labelledby="controllerModalTitle">
+      <div class="controller-modal-head">
+        <div>
+          <div class="panel-kicker">STEP 5.0 · PROCESS CONTROL</div>
+          <h2 id="controllerModalTitle">Start teleop listener</h2>
+          <p>Starts the exact whitelisted V1.8 controller. This does <strong>not</strong> enter XR arm control; the controller still starts in its normal locomotion-ready state.</p>
+        </div>
+        <button id="controllerModalCloseBtn" class="icon-btn" aria-label="Close">×</button>
+      </div>
+
+      <div id="controllerModalNotice" class="controller-modal-notice">Dashboard parameter ranges are editing bounds, not robot safety limits. Controller and Unitree checks remain authoritative.</div>
+
+      <div class="controller-auth-row">
+        <label>
+          <span>Management key</span>
+          <input id="controllerManagementKey" type="password" autocomplete="off" placeholder="Paste key printed by ./start_dashboard.sh" />
+        </label>
+        <button id="controllerResetDefaultsBtn" class="ghost-btn">Reset known-good</button>
+      </div>
+      <label class="controller-safety-ack">
+        <input id="controllerSafetyAck" type="checkbox" />
+        <span>I confirm the robot is prepared and the R3 safety operator is ready. Starting the listener enables the live controller process, but does not enter XR ownership.</span>
+      </label>
+
+      <div class="controller-locked-block">
+        <div class="controller-section-title">LOCKED WORKING SETTINGS</div>
+        <div id="controllerLockedSettings" class="controller-locked-grid"></div>
+      </div>
+
+      <div id="controllerParameterSections" class="controller-parameter-sections"></div>
+
+      <details class="controller-command-details">
+        <summary>Resolved launch command</summary>
+        <pre id="controllerCommandPreview">Loading controller configuration…</pre>
+      </details>
+
+      <div id="controllerModalError" class="controller-modal-error hidden"></div>
+
+      <div class="controller-modal-footer">
+        <span id="controllerModalRuntime" class="dim">—</span>
+        <div>
+          <button id="controllerModalCancelBtn" class="ghost-btn">Cancel</button>
+          <button id="controllerStartBtn" class="primary-btn">Launch V1.8 listener</button>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script type="module" src="/static/app.js?v=step5-0-v1"></script>
 </body>
 </html>

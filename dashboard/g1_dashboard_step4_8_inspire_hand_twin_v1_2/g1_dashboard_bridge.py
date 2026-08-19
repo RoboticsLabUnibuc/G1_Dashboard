@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""G1 dashboard bridge v1.4.8 — Inspire-hand twin + read-only system/base-sensing bridge.
+"""G1 dashboard bridge v1.5.0 — Step 5.0 whitelisted controller process manager.
 
 Safety boundary:
 - Receives controller telemetry only from localhost UDP (127.0.0.1:8765).
-- Exposes read-only HTTP/JSON to the lab network.
 - Uses only the Python standard library: no FastAPI/Uvicorn/WebSocket packages.
-- Does NOT import Unitree DDS libraries.
-- Does NOT publish robot commands.
-- Does NOT provide mode-switch/control endpoints.
-- Browser/client disconnects have no effect on robot control.
+- Does NOT import Unitree DDS libraries and does NOT publish DDS commands.
+- Step 5.0 adds only authenticated start/stop lifecycle requests for one exact
+  validated V1.8 controller script. No arbitrary executable/shell path is accepted.
+- It still has no XR mode-switch endpoint and no Unitree ServiceSwitch endpoint.
+- Browser/client disconnects have no effect on an already running controller.
 """
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ import argparse
 import json
 import math
 import mimetypes
+import os
 import socket
 import threading
 import time
@@ -24,10 +25,12 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
+
+from g1_dashboard_process_manager import ControllerProcessManager
 
 SCHEMA = "g1_dashboard.telemetry.v1"
-BRIDGE_VERSION = "g1_dashboard_bridge.v1.4.8.2-inspire-ghost-overlay"
+BRIDGE_VERSION = "g1_dashboard_bridge.v1.5.0-controller-process-manager"
 SYSTEM_SCHEMA = "g1_dashboard.system.v1"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -375,7 +378,7 @@ class UdpSystemThread(threading.Thread):
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
-    server_version = "G1Dashboard/1.4.8.2"
+    server_version = "G1Dashboard/1.5.0"
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt: str, *args: object) -> None:
@@ -397,6 +400,37 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _send_json(self, status: int, payload: Any) -> None:
         body = json.dumps(payload, separators=(",", ":"), allow_nan=False).encode("utf-8")
         self._send_bytes(status, body, "application/json; charset=utf-8", cache=False)
+
+    def _read_json_body(self, *, max_bytes: int = 65536) -> Any:
+        content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            raise ValueError("Content-Type must be application/json")
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise ValueError("invalid Content-Length") from exc
+        if length < 0 or length > max_bytes:
+            raise ValueError(f"request body must be <= {max_bytes} bytes")
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except Exception as exc:
+            raise ValueError(f"invalid JSON body: {exc}") from exc
+
+    def _process_action_authorized(self) -> bool:
+        import secrets
+        expected: str = self.server.action_token  # type: ignore[attr-defined]
+        supplied = self.headers.get("X-G1-Management-Key", "")
+        return bool(expected) and bool(supplied) and secrets.compare_digest(supplied, expected)
+
+    def _require_process_action_auth(self) -> bool:
+        if not self.server.process_actions_enabled:  # type: ignore[attr-defined]
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": "controller process actions are disabled"})
+            return False
+        if not self._process_action_authorized():
+            self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "invalid or missing management key"})
+            return False
+        return True
 
     def _serve_file(self, path: Path, *, cache: bool = False) -> None:
         try:
@@ -445,14 +479,34 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path == "/api/system":
             self._send_json(HTTPStatus.OK, system_state.envelope())
             return
+        if path == "/api/controller":
+            manager: ControllerProcessManager = self.server.process_manager  # type: ignore[attr-defined]
+            self._send_json(HTTPStatus.OK, manager.status())
+            return
+        if path == "/api/controller/config":
+            manager: ControllerProcessManager = self.server.process_manager  # type: ignore[attr-defined]
+            self._send_json(HTTPStatus.OK, manager.config_schema())
+            return
+        if path == "/api/controller/log":
+            manager: ControllerProcessManager = self.server.process_manager  # type: ignore[attr-defined]
+            query = parse_qs(parsed.query)
+            try:
+                lines = int((query.get("lines") or ["80"])[0])
+            except ValueError:
+                lines = 80
+            self._send_json(HTTPStatus.OK, manager.log_tail(lines))
+            return
         if path == "/api/info":
             env = state.envelope()
             self._send_json(HTTPStatus.OK, {
                 "bridge": env["bridge"],
                 "safety_boundary": {
-                    "read_only": True,
+                    "robot_dds_read_only": True,
                     "dds_imported": False,
-                    "command_endpoints": False,
+                    "robot_command_endpoints": False,
+                    "controller_process_actions": bool(self.server.process_actions_enabled),  # type: ignore[attr-defined]
+                    "controller_process_actions_authenticated": True,
+                    "arbitrary_process_launch": False,
                     "telemetry_input": f"udp://127.0.0.1:{self.server.udp_port}",  # type: ignore[attr-defined]
                     "system_input": f"udp://127.0.0.1:{self.server.system_udp_port}",  # type: ignore[attr-defined]
                 },
@@ -466,8 +520,37 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
-        # Explicit safety boundary: there are no command endpoints in v1.4.
-        self._send_json(HTTPStatus.METHOD_NOT_ALLOWED, {"error": "read-only bridge; POST is disabled"})
+        parsed = urlparse(self.path)
+        path = parsed.path
+        manager: ControllerProcessManager = self.server.process_manager  # type: ignore[attr-defined]
+
+        if path not in ("/api/controller/start", "/api/controller/stop"):
+            self._send_json(HTTPStatus.METHOD_NOT_ALLOWED, {
+                "error": "unsupported POST; Step 5.0 exposes only authenticated controller process start/stop"
+            })
+            return
+        if not self._require_process_action_auth():
+            return
+        try:
+            payload = self._read_json_body()
+            if not isinstance(payload, dict):
+                raise ValueError("JSON body must be an object")
+            if path == "/api/controller/start":
+                status = manager.start(payload.get("parameters", {}))
+                self._send_json(HTTPStatus.ACCEPTED, {"ok": True, "controller": status})
+            else:
+                status = manager.stop()
+                self._send_json(HTTPStatus.ACCEPTED, {"ok": True, "controller": status})
+        except PermissionError as exc:
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": str(exc), "controller": manager.status()})
+        except FileNotFoundError as exc:
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc), "controller": manager.status()})
+        except (ValueError, RuntimeError) as exc:
+            self._send_json(HTTPStatus.CONFLICT if isinstance(exc, RuntimeError) else HTTPStatus.BAD_REQUEST, {
+                "error": str(exc), "controller": manager.status()
+            })
+        except Exception as exc:
+            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"controller process action failed: {exc}"})
 
 
 def parse_args() -> argparse.Namespace:
@@ -478,6 +561,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--http-host", default="0.0.0.0")
     p.add_argument("--http-port", type=int, default=8080)
     p.add_argument("--stale-after-s", type=float, default=1.5)
+    p.add_argument(
+        "--enable-process-actions",
+        action="store_true",
+        help="Enable authenticated start/stop of the exact V1.8 controller process.",
+    )
     return p.parse_args()
 
 
@@ -503,14 +591,26 @@ def main() -> int:
     server.system_state = system_state  # type: ignore[attr-defined]
     server.udp_port = args.udp_port  # type: ignore[attr-defined]
     server.system_udp_port = args.system_udp_port  # type: ignore[attr-defined]
+    process_manager = ControllerProcessManager(enabled=args.enable_process_actions)
+    action_token = os.environ.get("G1_DASHBOARD_ACTION_TOKEN", "") if args.enable_process_actions else ""
+    if args.enable_process_actions and len(action_token) < 16:
+        raise SystemExit("--enable-process-actions requires G1_DASHBOARD_ACTION_TOKEN with at least 16 characters")
+    server.process_manager = process_manager  # type: ignore[attr-defined]
+    server.process_actions_enabled = args.enable_process_actions  # type: ignore[attr-defined]
+    server.action_token = action_token  # type: ignore[attr-defined]
 
-    print(f"{BRIDGE_VERSION} READ-ONLY")
+    print(f"{BRIDGE_VERSION} PROCESS-CONTROL-ONLY")
     print(f"Telemetry input : udp://127.0.0.1:{args.udp_port}")
     print(f"System input    : udp://127.0.0.1:{args.system_udp_port}")
     print(f"Dashboard HTTP  : http://{args.http_host}:{args.http_port}")
     print("Transport       : dual-rate latest-only HTTP (30 Hz pose / 4 Hz status)")
     print("Dependencies    : Python standard library only")
-    print("No DDS imports. No robot command endpoints.")
+    print(f"Process actions : {'ENABLED' if args.enable_process_actions else 'DISABLED'}")
+    if args.enable_process_actions:
+        print(f"Controller      : {process_manager.script_path}")
+        print(f"Controller Py   : {process_manager.python_path}")
+        print("Auth            : X-G1-Management-Key required")
+    print("No DDS imports. No XR mode or Unitree service command endpoints.")
     try:
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:

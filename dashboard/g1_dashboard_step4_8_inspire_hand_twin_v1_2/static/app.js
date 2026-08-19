@@ -37,6 +37,200 @@ document.querySelectorAll('.tab').forEach(b=>b.addEventListener('click',()=>swit
 document.querySelectorAll('[data-view-jump]').forEach(b=>b.addEventListener('click',()=>switchView(b.dataset.viewJump)));
 $('faultDetailsBtn').addEventListener('click',()=>switchView('status'));
 
+/* ---------- Step 5.0 controller process manager ---------- */
+let controllerConfig=null;
+let controllerStatus=null;
+let controllerPollBusy=false;
+let controllerActionBusy=false;
+
+function controllerStateTone(state){
+  if(state==='RUNNING') return 'good';
+  if(state==='STOPPING'||state==='RUNNING_EXTERNAL') return 'warn';
+  if(state==='UNAVAILABLE') return 'bad';
+  return null;
+}
+function controllerStateLabel(state){
+  if(state==='RUNNING_EXTERNAL') return 'EXTERNAL';
+  return state||'—';
+}
+function renderControllerProcess(st){
+  controllerStatus=st||{};
+  const state=controllerStatus.state||'UNAVAILABLE';
+  const tone=controllerStateTone(state);
+  setChip($('controllerProcessChip'),`CTRL ${controllerStateLabel(state)}`,tone);
+  setChip($('controllerProcessState'),controllerStateLabel(state),tone);
+  const pid=controllerStatus.pid;
+  $('controllerProcessPid').textContent=pid?`pid ${pid}`:'pid —';
+  $('controllerProcessUptime').textContent=finite(controllerStatus.uptime_s)?`uptime ${duration(controllerStatus.uptime_s)}`:'uptime —';
+  let detail='Process manager unavailable.';
+  if(state==='STOPPED') detail='Ready to launch the whitelisted V1.8 listener.';
+  else if(state==='RUNNING') detail='Dashboard-managed V1.8 listener is running. XR entry remains a separate action.';
+  else if(state==='STOPPING') detail='Controlled stop requested; waiting for V1.8 handback and cleanup.';
+  else if(state==='RUNNING_EXTERNAL') detail='V1.8 is already running outside this dashboard. Start/stop is locked here.';
+  else if(controllerStatus.last_error) detail=controllerStatus.last_error;
+  else if(controllerStatus.enabled===false) detail='Process actions disabled by dashboard startup configuration.';
+  $('controllerProcessDetail').textContent=detail;
+  $('controllerConfigureBtn').disabled=controllerActionBusy || !controllerStatus.can_start;
+  $('controllerConfigureBtn').textContent=state==='STOPPED'?'Configure & start':'Configure & start';
+  $('controllerStopBtn').disabled=controllerActionBusy || state!=='RUNNING' || !controllerStatus.can_stop;
+  if(state==='STOPPING') $('controllerStopBtn').textContent='Stopping…'; else $('controllerStopBtn').textContent='Stop listener';
+}
+async function pollControllerProcess(){
+  if(controllerPollBusy)return; controllerPollBusy=true;
+  try{
+    const r=await fetch('/api/controller',{cache:'no-store'});
+    if(!r.ok) throw new Error(`HTTP ${r.status}`);
+    renderControllerProcess(await r.json());
+  }catch(err){
+    setChip($('controllerProcessChip'),'CTRL OFFLINE','warn');
+    setChip($('controllerProcessState'),'OFFLINE','warn');
+    $('controllerProcessDetail').textContent='Controller process manager endpoint unavailable.';
+    $('controllerConfigureBtn').disabled=true; $('controllerStopBtn').disabled=true;
+    console.debug('controller process manager unavailable',err);
+  }finally{controllerPollBusy=false;}
+}
+async function loadControllerConfig(){
+  if(controllerConfig)return controllerConfig;
+  const r=await fetch('/api/controller/config',{cache:'no-store'});
+  if(!r.ok)throw new Error(`controller config HTTP ${r.status}`);
+  controllerConfig=await r.json();
+  return controllerConfig;
+}
+function setControllerModalError(message){
+  const el=$('controllerModalError');
+  if(!message){el.textContent='';el.classList.add('hidden');return;}
+  el.textContent=message; el.classList.remove('hidden');
+}
+function shellPreviewArg(arg){
+  const s=String(arg); return /^[A-Za-z0-9_./:=+-]+$/.test(s)?s:`'${s.replaceAll("'","'\\''")}'`;
+}
+function controllerParamValue(spec){
+  const input=$(`controller-param-${spec.name}`);
+  if(!input)return spec.default;
+  if(spec.type==='bool')return !!input.checked;
+  const x=Number(input.value);
+  return spec.type==='int'?Math.round(x):x;
+}
+function controllerModalParameters(){
+  const out={};
+  for(const spec of controllerConfig?.parameter_specs||[])out[spec.name]=controllerParamValue(spec);
+  return out;
+}
+function updateControllerCommandPreview(){
+  if(!controllerConfig)return;
+  const cmd=[controllerConfig.controller_python,controllerConfig.controller_script,...(controllerConfig.fixed_args||[])];
+  for(const spec of controllerConfig.parameter_specs||[]){
+    const value=controllerParamValue(spec);
+    if(spec.type==='bool'){if(value)cmd.push(spec.flag);}
+    else cmd.push(`${spec.flag}=${value}`);
+  }
+  $('controllerCommandPreview').textContent=cmd.map(shellPreviewArg).join(' \\\n  ');
+}
+function setControllerParam(spec,value){
+  const input=$(`controller-param-${spec.name}`); if(!input)return;
+  if(spec.type==='bool'){input.checked=!!value;return;}
+  input.value=String(value);
+  const range=$(`controller-range-${spec.name}`); if(range)range.value=String(value);
+}
+function resetControllerDefaults(){
+  if(!controllerConfig)return;
+  for(const spec of controllerConfig.parameter_specs||[])setControllerParam(spec,controllerConfig.known_good?.[spec.name]??spec.default);
+  updateControllerCommandPreview(); setControllerModalError('');
+}
+function makeControllerParamRow(spec){
+  const row=document.createElement('div');
+  row.className=`controller-param-row${spec.type==='bool'?' controller-bool-row':''}`;
+  const label=document.createElement('label'); label.textContent=spec.label; label.title=`${spec.flag}${spec.unit?` · ${spec.unit}`:''}`;
+  if(spec.type==='bool'){
+    const wrap=document.createElement('label'); wrap.className='toggle';
+    const input=document.createElement('input'); input.type='checkbox'; input.id=`controller-param-${spec.name}`; input.checked=!!spec.default;
+    const text=document.createElement('span'); text.textContent=spec.default?'Enabled':'Disabled';
+    input.addEventListener('change',()=>{text.textContent=input.checked?'Enabled':'Disabled';updateControllerCommandPreview();});
+    wrap.append(input,text); row.append(label,wrap); return row;
+  }
+  const range=document.createElement('input'); range.type='range'; range.id=`controller-range-${spec.name}`; range.min=spec.min; range.max=spec.max; range.step=spec.step; range.value=spec.default;
+  const numWrap=document.createElement('div'); numWrap.className='controller-param-number';
+  const number=document.createElement('input'); number.type='number'; number.id=`controller-param-${spec.name}`; number.min=spec.min; number.max=spec.max; number.step=spec.step; number.value=spec.default;
+  const unit=document.createElement('span'); unit.textContent=spec.unit||'';
+  const sync=(from,to)=>{to.value=from.value;updateControllerCommandPreview();};
+  range.addEventListener('input',()=>sync(range,number)); number.addEventListener('input',()=>sync(number,range));
+  numWrap.append(number,unit); row.append(label,range,numWrap); return row;
+}
+function buildControllerModal(cfg){
+  const locked=$('controllerLockedSettings'); locked.innerHTML='';
+  for(const item of cfg.locked_settings||[]){const d=document.createElement('div');const a=document.createElement('span');a.textContent=item.label;const b=document.createElement('strong');b.textContent=item.value;b.title=item.value;d.append(a,b);locked.appendChild(d);}
+  const sections=$('controllerParameterSections'); sections.innerHTML='';
+  const groups=new Map();
+  for(const spec of cfg.parameter_specs||[]){if(!groups.has(spec.section))groups.set(spec.section,[]);groups.get(spec.section).push(spec);}
+  for(const [name,specs] of groups){
+    const section=document.createElement('section');section.className='controller-param-section';
+    const head=document.createElement('header');head.textContent=name.toUpperCase();
+    const list=document.createElement('div');list.className='controller-param-list';
+    for(const spec of specs)list.appendChild(makeControllerParamRow(spec));
+    section.append(head,list);sections.appendChild(section);
+  }
+  $('controllerModalRuntime').textContent=`${cfg.controller_python} · ${cfg.controller_script}`;
+  resetControllerDefaults();
+}
+function updateControllerStartEnabled(){
+  const cfg=controllerConfig;
+  const ready=!!cfg?.enabled&&!!cfg?.controller_script_exists&&!!cfg?.controller_hash_match&&!!cfg?.controller_python_exists&&controllerStatus?.state==='STOPPED'&&$('controllerSafetyAck').checked&&!controllerActionBusy;
+  $('controllerStartBtn').disabled=!ready;
+}
+async function openControllerModal(){
+  setControllerModalError('');
+  $('controllerModal').classList.remove('hidden');
+  document.body.classList.add('modal-open');
+  $('controllerManagementKey').value=sessionStorage.getItem('g1ManagementKey')||'';
+  $('controllerSafetyAck').checked=false;
+  try{
+    const cfg=await loadControllerConfig();
+    buildControllerModal(cfg);
+    if(!cfg.enabled)setControllerModalError('Process actions are disabled. Restart the dashboard with G1_DASHBOARD_PROCESS_ACTIONS=1.');
+    else if(!cfg.controller_script_exists)setControllerModalError(`Controller script not found: ${cfg.controller_script}`);
+    else if(!cfg.controller_hash_match)setControllerModalError(`Controller V1.8 hash mismatch. Expected ${cfg.controller_expected_sha256}; got ${cfg.controller_actual_sha256||'unreadable'}. Launch is locked.`);
+    else if(!cfg.controller_python_exists)setControllerModalError(`Controller Python not executable: ${cfg.controller_python}`);
+    updateControllerStartEnabled();
+  }catch(err){setControllerModalError(String(err));$('controllerStartBtn').disabled=true;}
+}
+function closeControllerModal(){ $('controllerModal').classList.add('hidden'); document.body.classList.remove('modal-open'); }
+async function controllerPost(path,payload={}){
+  const key=$('controllerManagementKey')?.value||sessionStorage.getItem('g1ManagementKey')||'';
+  if(!key)throw new Error('Paste the management key printed by ./start_dashboard.sh.');
+  const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-G1-Management-Key':key},body:JSON.stringify(payload)});
+  let body={}; try{body=await r.json();}catch{}
+  if(!r.ok)throw new Error(body.error||`HTTP ${r.status}`);
+  sessionStorage.setItem('g1ManagementKey',key);
+  if(body.controller)renderControllerProcess(body.controller);
+  return body;
+}
+$('controllerConfigureBtn').addEventListener('click',()=>openControllerModal());
+$('controllerModalCloseBtn').addEventListener('click',closeControllerModal);
+$('controllerModalCancelBtn').addEventListener('click',closeControllerModal);
+$('controllerModal').addEventListener('click',(e)=>{if(e.target===$('controllerModal'))closeControllerModal();});
+$('controllerManagementKey').addEventListener('input',()=>sessionStorage.setItem('g1ManagementKey',$('controllerManagementKey').value));
+$('controllerSafetyAck').addEventListener('change',updateControllerStartEnabled);
+$('controllerResetDefaultsBtn').addEventListener('click',resetControllerDefaults);
+$('controllerStartBtn').addEventListener('click',async()=>{
+  if(controllerActionBusy)return; controllerActionBusy=true; setControllerModalError(''); $('controllerStartBtn').disabled=true;
+  try{
+    await controllerPost('/api/controller/start',{parameters:controllerModalParameters()});
+    closeControllerModal(); await pollControllerProcess();
+  }catch(err){setControllerModalError(err.message||String(err));}
+  finally{controllerActionBusy=false; renderControllerProcess(controllerStatus||{}); if(!$('controllerModal').classList.contains('hidden'))updateControllerStartEnabled();}
+});
+$('controllerStopBtn').addEventListener('click',async()=>{
+  if(controllerActionBusy)return;
+  const key=sessionStorage.getItem('g1ManagementKey')||'';
+  if(!key){await openControllerModal();setControllerModalError('Paste the management key first. It is required for both start and controlled stop.');return;}
+  if(!window.confirm('Request a controlled stop of the V1.8 teleop listener? If XR ownership is active, the controller will perform its normal handback before exiting.'))return;
+  controllerActionBusy=true;renderControllerProcess(controllerStatus||{});
+  try{await controllerPost('/api/controller/stop',{});await pollControllerProcess();}
+  catch(err){window.alert(`Stop request failed: ${err.message||err}`);}
+  finally{controllerActionBusy=false;renderControllerProcess(controllerStatus||{});}
+});
+document.addEventListener('keydown',(e)=>{if(e.key==='Escape'&&!$('controllerModal').classList.contains('hidden'))closeControllerModal();});
+
 /* ---------- Camera / teleimager ---------- */
 function fallbackCameraOffer(){
   const host=window.location.hostname;
@@ -490,6 +684,6 @@ async function poll(){
   finally{pollBusy=false;}
 }
 
-pollPose(); poll(); pollSystem(); setInterval(poll,250); setInterval(updatePoseHud,250); setInterval(pollSystem,250);
+pollPose(); poll(); pollSystem(); pollControllerProcess(); setInterval(poll,250); setInterval(updatePoseHud,250); setInterval(pollSystem,250); setInterval(pollControllerProcess,750);
 
 })();
