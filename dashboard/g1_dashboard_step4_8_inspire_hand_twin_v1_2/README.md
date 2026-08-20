@@ -1,10 +1,17 @@
 # Shared RealSense camera modes
 
-This revision keeps the existing WebRTC endpoint (`:60001`) but launches Teleimager through `g1_dashboard_teleimager_modes_runner.py`. The wrapper uses the already-installed system `pyrealsense2` binding from the validated Teleimager Python 3.10 environment and a dashboard-owned D435i config. It acquires aligned RGB + Z16 depth at 640x480 / 30 fps and exposes four authenticated display modes: `RGB`, `DEPTH`, `OVERLAY`, and `NEAR`.
+This revision keeps the existing WebRTC endpoint (`:60001`) but launches Teleimager through `g1_dashboard_teleimager_modes_runner.py`. The wrapper uses the already-installed system `pyrealsense2` binding from the validated Teleimager Python 3.10 environment and a dashboard-owned D435i config. It acquires aligned RGB + Z16 depth at 640x480 / 30 fps and exposes seven authenticated display modes: `RGB`, `DEPTH`, `OVERLAY`, `NEAR`, `DISPARITY`, `POINT CLOUD`, and `TOP-DOWN`. The last three are derived from the same RGB+depth pair and do not enable additional D435i streams.
 
 Mode changes are global to the shared Teleimager WebRTC output and do **not** restart the camera process, WebRTC publisher, or port. The dashboard controller's immersive TeleVuer path is configured for the same `https://192.168.0.116:60001/offer` stream, so a connected headset and dashboard browser see the same selected mode. Independent dashboard/headset modes would require separate WebRTC outputs and are not part of this revision.
 
-The upstream `/home/unitree/teleimager` source/config are not edited by this feature. The runner overrides Teleimager's config path at runtime and monkey-patches only the RealSense constructor/frame renderer in its own process. Camera mode control is an authenticated dashboard request that writes one validated token (`rgb`, `depth`, `overlay`, or `near`) to a local `0600` file; the runner acknowledges the rendered mode through a separate local status file.
+The upstream `/home/unitree/teleimager` source/config are not edited by this feature. The runner overrides Teleimager's config path at runtime and monkey-patches only the RealSense constructor/frame renderer in its own process. Camera mode control is an authenticated dashboard request that writes one validated token (`rgb`, `depth`, `overlay`, `near`, `disparity`, `pointcloud`, or `topdown`) to a local `0600` file; the runner acknowledges the rendered mode through a separate local status file.
+
+Derived modes:
+
+- `DISPARITY` visualizes inverse metric depth, which is proportional to stereo disparity for the fixed D435i baseline/focal length.
+- `POINT CLOUD` deprojects aligned depth with the RGB intrinsics, samples every 6 pixels, and renders an RGB-textured virtual view into the same H.264 frame. While POINT is selected, drag directly on the camera view to orbit, use the mouse wheel to change virtual-camera distance, or use FRONT/LEFT/RIGHT/ABOVE/RESET presets. These controls move only the virtual point-cloud renderer camera; they do not move the D435i or the robot. Because the H.264 output is shared, the selected point-cloud viewpoint is also what a connected headset sees.
+- `TOP-DOWN` is an orthographic 2-D X/Z occupancy projection, not a perspective camera view. It drops Y after a configurable camera-relative vertical filter, bins returns into 0.10 m metric cells, rejects isolated one-sample speckles, and renders filled occupancy cells. It is explicitly **not** the Unitree SLAM map and does not use robot pose.
+- Invalid depth is rendered dark gray in depth/disparity views; overlay mode leaves the underlying RGB untouched where depth is invalid.
 
 ---
 
@@ -413,3 +420,20 @@ coincident with the command-estimated solid hand. If valid feedback returns, the
 solid hand automatically becomes measured again and the cyan ghost continues to
 represent the command independently. No controller, DDS, command, or safety logic
 changes are included.
+
+## Camera QoL v1.3 — clean launcher shutdown + browser WebGL point cloud
+
+- `Ctrl+C` on `./start_dashboard.sh` is now an explicit lifecycle command: it
+  requests the validated managed controller SIGTERM/handback path, stops the
+  managed RealSense camera process group, then stops helper-managed Inspire
+  after the controller is gone. Browser closure and unexpected bridge exit are
+  still not robot-control inputs. Manually/external-started processes are never
+  killed by this cleanup.
+- POINT is rendered locally in the dashboard with Three.js/WebGL from a compact
+  latest-only G1PC XYZ+RGB snapshot (`/api/camera/pointcloud`, about 15 Hz by
+  default). Orbit/zoom stays at browser render rate and only the final viewpoint
+  is optionally synchronized to the server-rendered shared WebRTC point cloud.
+- The server-rendered point-cloud camera basis was corrected so left/right is no
+  longer mirrored.
+- TOP remains the 2-D X/Z occupancy-grid mode; it is separate from the local
+  interactive 3-D POINT scene.

@@ -27,10 +27,37 @@ BRIDGE_PY="${G1_DASHBOARD_BRIDGE_PYTHON:-$(command -v python3)}"
 MONITOR_PID=""
 BRIDGE_PID=""
 SERVICE_PID=""
+REQUEST_STACK_SHUTDOWN=0
+CLEANUP_STARTED=0
+
+on_signal() {
+  REQUEST_STACK_SHUTDOWN=1
+  exit 130
+}
 
 cleanup() {
   local code=$?
+  if [[ "$CLEANUP_STARTED" == "1" ]]; then
+    exit "$code"
+  fi
+  CLEANUP_STARTED=1
   trap - EXIT INT TERM
+
+  # Only an explicit Ctrl+C / TERM of this launcher is a lifecycle command.
+  # Browser closure or an unexpected bridge exit still does NOT become a robot
+  # control input. External/manual controller/camera/Inspire processes are never
+  # killed; only dashboard-owned state is stopped.
+  if [[ "$REQUEST_STACK_SHUTDOWN" == "1" ]] && [[ "$PROCESS_ACTIONS" == "1" || "$PROCESS_ACTIONS" == "true" || "$PROCESS_ACTIONS" == "yes" ]]; then
+    echo
+    echo "Stopping dashboard-managed listener, camera and Inspire dependency..."
+    "$BRIDGE_PY" - <<'PY' || true
+from g1_dashboard_process_manager import ControllerProcessManager
+manager = ControllerProcessManager(enabled=True)
+summary = manager.shutdown_dashboard_managed(timeout_s=15.0)
+print("Managed shutdown:", summary)
+PY
+  fi
+
   if [[ -n "${BRIDGE_PID:-}" ]] && kill -0 "$BRIDGE_PID" 2>/dev/null; then
     kill "$BRIDGE_PID" 2>/dev/null || true
     wait "$BRIDGE_PID" 2>/dev/null || true
@@ -46,11 +73,10 @@ cleanup() {
   if [[ -n "${G1_DASHBOARD_SERVICE_SOCKET:-}" ]]; then
     rm -f "$G1_DASHBOARD_SERVICE_SOCKET" 2>/dev/null || true
   fi
-  # Deliberately do NOT stop a controller launched by the dashboard here.
-  # Browser/bridge/dashboard disconnects must not become a robot-control input.
   exit "$code"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap on_signal INT TERM
 
 BRIDGE_ARGS=()
 if [[ "$PROCESS_ACTIONS" == "1" || "$PROCESS_ACTIONS" == "true" || "$PROCESS_ACTIONS" == "yes" ]]; then
@@ -152,9 +178,9 @@ if [[ "$SERVICE_ENABLED" == "1" ]]; then
 fi
 
 echo "System monitor pid: $MONITOR_PID"
-echo "Starting dashboard bridge. Ctrl+C stops dashboard processes only."
-echo "Managed controller/camera processes are intentionally left running if the dashboard itself exits."
-echo "A helper-managed Inspire service follows the controller lifecycle, not the browser lifecycle."
+echo "Starting dashboard bridge. Ctrl+C performs a controlled stop of dashboard-managed listener/camera/Inspire, then exits."
+echo "Closing the browser does not stop robot-side processes; external/manual processes are never killed by the dashboard."
+echo "A helper-managed Inspire service is stopped only after the managed controller exits."
 echo "The Unitree ServiceSwitch worker exists only while the dashboard stack is running and accepts explicit allowlisted requests only."
 echo
 

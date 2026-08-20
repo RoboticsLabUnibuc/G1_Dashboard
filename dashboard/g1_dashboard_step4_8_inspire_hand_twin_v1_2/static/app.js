@@ -1,4 +1,5 @@
 import { G1Twin } from './g1_model.js';
+import { PointCloud3D } from './pointcloud_view.js';
 
 (()=>{
 'use strict';
@@ -29,6 +30,11 @@ let cameraProcessStatus=null;
 let cameraProcessPollBusy=false;
 let cameraProcessActionBusy=false;
 let cameraModeActionBusy=false;
+let pointViewSendBusy=false;
+let pointViewLocal=null;
+let pointViewInitialized=false;
+let pointCloudFetchBusy=false;
+let pointCloudPollTimer=null;
 let selectedJointIndex=18;
 
 function switchView(name){
@@ -437,7 +443,7 @@ async function cameraProcessPost(path,payload={}){
   return body.camera||cameraProcessStatus;
 }
 function cameraModeLabel(mode){
-  return ({rgb:'RGB',depth:'DEPTH',overlay:'OVERLAY',near:'NEAR'})[mode]||String(mode||'—').toUpperCase();
+  return ({rgb:'RGB',depth:'DEPTH',overlay:'OVERLAY',near:'NEAR',disparity:'DISPARITY',pointcloud:'POINT CLOUD',topdown:'TOP-DOWN'})[mode]||String(mode||'—').toUpperCase();
 }
 function renderCameraModes(){
   const st=cameraProcessStatus||{};
@@ -456,10 +462,101 @@ function renderCameraModes(){
     badge.textContent=waiting?`MODE ${cameraModeLabel(requested)}…`:`MODE ${cameraModeLabel(actual||requested)}`;
     badge.className=`camera-mode-state${waiting?' warn':actual?' good':''}`;
   }
+  renderPointViewControls();
 }
+
+const POINT_VIEW_DEFAULT={yaw_deg:22,pitch_deg:14,distance_m:3.16,target_z_m:2.0};
+function pointClamp(x,lo,hi){return Math.max(lo,Math.min(hi,Number(x)));}
+function normalizePointView(raw={}){
+  return {
+    yaw_deg:pointClamp(finite(raw.yaw_deg)?raw.yaw_deg:POINT_VIEW_DEFAULT.yaw_deg,-180,180),
+    pitch_deg:pointClamp(finite(raw.pitch_deg)?raw.pitch_deg:POINT_VIEW_DEFAULT.pitch_deg,-82,82),
+    distance_m:pointClamp(finite(raw.distance_m)?raw.distance_m:POINT_VIEW_DEFAULT.distance_m,1,8),
+    target_z_m:pointClamp(finite(raw.target_z_m)?raw.target_z_m:POINT_VIEW_DEFAULT.target_z_m,.5,5),
+  };
+}
+function pointCloudActive(){return (cameraProcessStatus?.mode_requested||'rgb')==='pointcloud'&&cameraProcessStatus?.state==='RUNNING';}
+function currentPointView(){return normalizePointView(PointCloud3D.getView?.()||pointViewLocal||POINT_VIEW_DEFAULT);}
+
+async function syncPointViewToCamera(view){
+  // Local WebGL orbit never requires authentication. If management access is
+  // unlocked, sync only the final viewpoint to the server-rendered WebRTC
+  // point cloud so the headset roughly follows without making drag latency
+  // depend on HTTP/H.264 round trips.
+  if(pointViewSendBusy||!currentManagementKey()||cameraProcessStatus?.state!=='RUNNING'||!cameraProcessStatus?.point_view_control)return;
+  pointViewSendBusy=true;
+  try{
+    const st=await cameraProcessPost('/api/camera/view',{view:normalizePointView(view)});
+    if(st)cameraProcessStatus=st;
+  }catch(err){console.warn('headset point-view sync failed',err);}
+  finally{pointViewSendBusy=false;renderPointViewControls();}
+}
+
+const pointCloudViewer=PointCloud3D.init($('pointCloudCanvas'),(view,final)=>{
+  pointViewLocal=normalizePointView(view);
+  renderPointViewControls();
+  if(final)syncPointViewToCamera(pointViewLocal);
+});
+PointCloud3D.setView(POINT_VIEW_DEFAULT,false);
+
+function updatePointCloudReadout(){
+  const readout=$('pointViewReadout');if(!readout)return;
+  const v=currentPointView(),st=PointCloud3D.getStats();
+  const points=st.points?`${(st.points/1000).toFixed(st.points>=10000?0:1)}k pts`:'waiting';
+  const hz=st.dataHz>0?`${st.dataHz.toFixed(0)} Hz`:'— Hz';
+  readout.textContent=`Y ${v.yaw_deg>=0?'+':''}${v.yaw_deg.toFixed(0)}° · P ${v.pitch_deg>=0?'+':''}${v.pitch_deg.toFixed(0)}° · ${v.distance_m.toFixed(1)}m · ${points} · ${hz}`;
+}
+function renderPointViewControls(){
+  const strip=$('pointViewStrip');if(!strip)return;
+  const show=(cameraProcessStatus?.mode_requested||'rgb')==='pointcloud'&&cameraProcessStatus?.state==='RUNNING';
+  strip.classList.toggle('hidden',!show);
+  strip.querySelectorAll('[data-point-view-preset]').forEach(b=>b.disabled=!show);
+  const stage=$('cameraStage');
+  if(stage)stage.classList.toggle('pointcloud-webgl-active',show);
+  PointCloud3D.setVisible(show);
+  if(show&&!pointViewInitialized){
+    const initial=normalizePointView(cameraProcessStatus?.point_view_actual||cameraProcessStatus?.point_view_requested||POINT_VIEW_DEFAULT);
+    PointCloud3D.setView(initial,false);pointViewInitialized=true;
+  }
+  updatePointCloudReadout();
+  if(show)ensurePointCloudPoll();
+}
+async function pollPointCloud(){
+  pointCloudPollTimer=null;
+  if(!pointCloudActive())return;
+  if(pointCloudFetchBusy){ensurePointCloudPoll();return;}
+  pointCloudFetchBusy=true;
+  try{
+    const r=await fetch('/api/camera/pointcloud',{cache:'no-store'});
+    if(r.ok&&r.status!==204){
+      const b=await r.arrayBuffer();
+      PointCloud3D.setSnapshot(b);
+      updatePointCloudReadout();
+    }
+  }catch(err){console.debug('point-cloud snapshot unavailable',err);}
+  finally{pointCloudFetchBusy=false;if(pointCloudActive())pointCloudPollTimer=setTimeout(pollPointCloud,65);}
+}
+function ensurePointCloudPoll(){
+  if(!pointCloudActive()||pointCloudPollTimer||pointCloudFetchBusy)return;
+  pointCloudPollTimer=setTimeout(pollPointCloud,0);
+}
+const POINT_VIEW_PRESETS={
+  front:{yaw_deg:0,pitch_deg:0,distance_m:3.0,target_z_m:2.0},
+  left:{yaw_deg:-70,pitch_deg:12,distance_m:3.35,target_z_m:2.0},
+  right:{yaw_deg:70,pitch_deg:12,distance_m:3.35,target_z_m:2.0},
+  above:{yaw_deg:0,pitch_deg:78,distance_m:3.8,target_z_m:2.0},
+  reset:POINT_VIEW_DEFAULT,
+};
+function applyPointViewPreset(name){
+  const preset=POINT_VIEW_PRESETS[name];if(!preset)return;
+  pointViewLocal=normalizePointView(preset);
+  PointCloud3D.setView(pointViewLocal,true);
+  updatePointCloudReadout();
+}
+
 async function setCameraMode(mode){
   mode=String(mode||'').toLowerCase();
-  if(!['rgb','depth','overlay','near'].includes(mode)||cameraModeActionBusy)return;
+  if(!['rgb','depth','overlay','near','disparity','pointcloud','topdown'].includes(mode)||cameraModeActionBusy)return;
   if(!currentManagementKey()){
     showManagementKeyPrompt('Enter the management key to switch the shared camera view.',()=>setCameraMode(mode));
     return;
@@ -482,6 +579,7 @@ async function setCameraMode(mode){
   }
 }
 document.querySelectorAll('[data-camera-mode]').forEach(btn=>btn.addEventListener('click',()=>setCameraMode(btn.dataset.cameraMode)));
+document.querySelectorAll('[data-point-view-preset]').forEach(btn=>btn.addEventListener('click',()=>applyPointViewPreset(btn.dataset.pointViewPreset)));
 
 function updateCameraButtons(t){
   const base=cameraBaseFromTelemetry(t);

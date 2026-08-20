@@ -29,7 +29,7 @@ CONTROLLER_BASENAME = (
     "dashboard_telemetry_v1_8.py"
 )
 MANAGER_SCHEMA = "g1_dashboard.controller_process.v1"
-MANAGER_VERSION = "g1_dashboard_process_manager.v1.3.0-realsense-camera-modes"
+MANAGER_VERSION = "g1_dashboard_process_manager.v1.4.0-clean-shutdown-webgl-pointcloud"
 CONTROLLER_SHA256 = "1e5d92c3c460c4f652e22e8de00ae2305d444f3e4a2485dfa8cebbb68c2b8484"
 
 ACTION_REQUEST_SCHEMA = "g1_dashboard.action_request.v1"
@@ -42,7 +42,14 @@ INSPIRE_SERVICE_BASENAME = "inspire_g1"
 CAMERA_BASENAME = "teleimager-server"
 CAMERA_RUNNER_BASENAME = "g1_dashboard_teleimager_modes_runner.py"
 CAMERA_WEBRTC_PORT = 60001
-CAMERA_DISPLAY_MODES = {"rgb", "depth", "overlay", "near"}
+CAMERA_DISPLAY_MODES = {"rgb", "depth", "overlay", "near", "disparity", "pointcloud", "topdown"}
+POINT_VIEW_DEFAULT = {"yaw_deg": 22.0, "pitch_deg": 14.0, "distance_m": 3.16, "target_z_m": 2.0}
+POINT_VIEW_LIMITS = {
+    "yaw_deg": (-180.0, 180.0),
+    "pitch_deg": (-82.0, 82.0),
+    "distance_m": (1.0, 8.0),
+    "target_z_m": (0.5, 5.0),
+}
 
 # These defaults exactly match the last validated V1.8 launch command.
 # Min/max values are dashboard edit bounds only. They are not robot safety
@@ -452,6 +459,14 @@ class ControllerProcessManager:
             "G1_DASHBOARD_CAMERA_MODE_STATUS",
             f"/tmp/g1_dashboard_camera_mode_status_{os.getuid()}.json",
         )).expanduser()
+        self.camera_point_view_path = Path(os.environ.get(
+            "G1_DASHBOARD_CAMERA_POINT_VIEW",
+            f"/tmp/g1_dashboard_camera_point_view_{os.getuid()}.json",
+        )).expanduser()
+        self.camera_pointcloud_path = Path(os.environ.get(
+            "G1_DASHBOARD_CAMERA_POINTCLOUD_FILE",
+            f"/tmp/g1_dashboard_camera_pointcloud_{os.getuid()}.bin",
+        )).expanduser()
         self.camera_state_path = Path(os.environ.get(
             "G1_DASHBOARD_CAMERA_STATE",
             "/tmp/g1_dashboard_camera_teleimager_state.json",
@@ -724,7 +739,8 @@ class ControllerProcessManager:
     def _read_camera_mode_status(self) -> dict[str, Any] | None:
         try:
             data = json.loads(self.camera_mode_status_path.read_text(encoding="utf-8"))
-            if data.get("schema") != "g1_dashboard.camera_display_status.v1":
+            schema = str(data.get("schema") or "")
+            if not schema.startswith("g1_dashboard.camera_display_status.v1"):
                 return None
             updated = float(data.get("updated_unix_time_s", 0.0))
             data["online"] = bool(updated > 0 and time.time() - updated <= 2.0)
@@ -742,6 +758,51 @@ class ControllerProcessManager:
         os.chmod(tmp, 0o600)
         tmp.replace(self.camera_mode_path)
         return normalized
+
+    def _sanitize_camera_point_view(self, raw: Any) -> dict[str, float]:
+        current = dict(POINT_VIEW_DEFAULT)
+        if isinstance(raw, dict):
+            for key in current:
+                if key in raw:
+                    current[key] = _finite(raw[key])
+        for key, (lo, hi) in POINT_VIEW_LIMITS.items():
+            if current[key] < lo or current[key] > hi:
+                raise ValueError(f"{key} must be in [{lo}, {hi}]")
+        return current
+
+    def _read_camera_point_view_requested(self) -> dict[str, float]:
+        try:
+            raw = json.loads(self.camera_point_view_path.read_text(encoding="utf-8"))
+            return self._sanitize_camera_point_view(raw)
+        except Exception:
+            return dict(POINT_VIEW_DEFAULT)
+
+    def _write_camera_point_view(self, view: dict[str, Any]) -> dict[str, float]:
+        current = self._read_camera_point_view_requested()
+        merged = dict(current)
+        for key in POINT_VIEW_DEFAULT:
+            if key in view:
+                merged[key] = view[key]
+        normalized = self._sanitize_camera_point_view(merged)
+        self.camera_point_view_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.camera_point_view_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(normalized, separators=(",", ":")) + "\n", encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        tmp.replace(self.camera_point_view_path)
+        return normalized
+
+    def set_camera_point_view(self, view: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            if not self.enabled:
+                raise PermissionError("dashboard process actions are disabled")
+            status = self.camera_status()
+            if status.get("state") != "RUNNING" or not status.get("mode_control"):
+                raise PermissionError("point-cloud view control requires the dashboard-managed RealSense mode runner")
+            self._write_camera_point_view(view)
+            # No camera/WebRTC restart and no blocking acknowledgement wait:
+            # orbit gestures may update several times per second. The normal
+            # camera-status poll exposes the runner's latest acknowledged view.
+            return self.camera_status()
 
     def set_camera_mode(self, mode: str) -> dict[str, Any]:
         with self._lock:
@@ -780,6 +841,8 @@ class ControllerProcessManager:
             mode_status = self._read_camera_mode_status()
             mode_actual = mode_status.get("mode") if mode_status and mode_status.get("online") else None
             mode_ack_online = bool(mode_status and mode_status.get("online"))
+            point_view_requested = self._read_camera_point_view_requested()
+            point_view_actual = mode_status.get("point_view") if mode_status and mode_status.get("online") else None
 
             if managed_alive and self._camera_managed is not None:
                 # teleimager uses multiprocessing and normally creates one or
@@ -819,6 +882,11 @@ class ControllerProcessManager:
                     "mode_actual": mode_actual,
                     "mode_ack_online": mode_ack_online,
                     "mode_control": state == "RUNNING" and not external_groups and managed_mode_runner,
+                    "point_view_control": state == "RUNNING" and not external_groups and managed_mode_runner,
+                    "point_view_requested": point_view_requested,
+                    "point_view_actual": point_view_actual,
+                    "pointcloud_browser_webgl": bool(state == "RUNNING" and managed_mode_runner),
+                    "pointcloud_endpoint": "/api/camera/pointcloud",
                     "mode_status": mode_status,
                     "last_error": self._camera_last_error,
                     "last_exit_code": self._camera_last_exit_code,
@@ -852,6 +920,11 @@ class ControllerProcessManager:
                     "mode_actual": mode_actual,
                     "mode_ack_online": mode_ack_online,
                     "mode_control": False,
+                    "point_view_control": False,
+                    "point_view_requested": point_view_requested,
+                    "point_view_actual": point_view_actual,
+                    "pointcloud_browser_webgl": False,
+                    "pointcloud_endpoint": "/api/camera/pointcloud",
                     "mode_status": mode_status,
                     "last_error": self._camera_last_error,
                     "last_exit_code": self._camera_last_exit_code,
@@ -882,6 +955,11 @@ class ControllerProcessManager:
                 "mode_actual": mode_actual,
                 "mode_ack_online": mode_ack_online,
                 "mode_control": False,
+                "point_view_control": False,
+                "point_view_requested": point_view_requested,
+                "point_view_actual": point_view_actual,
+                "pointcloud_browser_webgl": False,
+                "pointcloud_endpoint": "/api/camera/pointcloud",
                 "mode_status": mode_status,
                 "last_error": self._camera_last_error,
                 "last_exit_code": self._camera_last_exit_code,
@@ -914,11 +992,15 @@ class ControllerProcessManager:
             env["G1_DASHBOARD_CAMERA_CONFIG"] = str(self.camera_config)
             env["TELEIMAGER_DISPLAY_MODE_FILE"] = str(self.camera_mode_path)
             env["TELEIMAGER_DISPLAY_STATUS_FILE"] = str(self.camera_mode_status_path)
+            env["TELEIMAGER_POINT_VIEW_FILE"] = str(self.camera_point_view_path)
+            env["TELEIMAGER_POINTCLOUD_SNAPSHOT_FILE"] = str(self.camera_pointcloud_path)
             # Every camera-server launch returns to the normal RGB operator
             # view. Mode changes are live-session choices, not boot defaults.
             self._write_camera_mode("rgb")
+            self._write_camera_point_view(dict(POINT_VIEW_DEFAULT))
             try:
                 self.camera_mode_status_path.unlink(missing_ok=True)
+                self.camera_pointcloud_path.unlink(missing_ok=True)
             except Exception:
                 pass
             try:
@@ -1007,6 +1089,128 @@ class ControllerProcessManager:
             self._camera_managed["stop_requested_unix_time_s"] = time.time()
             self._save_camera_state()
             return self.camera_status()
+
+    def camera_pointcloud_snapshot(self, *, max_age_s: float = 1.5, max_bytes: int = 2_000_000) -> bytes | None:
+        """Return the latest browser-rendered point-cloud packet, if fresh.
+
+        The packet is visualization-only data written atomically by the managed
+        RealSense runner. It is never accepted from the browser and has no DDS
+        or robot-control path.
+        """
+        path = self.camera_pointcloud_path
+        try:
+            st = path.stat()
+            if time.time() - st.st_mtime > max_age_s:
+                return None
+            if st.st_size <= 32 or st.st_size > max_bytes:
+                return None
+            data = path.read_bytes()
+            if len(data) != st.st_size or data[:4] != b"G1PC":
+                return None
+            return data
+        except (FileNotFoundError, OSError):
+            return None
+
+    def shutdown_dashboard_managed(self, *, timeout_s: float = 15.0) -> dict[str, Any]:
+        """Synchronously stop dashboard-owned controller, camera and Inspire.
+
+        External/manual processes are intentionally never killed. The controller
+        receives the same SIGTERM used by the authenticated Stop Listener action
+        so its normal handback/shutdown path remains authoritative. Camera gets
+        SIGINT for its full managed process group. Inspire is stopped only when
+        the root-owned helper reports RUNNING_MANAGED, and only after the
+        controller is gone.
+        """
+        deadline = time.monotonic() + max(2.0, float(timeout_s))
+        result: dict[str, Any] = {"controller": "not-running", "camera": "not-running", "inspire": "not-running"}
+
+        with self._lock:
+            self._refresh()
+            alive, pid = self._managed_alive()
+            controller_ticks = None
+            if alive and pid is not None and self._managed is not None:
+                controller_ticks = self._managed.get("start_ticks")
+                controller_ticks = int(controller_ticks) if controller_ticks is not None else None
+                if not self._managed.get("stop_requested_unix_time_s"):
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                        self._managed["stop_requested_unix_time_s"] = time.time()
+                        self._save_state()
+                    except ProcessLookupError:
+                        pass
+                result["controller"] = f"stopping:{pid}"
+
+            self._refresh_camera()
+            cam_alive, cam_pid = self._camera_managed_alive()
+            cam_pgid = _proc_pgid(cam_pid) if cam_alive and cam_pid is not None else None
+            if cam_alive and cam_pid is not None and self._camera_managed is not None:
+                if not self._camera_managed.get("stop_requested_unix_time_s"):
+                    try:
+                        os.killpg(cam_pgid if cam_pgid is not None else cam_pid, signal.SIGINT)
+                    except ProcessLookupError:
+                        pass
+                    self._camera_managed["stop_requested_unix_time_s"] = time.time()
+                    self._save_camera_state()
+                result["camera"] = f"stopping:{cam_pid}"
+
+        # Wait without holding the manager lock so child cleanup can progress.
+        if result["controller"].startswith("stopping:"):
+            while time.monotonic() < deadline and _process_alive(pid, controller_ticks):
+                time.sleep(0.10)
+            if _process_alive(pid, controller_ticks):
+                result["controller"] = f"timeout:{pid}"
+            else:
+                result["controller"] = "stopped"
+                with self._lock:
+                    self._managed = None
+                    self._popen = None
+                    self._save_state()
+
+        if result["camera"].startswith("stopping:"):
+            while time.monotonic() < deadline and _process_alive(cam_pid):
+                time.sleep(0.08)
+            if _process_alive(cam_pid):
+                # Match normal camera lifecycle fallback: SIGTERM the managed
+                # process group, but never SIGKILL.
+                try:
+                    os.killpg(cam_pgid if cam_pgid is not None else cam_pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                end2 = time.monotonic() + 2.0
+                while time.monotonic() < end2 and _process_alive(cam_pid):
+                    time.sleep(0.08)
+            if _process_alive(cam_pid):
+                result["camera"] = f"timeout:{cam_pid}"
+            else:
+                result["camera"] = "stopped"
+                with self._lock:
+                    self._camera_managed = None
+                    self._camera_popen = None
+                    self._save_camera_state()
+                    try:
+                        self.camera_pointcloud_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
+        # Inspire is stopped after the controller is confirmed gone. A helper-
+        # managed orphan is also cleaned up on dashboard exit; external/manual
+        # Inspire instances remain untouched.
+        with self._lock:
+            c_alive, _ = self._managed_alive()
+            inspire = self._inspire_status()
+            if not c_alive and inspire.get("state") == "RUNNING_MANAGED":
+                try:
+                    stopped = self._stop_inspire_managed_dependency()
+                    result["inspire"] = str(stopped.get("state") or "stopped")
+                except Exception as exc:
+                    result["inspire"] = f"error:{exc}"
+            elif inspire.get("state") == "RUNNING_EXTERNAL":
+                result["inspire"] = "external-untouched"
+            elif c_alive:
+                result["inspire"] = "left-running-controller-timeout"
+            else:
+                result["inspire"] = str(inspire.get("state") or "not-running")
+        return result
 
     # ---------- controller configuration ----------
     def _validate_parameters(self, supplied: Any) -> dict[str, Any]:

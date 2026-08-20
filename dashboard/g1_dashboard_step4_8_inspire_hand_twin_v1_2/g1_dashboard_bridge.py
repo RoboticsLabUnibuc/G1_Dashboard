@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""G1 dashboard bridge v1.6.0 — RealSense camera display modes + verified service actions.
+"""G1 dashboard bridge v1.6.2 — point-cloud orbit + 2-D top occupancy + verified service actions.
 
 Safety boundary:
 - Receives controller telemetry only from localhost UDP (127.0.0.1:8765).
@@ -37,7 +37,7 @@ from g1_dashboard_service_client import ServiceActionClient
 from g1_dashboard_service_policy import classify_service, load_policy, public_policy
 
 SCHEMA = "g1_dashboard.telemetry.v1"
-BRIDGE_VERSION = "g1_dashboard_bridge.v1.6.0-realsense-camera-modes"
+BRIDGE_VERSION = "g1_dashboard_bridge.v1.7.0-clean-shutdown-webgl-pointcloud"
 SYSTEM_SCHEMA = "g1_dashboard.system.v1"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -390,7 +390,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt: str, *args: object) -> None:
         # /api/pose is intentionally high-rate; do not flood the terminal at 30 Hz.
-        if self.path.startswith("/api/pose"):
+        if self.path.startswith("/api/pose") or self.path.startswith("/api/camera/pointcloud"):
             return
         print(f"HTTP {self.client_address[0]} - {fmt % args}")
 
@@ -507,6 +507,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             manager: ControllerProcessManager = self.server.process_manager  # type: ignore[attr-defined]
             self._send_json(HTTPStatus.OK, manager.camera_status())
             return
+        if path == "/api/camera/pointcloud":
+            manager: ControllerProcessManager = self.server.process_manager  # type: ignore[attr-defined]
+            packet = manager.camera_pointcloud_snapshot()
+            if packet is None:
+                self._send_bytes(HTTPStatus.NO_CONTENT, b"", "application/octet-stream", cache=False)
+            else:
+                self._send_bytes(HTTPStatus.OK, packet, "application/vnd.g1.pointcloud", cache=False)
+            return
         if path == "/api/camera/log":
             manager: ControllerProcessManager = self.server.process_manager  # type: ignore[attr-defined]
             query = parse_qs(parsed.query)
@@ -543,8 +551,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "inspire_dependency_lifecycle": "root-owned fixed helper; controller first on stop",
                     "camera_process_actions": bool(self.server.process_actions_enabled),
                     "camera_process_actions_authenticated": True,
-                    "camera_display_modes": ["rgb", "depth", "overlay", "near"],
+                    "camera_display_modes": ["rgb", "depth", "overlay", "near", "disparity", "pointcloud", "topdown"],
                     "camera_mode_switch_preserves_webrtc": True,
+                    "camera_point_view_orbit_control": True,
+                    "camera_pointcloud_browser_webgl": True,
+                    "camera_pointcloud_transport": "latest-only binary G1PC over same-origin HTTP",
+                    "camera_topdown_projection": "orthographic X/Z occupancy grid",
                     "unitree_service_actions": bool(self.server.service_actions_enabled),  # type: ignore[attr-defined]
                     "unitree_service_actions_authenticated": True,
                     "unitree_service_actions_allowlisted": True,
@@ -576,10 +588,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "/api/camera/start",
             "/api/camera/stop",
             "/api/camera/mode",
+            "/api/camera/view",
             "/api/services/set",
         ):
             self._send_json(HTTPStatus.METHOD_NOT_ALLOWED, {
-                "error": "unsupported POST; authenticated endpoints are controller auth/start/stop/action, camera start/stop/mode, and allowlisted service set"
+                "error": "unsupported POST; authenticated endpoints are controller auth/start/stop/action, camera start/stop/mode/view, and allowlisted service set"
             })
             return
         if not self._require_process_action_auth():
@@ -641,6 +654,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     HTTPStatus.OK if acknowledged else HTTPStatus.ACCEPTED,
                     {"ok": True, "acknowledged": acknowledged, "camera": status},
                 )
+            elif path == "/api/camera/view":
+                view = payload.get("view")
+                if not isinstance(view, dict):
+                    raise ValueError("view must be an object")
+                status = manager.set_camera_point_view(view)
+                self._send_json(HTTPStatus.OK, {"ok": True, "camera": status})
         except PermissionError as exc:
             self._send_json(HTTPStatus.FORBIDDEN, {"error": str(exc), "controller": manager.status(), "camera": manager.camera_status()})
         except FileNotFoundError as exc:
@@ -724,11 +743,22 @@ def main() -> int:
         print(f"Controller Py   : {process_manager.python_path}")
         print("Auth            : X-G1-Management-Key required")
     print("Bridge imports no DDS. XR requests are controller-validated; Unitree ServiceSwitch is isolated in the allowlisted service worker and post-verified with ServiceList.")
+    interrupted = False
     try:
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:
+        interrupted = True
         print("\nStopping dashboard bridge...")
     finally:
+        # A direct Ctrl+C of the bridge is an explicit lifecycle command. An
+        # unexpected bridge exception remains non-authoritative and does not
+        # automatically change robot-side process state.
+        if interrupted and args.enable_process_actions:
+            try:
+                summary = process_manager.shutdown_dashboard_managed(timeout_s=15.0)
+                print(f"Managed dependency shutdown: {summary}")
+            except Exception as exc:
+                print(f"WARNING: managed dependency shutdown failed: {exc}")
         # serve_forever() has already returned here; calling shutdown() from the
         # same thread can deadlock. Close the socket directly.
         server.server_close()

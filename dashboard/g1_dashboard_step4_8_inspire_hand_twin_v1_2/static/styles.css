@@ -478,3 +478,22 @@ button,a{font:inherit}.topbar{height:var(--top);display:grid;grid-template-colum
 .camera-mode-state.good{color:var(--good)}
 .camera-mode-state.warn{color:var(--warn)}
 @media(max-width:1280px){.camera-mode-btn{padding:4px 5px}.camera-mode-state{display:none}}
+
+/* Camera modes v1.2 — point-cloud orbit controls + explicit 2-D TOP map */
+.point-view-strip{height:30px;flex:0 0 30px;display:flex;align-items:center;gap:4px;padding:3px 9px;border-bottom:1px solid var(--line);background:#0a1118}
+.point-view-strip.hidden{display:none}
+.point-view-label{font-size:7px;font-weight:850;letter-spacing:.08em;color:#6f8397;margin-right:2px;white-space:nowrap}
+.point-view-btn{border:1px solid #273848;background:#101923;color:#91a3b5;border-radius:5px;padding:3px 6px;font-size:7px;font-weight:850;letter-spacing:.04em;cursor:pointer}
+.point-view-btn:hover:not(:disabled){border-color:#4c6d8b;color:#e4eff9}.point-view-btn:disabled{opacity:.42;cursor:not-allowed}
+.point-view-readout{margin-left:4px;font-size:7px;font-weight:800;color:#9eb1c3;white-space:nowrap;font-variant-numeric:tabular-nums}
+.point-view-hint{margin-left:auto;font-size:7px;color:#60758a;white-space:nowrap}
+.camera-stage.point-orbit-enabled{cursor:grab}.camera-stage.point-orbit-enabled.dragging{cursor:grabbing}
+@media(max-width:1450px){.point-view-hint{display:none}.point-view-readout{margin-left:auto}}
+@media(max-width:1180px){.point-view-label{display:none}.point-view-btn{padding:3px 4px}.point-view-readout{font-size:6.5px}}
+
+/* Camera QoL v1.3 — local WebGL point cloud. The WebRTC video remains alive
+   underneath so the shared headset stream is unaffected. */
+.pointcloud-canvas{position:absolute;inset:0;width:100%;height:100%;z-index:2;display:block;background:#071018;touch-action:none;cursor:grab}
+.pointcloud-canvas.dragging{cursor:grabbing}
+.camera-stage.pointcloud-webgl-active video{visibility:hidden}
+.camera-stage.pointcloud-webgl-active .camera-hud{z-index:4}
