@@ -1,3 +1,13 @@
+# Shared RealSense camera modes
+
+This revision keeps the existing WebRTC endpoint (`:60001`) but launches Teleimager through `g1_dashboard_teleimager_modes_runner.py`. The wrapper uses the already-installed system `pyrealsense2` binding from the validated Teleimager Python 3.10 environment and a dashboard-owned D435i config. It acquires aligned RGB + Z16 depth at 640x480 / 30 fps and exposes four authenticated display modes: `RGB`, `DEPTH`, `OVERLAY`, and `NEAR`.
+
+Mode changes are global to the shared Teleimager WebRTC output and do **not** restart the camera process, WebRTC publisher, or port. The dashboard controller's immersive TeleVuer path is configured for the same `https://192.168.0.116:60001/offer` stream, so a connected headset and dashboard browser see the same selected mode. Independent dashboard/headset modes would require separate WebRTC outputs and are not part of this revision.
+
+The upstream `/home/unitree/teleimager` source/config are not edited by this feature. The runner overrides Teleimager's config path at runtime and monkey-patches only the RealSense constructor/frame renderer in its own process. Camera mode control is an authenticated dashboard request that writes one validated token (`rgb`, `depth`, `overlay`, or `near`) to a local `0600` file; the runner acknowledges the rendered mode through a separate local status file.
+
+---
+
 # G1 Dashboard Step 5.2 — verified allowlisted Unitree service controls
 
 Step 5.2 keeps the tested listener/Inspire/camera/XR lifecycle and adds an isolated RobotState service action worker. The browser still never imports or publishes DDS. Authenticated service requests flow through the stdlib bridge to a localhost Unix-domain socket owned by the dashboard user; only the g1_xr worker imports `unitree_sdk2py` and may call `RobotStateClient.ServiceSwitch()`.

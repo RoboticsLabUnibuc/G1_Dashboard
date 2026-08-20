@@ -466,3 +466,15 @@ button,a{font:inherit}.topbar{height:var(--top);display:grid;grid-template-colum
 .camera-process-state.warn{color:#e9c35e;border-color:#54451f;background:#1a1710}
 .camera-process-state.bad{color:#ff7b88;border-color:#5f2630;background:#1d1013}
 @media(max-width:1280px){.camera-process-state{display:none}}
+
+/* RealSense camera display modes — shared Teleimager WebRTC output */
+.camera-mode-strip{height:34px;flex:0 0 34px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:4px 9px;border-bottom:1px solid var(--line);background:#0d141c}
+.camera-mode-buttons{display:flex;align-items:center;gap:4px;min-width:0}
+.camera-mode-btn{border:1px solid #283848;background:#101923;color:#8496a9;border-radius:6px;padding:4px 7px;font-size:8px;font-weight:850;letter-spacing:.055em;cursor:pointer;white-space:nowrap}
+.camera-mode-btn:hover:not(:disabled){border-color:#49647e;color:#e1edf8}
+.camera-mode-btn.active{background:#17385e;border-color:#315f8f;color:#e8f4ff;box-shadow:0 0 0 1px rgba(88,147,205,.12) inset}
+.camera-mode-btn:disabled{opacity:.42;cursor:not-allowed}
+.camera-mode-state{font-size:7px;font-weight:850;letter-spacing:.06em;color:#7e91a5;white-space:nowrap}
+.camera-mode-state.good{color:var(--good)}
+.camera-mode-state.warn{color:var(--warn)}
+@media(max-width:1280px){.camera-mode-btn{padding:4px 5px}.camera-mode-state{display:none}}

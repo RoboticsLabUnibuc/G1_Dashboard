@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""G1 dashboard bridge v1.5.3 — Step 5.2 verified service actions.
+"""G1 dashboard bridge v1.6.0 — RealSense camera display modes + verified service actions.
 
 Safety boundary:
 - Receives controller telemetry only from localhost UDP (127.0.0.1:8765).
@@ -37,7 +37,7 @@ from g1_dashboard_service_client import ServiceActionClient
 from g1_dashboard_service_policy import classify_service, load_policy, public_policy
 
 SCHEMA = "g1_dashboard.telemetry.v1"
-BRIDGE_VERSION = "g1_dashboard_bridge.v1.5.3-verified-service-actions"
+BRIDGE_VERSION = "g1_dashboard_bridge.v1.6.0-realsense-camera-modes"
 SYSTEM_SCHEMA = "g1_dashboard.system.v1"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -543,6 +543,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "inspire_dependency_lifecycle": "root-owned fixed helper; controller first on stop",
                     "camera_process_actions": bool(self.server.process_actions_enabled),
                     "camera_process_actions_authenticated": True,
+                    "camera_display_modes": ["rgb", "depth", "overlay", "near"],
+                    "camera_mode_switch_preserves_webrtc": True,
                     "unitree_service_actions": bool(self.server.service_actions_enabled),  # type: ignore[attr-defined]
                     "unitree_service_actions_authenticated": True,
                     "unitree_service_actions_allowlisted": True,
@@ -573,10 +575,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "/api/controller/action",
             "/api/camera/start",
             "/api/camera/stop",
+            "/api/camera/mode",
             "/api/services/set",
         ):
             self._send_json(HTTPStatus.METHOD_NOT_ALLOWED, {
-                "error": "unsupported POST; authenticated endpoints are controller auth/start/stop/action, camera start/stop, and allowlisted service set"
+                "error": "unsupported POST; authenticated endpoints are controller auth/start/stop/action, camera start/stop/mode, and allowlisted service set"
             })
             return
         if not self._require_process_action_auth():
@@ -627,9 +630,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
             elif path == "/api/camera/start":
                 status = manager.start_camera()
                 self._send_json(HTTPStatus.ACCEPTED, {"ok": True, "camera": status})
-            else:
+            elif path == "/api/camera/stop":
                 status = manager.stop_camera()
                 self._send_json(HTTPStatus.ACCEPTED, {"ok": True, "camera": status})
+            elif path == "/api/camera/mode":
+                mode = str(payload.get("mode") or "").strip().lower()
+                status = manager.set_camera_mode(mode)
+                acknowledged = bool(status.get("mode_ack_online") and status.get("mode_actual") == mode)
+                self._send_json(
+                    HTTPStatus.OK if acknowledged else HTTPStatus.ACCEPTED,
+                    {"ok": True, "acknowledged": acknowledged, "camera": status},
+                )
         except PermissionError as exc:
             self._send_json(HTTPStatus.FORBIDDEN, {"error": str(exc), "controller": manager.status(), "camera": manager.camera_status()})
         except FileNotFoundError as exc:

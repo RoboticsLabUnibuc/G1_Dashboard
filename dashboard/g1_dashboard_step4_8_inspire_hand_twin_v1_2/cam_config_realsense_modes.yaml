@@ -1,0 +1,57 @@
+webrtc:
+  bitrate:
+    min: 2000000
+    default: 5000000
+    max: 12000000
+  gop_length: 60
+
+head_camera:
+  enable_zmq: false
+  zmq_port: 55555
+  enable_webrtc: true
+  webrtc_port: 60001
+  webrtc_codec: h264
+  type: realsense
+  image_shape:
+    - 480
+    - 640
+  binocular: false
+  fps: 30
+  video_id: null
+  serial_number: "243722070255"
+  physical_path: null
+
+# Keep the wrist-camera entries disabled exactly as in the current PC2 config.
+# They are retained here so Teleimager's configuration responder still exposes
+# the same camera topics if another component inspects the config.
+left_wrist_camera:
+  enable_zmq: false
+  zmq_port: 55556
+  enable_webrtc: false
+  webrtc_port: 60002
+  webrtc_codec: h264
+  type: uvc
+  image_shape:
+    - 480
+    - 640
+  binocular: false
+  fps: 30
+  video_id: 2
+  serial_number: 200901010001
+  physical_path: null
+
+right_wrist_camera:
+  enable_zmq: false
+  zmq_port: 55557
+  enable_webrtc: false
+  webrtc_port: 60003
+  webrtc_codec: h264
+  type: uvc
+  image_shape:
+    - 480
+    - 640
+  binocular: false
+  fps: 30
+  video_id: 4
+  serial_number: 200901010002
+  physical_path: null

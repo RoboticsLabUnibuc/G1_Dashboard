@@ -2,8 +2,8 @@
 """Whitelisted lifecycle manager for G1 XR controller dependencies.
 
 This module intentionally does not import Unitree DDS libraries. It can only
-start/stop the exact validated controller, the exact teleimager executable, and
-the installed root-owned Inspire helper. The browser never supplies an
+start/stop the exact validated controller, the fixed dashboard Teleimager/RealSense
+runner in the validated teleimager environment, and the installed root-owned Inspire helper. The browser never supplies an
 executable path, shell fragment, environment variable, PID, or arbitrary
 command-line token.
 """
@@ -29,7 +29,7 @@ CONTROLLER_BASENAME = (
     "dashboard_telemetry_v1_8.py"
 )
 MANAGER_SCHEMA = "g1_dashboard.controller_process.v1"
-MANAGER_VERSION = "g1_dashboard_process_manager.v1.2.2-camera-process-group"
+MANAGER_VERSION = "g1_dashboard_process_manager.v1.3.0-realsense-camera-modes"
 CONTROLLER_SHA256 = "1e5d92c3c460c4f652e22e8de00ae2305d444f3e4a2485dfa8cebbb68c2b8484"
 
 ACTION_REQUEST_SCHEMA = "g1_dashboard.action_request.v1"
@@ -40,7 +40,9 @@ ACTION_OPERATIONS = {"REQUEST_XR", "CANCEL_XR_REQUEST", "HAND_BACK_ARMS"}
 
 INSPIRE_SERVICE_BASENAME = "inspire_g1"
 CAMERA_BASENAME = "teleimager-server"
+CAMERA_RUNNER_BASENAME = "g1_dashboard_teleimager_modes_runner.py"
 CAMERA_WEBRTC_PORT = 60001
+CAMERA_DISPLAY_MODES = {"rgb", "depth", "overlay", "near"}
 
 # These defaults exactly match the last validated V1.8 launch command.
 # Min/max values are dashboard edit bounds only. They are not robot safety
@@ -198,6 +200,26 @@ def _find_pids_by_basename(basename: str) -> list[int]:
     return sorted(set(out))
 
 
+def _pids_in_process_group(pgid: int | None) -> list[int]:
+    if pgid is None:
+        return []
+    out: list[int] = []
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return out
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if _proc_pgid(pid) == pgid:
+            out.append(pid)
+    return sorted(set(out))
+
+
+def _find_camera_pids() -> list[int]:
+    return sorted(set(_find_pids_by_basename(CAMERA_BASENAME)) | set(_find_pids_by_basename(CAMERA_RUNNER_BASENAME)))
+
+
 def _tcp_port_open(host: str, port: int, timeout_s: float = 0.08) -> bool:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
@@ -231,12 +253,24 @@ def _camera_environment(executable: Path) -> dict[str, str]:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     env["PYTHONNOUSERSITE"] = "1"
+    # Do NOT put all of /usr/lib/python3/dist-packages on PYTHONPATH.  Doing
+    # that can shadow Conda's cryptography stack with Ubuntu packages while
+    # aiortc still imports Conda's pyOpenSSL, producing an incompatible mix.
+    # The camera runner temporarily exposes this directory only long enough to
+    # preload the already-installed pyrealsense2 package, then removes it from
+    # sys.path before Teleimager / aiortc are imported.
     env.pop("PYTHONPATH", None)
+    env["G1_DASHBOARD_REALSENSE_SYSTEM_SITE"] = os.environ.get(
+        "G1_DASHBOARD_REALSENSE_SYSTEM_SITE",
+        "/usr/lib/python3/dist-packages",
+    )
     env.pop("PYTHONHOME", None)
     prefix = executable.parent.parent
     env["PATH"] = f"{prefix / 'bin'}:{env.get('PATH', '')}"
     env["CONDA_PREFIX"] = str(prefix)
     env["CONDA_DEFAULT_ENV"] = prefix.name
+    ld = env.get("LD_LIBRARY_PATH", "")
+    env["LD_LIBRARY_PATH"] = "/usr/local/lib" + (f":{ld}" if ld else "")
     return env
 
 
@@ -247,7 +281,21 @@ def _camera_preflight(executable: Path, cwd: Path, env: dict[str, str]) -> str:
         raise RuntimeError(f"teleimager Python is not executable: {python}")
     try:
         result = subprocess.run(
-            [str(python), "-c", "import teleimager.image_server; print('teleimager.image_server=OK')"],
+            [
+                str(python),
+                "-c",
+                (
+                    "import os,sys; "
+                    "p=os.environ.get('G1_DASHBOARD_REALSENSE_SYSTEM_SITE','/usr/lib/python3/dist-packages'); "
+                    "sys.path.insert(0,p); "
+                    "import pyrealsense2 as rs; "
+                    "sys.path.remove(p); "
+                    "import teleimager.image_server; "
+                    "ctx=rs.context(); "
+                    "print('teleimager.image_server=OK'); "
+                    "print('pyrealsense2=OK devices=%d' % len(ctx.query_devices()))"
+                ),
+            ],
             cwd=str(cwd),
             env=env,
             stdin=subprocess.DEVNULL,
@@ -387,6 +435,22 @@ class ControllerProcessManager:
         self.camera_cwd = Path(os.environ.get(
             "G1_DASHBOARD_CAMERA_CWD",
             str(Path.home() / "teleimager"),
+        )).expanduser()
+        self.camera_runner = Path(os.environ.get(
+            "G1_DASHBOARD_CAMERA_RUNNER",
+            str(Path(__file__).with_name(CAMERA_RUNNER_BASENAME)),
+        )).expanduser()
+        self.camera_config = Path(os.environ.get(
+            "G1_DASHBOARD_CAMERA_CONFIG",
+            str(Path(__file__).with_name("cam_config_realsense_modes.yaml")),
+        )).expanduser()
+        self.camera_mode_path = Path(os.environ.get(
+            "G1_DASHBOARD_CAMERA_MODE_FILE",
+            f"/tmp/g1_dashboard_camera_mode_{os.getuid()}.txt",
+        )).expanduser()
+        self.camera_mode_status_path = Path(os.environ.get(
+            "G1_DASHBOARD_CAMERA_MODE_STATUS",
+            f"/tmp/g1_dashboard_camera_mode_status_{os.getuid()}.json",
         )).expanduser()
         self.camera_state_path = Path(os.environ.get(
             "G1_DASHBOARD_CAMERA_STATE",
@@ -588,7 +652,8 @@ class ControllerProcessManager:
             ticks = data.get("start_ticks")
             ticks = int(ticks) if ticks is not None else None
             if _process_alive(pid, ticks) and any(
-                Path(a).name == CAMERA_BASENAME for a in _proc_cmdline(pid)
+                Path(a).name in {CAMERA_BASENAME, CAMERA_RUNNER_BASENAME}
+                for a in _proc_cmdline(pid)
             ):
                 self._camera_managed = data
                 return
@@ -649,10 +714,61 @@ class ControllerProcessManager:
             self._camera_managed = None
             self._save_camera_state()
 
+    def _read_camera_mode_requested(self) -> str:
+        try:
+            mode = self.camera_mode_path.read_text(encoding="utf-8").strip().lower()
+            return mode if mode in CAMERA_DISPLAY_MODES else "rgb"
+        except Exception:
+            return "rgb"
+
+    def _read_camera_mode_status(self) -> dict[str, Any] | None:
+        try:
+            data = json.loads(self.camera_mode_status_path.read_text(encoding="utf-8"))
+            if data.get("schema") != "g1_dashboard.camera_display_status.v1":
+                return None
+            updated = float(data.get("updated_unix_time_s", 0.0))
+            data["online"] = bool(updated > 0 and time.time() - updated <= 2.0)
+            return data
+        except Exception:
+            return None
+
+    def _write_camera_mode(self, mode: str) -> str:
+        normalized = str(mode or "").strip().lower()
+        if normalized not in CAMERA_DISPLAY_MODES:
+            raise ValueError(f"camera mode must be one of {sorted(CAMERA_DISPLAY_MODES)}")
+        self.camera_mode_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.camera_mode_path.with_suffix(".tmp")
+        tmp.write_text(normalized + "\n", encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        tmp.replace(self.camera_mode_path)
+        return normalized
+
+    def set_camera_mode(self, mode: str) -> dict[str, Any]:
+        with self._lock:
+            if not self.enabled:
+                raise PermissionError("dashboard process actions are disabled")
+            status = self.camera_status()
+            if status.get("state") != "RUNNING" or not status.get("mode_control"):
+                raise PermissionError(
+                    "camera display modes require the dashboard-managed RealSense mode runner; "
+                    "stop/restart an older managed teleimager process first"
+                )
+            self._write_camera_mode(mode)
+            # Do not restart WebRTC. The runner polls this local file and changes
+            # only the BGR frame written into Teleimager's existing buffer.
+            deadline = time.monotonic() + 1.2
+            requested = self._read_camera_mode_requested()
+            while time.monotonic() < deadline:
+                ack = self._read_camera_mode_status()
+                if ack and ack.get("online") and ack.get("mode") == requested:
+                    break
+                time.sleep(0.03)
+            return self.camera_status()
+
     def camera_status(self) -> dict[str, Any]:
         with self._lock:
             self._refresh_camera()
-            matching = _find_pids_by_basename(CAMERA_BASENAME)
+            matching = _find_camera_pids()
             groups = _group_pids_by_pgid(matching)
             managed_alive, managed_pid = self._camera_managed_alive()
             managed_pgid = _proc_pgid(managed_pid) if managed_alive and managed_pid is not None else None
@@ -660,6 +776,10 @@ class ControllerProcessManager:
             executable_ok = self.camera_executable.is_file() and os.access(self.camera_executable, os.X_OK)
             cwd_ok = self.camera_cwd.is_dir()
             port_ready = _tcp_port_open("127.0.0.1", CAMERA_WEBRTC_PORT)
+            mode_requested = self._read_camera_mode_requested()
+            mode_status = self._read_camera_mode_status()
+            mode_actual = mode_status.get("mode") if mode_status and mode_status.get("online") else None
+            mode_ack_online = bool(mode_status and mode_status.get("online"))
 
             if managed_alive and self._camera_managed is not None:
                 # teleimager uses multiprocessing and normally creates one or
@@ -667,7 +787,10 @@ class ControllerProcessManager:
                 # basename. Because the dashboard launches the server in a new
                 # session, every normal worker belongs to the managed process
                 # group. Only another process group is an external conflict.
-                managed_family = groups.get(managed_pgid, []) if managed_pgid is not None else [managed_pid]
+                managed_family = _pids_in_process_group(managed_pgid) if managed_pgid is not None else [managed_pid]
+                managed_mode_runner = any(
+                    Path(a).name == CAMERA_RUNNER_BASENAME for a in _proc_cmdline(managed_pid)
+                )
                 external_groups = {pgid: pids for pgid, pids in groups.items() if pgid != managed_pgid}
                 external = sorted(pid for pids in external_groups.values() for pid in pids)
                 stop_requested = self._camera_managed.get("stop_requested_unix_time_s")
@@ -691,6 +814,12 @@ class ControllerProcessManager:
                     "log_path": str(self.camera_log_path),
                     "port": CAMERA_WEBRTC_PORT,
                     "port_ready": port_ready,
+                    "display_modes": sorted(CAMERA_DISPLAY_MODES),
+                    "mode_requested": mode_requested,
+                    "mode_actual": mode_actual,
+                    "mode_ack_online": mode_ack_online,
+                    "mode_control": state == "RUNNING" and not external_groups and managed_mode_runner,
+                    "mode_status": mode_status,
                     "last_error": self._camera_last_error,
                     "last_exit_code": self._camera_last_exit_code,
                     "can_start": False,
@@ -718,13 +847,19 @@ class ControllerProcessManager:
                     "log_path": str(self.camera_log_path),
                     "port": CAMERA_WEBRTC_PORT,
                     "port_ready": port_ready,
+                    "display_modes": sorted(CAMERA_DISPLAY_MODES),
+                    "mode_requested": mode_requested,
+                    "mode_actual": mode_actual,
+                    "mode_ack_online": mode_ack_online,
+                    "mode_control": False,
+                    "mode_status": mode_status,
                     "last_error": self._camera_last_error,
                     "last_exit_code": self._camera_last_exit_code,
                     "can_start": False,
                     "can_stop": False,
                 }
 
-            ready = self.enabled and executable_ok and cwd_ok
+            ready = self.enabled and executable_ok and cwd_ok and self.camera_runner.is_file() and self.camera_config.is_file()
             return {
                 "schema": "g1_dashboard.camera_process.v1",
                 "manager_version": MANAGER_VERSION,
@@ -742,6 +877,12 @@ class ControllerProcessManager:
                 "log_path": str(self.camera_log_path),
                 "port": CAMERA_WEBRTC_PORT,
                 "port_ready": port_ready,
+                "display_modes": sorted(CAMERA_DISPLAY_MODES),
+                "mode_requested": mode_requested,
+                "mode_actual": mode_actual,
+                "mode_ack_online": mode_ack_online,
+                "mode_control": False,
+                "mode_status": mode_status,
                 "last_error": self._camera_last_error,
                 "last_exit_code": self._camera_last_exit_code,
                 "can_start": ready,
@@ -761,11 +902,25 @@ class ControllerProcessManager:
                 raise FileNotFoundError(f"teleimager-server not executable: {self.camera_executable}")
             if not self.camera_cwd.is_dir():
                 raise FileNotFoundError(f"teleimager working directory not found: {self.camera_cwd}")
-            matching = _find_pids_by_basename(CAMERA_BASENAME)
+            if not self.camera_runner.is_file():
+                raise FileNotFoundError(f"dashboard camera runner not found: {self.camera_runner}")
+            if not self.camera_config.is_file():
+                raise FileNotFoundError(f"dashboard RealSense camera config not found: {self.camera_config}")
+            matching = _find_camera_pids()
             if matching:
                 return self.camera_status()
 
             env = _camera_environment(self.camera_executable)
+            env["G1_DASHBOARD_CAMERA_CONFIG"] = str(self.camera_config)
+            env["TELEIMAGER_DISPLAY_MODE_FILE"] = str(self.camera_mode_path)
+            env["TELEIMAGER_DISPLAY_STATUS_FILE"] = str(self.camera_mode_status_path)
+            # Every camera-server launch returns to the normal RGB operator
+            # view. Mode changes are live-session choices, not boot defaults.
+            self._write_camera_mode("rgb")
+            try:
+                self.camera_mode_status_path.unlink(missing_ok=True)
+            except Exception:
+                pass
             try:
                 preflight = _camera_preflight(self.camera_executable, self.camera_cwd, env)
             except Exception as exc:
@@ -776,14 +931,15 @@ class ControllerProcessManager:
             log.write(
                 (
                     f"\n===== dashboard camera launch {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n"
-                    f"command: {self.camera_executable}\n"
-                    "managed_env: teleimager conda prefix; PYTHONNOUSERSITE=1; PYTHONPATH/PYTHONHOME cleared\n"
+                    f"command: {self.camera_executable.parent / 'python'} {self.camera_runner} --rs\n"
+                    "managed_env: teleimager conda prefix; PYTHONNOUSERSITE=1; pyrealsense2 preloaded selectively (no system-site PYTHONPATH)\n"
                     f"preflight: {preflight}\n"
                 ).encode("utf-8", "replace")
             )
             try:
+                camera_python = self.camera_executable.parent / "python"
                 proc = subprocess.Popen(
-                    [str(self.camera_executable)],
+                    [str(camera_python), str(self.camera_runner), "--rs"],
                     cwd=str(self.camera_cwd),
                     stdin=subprocess.DEVNULL,
                     stdout=log,
@@ -833,7 +989,7 @@ class ControllerProcessManager:
             self._refresh_camera()
             alive, pid = self._camera_managed_alive()
             if not alive or pid is None or self._camera_managed is None:
-                matching = _find_pids_by_basename(CAMERA_BASENAME)
+                matching = _find_camera_pids()
                 if matching:
                     raise PermissionError(
                         f"teleimager pid {matching[0]} was not launched/adopted by this dashboard; disconnect only or stop it from its owning terminal"

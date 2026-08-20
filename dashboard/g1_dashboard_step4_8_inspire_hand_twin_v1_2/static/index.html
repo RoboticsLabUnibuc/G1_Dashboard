@@ -59,6 +59,16 @@
             </div>
           </div>
 
+          <div class="camera-mode-strip" aria-label="Shared head-camera display mode">
+            <div class="camera-mode-buttons">
+              <button class="camera-mode-btn active" data-camera-mode="rgb">RGB</button>
+              <button class="camera-mode-btn" data-camera-mode="depth">DEPTH</button>
+              <button class="camera-mode-btn" data-camera-mode="overlay">OVERLAY</button>
+              <button class="camera-mode-btn" data-camera-mode="near">NEAR</button>
+            </div>
+            <span id="cameraModeState" class="camera-mode-state">MODE RGB</span>
+          </div>
+
           <div class="camera-stage">
             <video id="cameraVideo" autoplay playsinline muted></video>
             <div id="cameraOverlay" class="camera-overlay">

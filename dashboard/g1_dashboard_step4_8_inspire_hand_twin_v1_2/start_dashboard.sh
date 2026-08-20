@@ -85,14 +85,14 @@ PY
   SERVICE_ENABLED=1
 fi
 
-echo "G1 dashboard Step 5.2 — verified Unitree service controls"
+echo "G1 dashboard — verified services + shared RealSense camera modes"
 echo "  interface       : $IFACE"
 echo "  monitor python  : $MONITOR_PY"
 echo "  service monitor : $UNITREE_SERVICES (read-only inventory)"
 echo "  base sensing    : $BASE_SENSING (read-only)"
 echo "  system rate     : ${SYSTEM_HZ} Hz"
 if ((${#BRIDGE_ARGS[@]})); then
-  echo "  process actions : ENABLED (listener/Inspire/camera + controller-validated XR actions)"
+  echo "  process actions : ENABLED (listener/Inspire/RealSense camera + controller-validated XR actions)"
   if [[ "$SERVICE_ENABLED" == "1" ]]; then
     echo "  service actions : ENABLED (explicit allowlist + ServiceList post-verification)"
     echo "  service policy  : $G1_DASHBOARD_SERVICE_POLICY"

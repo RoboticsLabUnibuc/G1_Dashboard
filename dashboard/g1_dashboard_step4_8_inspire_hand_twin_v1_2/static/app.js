@@ -28,6 +28,7 @@ let cameraConnecting=false;
 let cameraProcessStatus=null;
 let cameraProcessPollBusy=false;
 let cameraProcessActionBusy=false;
+let cameraModeActionBusy=false;
 let selectedJointIndex=18;
 
 function switchView(name){
@@ -408,6 +409,7 @@ function renderCameraProcess(st){
   }
   if(state==='STOPPED')$('cameraConnectBtn').textContent='Start & connect';
   else $('cameraConnectBtn').textContent='Connect camera';
+  renderCameraModes();
   updateCameraButtons(latestEnv?.telemetry||{});
 }
 async function pollCameraProcess(){
@@ -424,16 +426,63 @@ async function pollCameraProcess(){
     return cameraProcessStatus;
   }finally{cameraProcessPollBusy=false;}
 }
-async function cameraProcessPost(path){
+async function cameraProcessPost(path,payload={}){
   const key=currentManagementKey();
   if(!key)throw new Error('Enter the management key first.');
-  const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-G1-Management-Key':key},body:'{}'});
+  const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-G1-Management-Key':key},body:JSON.stringify(payload||{})});
   let body={};try{body=await r.json();}catch{}
   if(r.status===401){storeManagementKey('');showManagementKeyPrompt('Management key rejected. Enter the key printed by the currently running ./start_dashboard.sh.');}
   if(!r.ok)throw new Error(body.error||`HTTP ${r.status}`);
   if(body.camera)renderCameraProcess(body.camera);
   return body.camera||cameraProcessStatus;
 }
+function cameraModeLabel(mode){
+  return ({rgb:'RGB',depth:'DEPTH',overlay:'OVERLAY',near:'NEAR'})[mode]||String(mode||'—').toUpperCase();
+}
+function renderCameraModes(){
+  const st=cameraProcessStatus||{};
+  const requested=st.mode_requested||'rgb';
+  const actual=st.mode_actual||null;
+  const controllable=!!st.mode_control && st.state==='RUNNING';
+  document.querySelectorAll('[data-camera-mode]').forEach(btn=>{
+    const mode=btn.dataset.cameraMode;
+    btn.classList.toggle('active',mode===requested);
+    btn.disabled=!controllable || cameraModeActionBusy;
+    btn.title=controllable?'Switch the shared Teleimager WebRTC output without reconnecting.':'Mode switching requires the dashboard-managed RealSense camera server.';
+  });
+  const badge=$('cameraModeState');
+  if(badge){
+    const waiting=controllable && actual!==requested;
+    badge.textContent=waiting?`MODE ${cameraModeLabel(requested)}…`:`MODE ${cameraModeLabel(actual||requested)}`;
+    badge.className=`camera-mode-state${waiting?' warn':actual?' good':''}`;
+  }
+}
+async function setCameraMode(mode){
+  mode=String(mode||'').toLowerCase();
+  if(!['rgb','depth','overlay','near'].includes(mode)||cameraModeActionBusy)return;
+  if(!currentManagementKey()){
+    showManagementKeyPrompt('Enter the management key to switch the shared camera view.',()=>setCameraMode(mode));
+    return;
+  }
+  if(cameraProcessStatus?.state!=='RUNNING'||!cameraProcessStatus?.mode_control){
+    window.alert('Camera modes are available only while the dashboard-managed RealSense camera server is running.');
+    return;
+  }
+  cameraModeActionBusy=true;
+  renderCameraModes();
+  try{
+    const st=await cameraProcessPost('/api/camera/mode',{mode});
+    if(st)renderCameraProcess(st);
+  }catch(err){
+    window.alert(`Camera mode switch failed: ${err.message||err}`);
+  }finally{
+    cameraModeActionBusy=false;
+    await pollCameraProcess();
+    renderCameraModes();
+  }
+}
+document.querySelectorAll('[data-camera-mode]').forEach(btn=>btn.addEventListener('click',()=>setCameraMode(btn.dataset.cameraMode)));
+
 function updateCameraButtons(t){
   const base=cameraBaseFromTelemetry(t);
   cameraUrl=cameraOfferFromTelemetry(t);
@@ -521,7 +570,7 @@ async function startAndConnectCamera(){
     if(!currentManagementKey()){showManagementKeyPrompt('Enter the management key to start the camera server.',()=>startAndConnectCamera());return;}
     cameraProcessActionBusy=true;updateCameraButtons(latestEnv?.telemetry||{});
     $('cameraOverlayTitle').textContent='Starting camera server…';
-    $('cameraOverlayText').textContent='Launching the fixed teleimager-server process on PC2.';
+    $('cameraOverlayText').textContent='Launching the dashboard-managed RealSense Teleimager stream on PC2.';
     cameraState('STARTING','warn');
     try{st=await cameraProcessPost('/api/camera/start');}
     catch(err){cameraState('ERROR','bad',err.message||String(err));window.alert(`Camera server start failed: ${err.message||err}`);return;}
@@ -761,7 +810,7 @@ function render(env){
   $('handFeedbackDetail').textContent=handFbFault?`STALE ${n(handFbAge,2,'s')}`:handFbValid?`${n(handFbAge,2,'s')}`:'INVALID RANGE';
   setTone($('handFeedbackDetail'),handFbFault||!handFbValid?'warn':'good');
   $('handRetargets').textContent=val(t,['hands','retarget_count'],'—'); $('handReacquire').textContent=val(t,['hands','reacquire_ready'])?'READY':`${val(t,['hands','reacquire_count'],0)}/${val(t,['hands','reacquire_required_frames'],'—')}`; $('thumbStatus').textContent=val(t,['controller','symmetric_thumb_rotation'])===false?'NO':'YES';
-  const c=t.camera||{}; const res=c.width&&c.height?`${c.width}×${c.height}`:'—'; $('cameraMeta').textContent=`${res} · ${n(c.display_fps,0,' fps')} · ${c.display_mode||'—'}`; $('cameraHudInfo').textContent=$('cameraMeta').textContent; $('statusCamera').textContent=c.webrtc_enabled?`WebRTC ${res}`:'disabled'; updateCameraButtons(t); if(!cameraPc&&!cameraConnecting)setChip($('cameraChip'),c.webrtc_enabled?'CAMERA OFFLINE':'CAMERA OFF',c.webrtc_enabled?'warn':null);
+  const c=t.camera||{}; const res=c.width&&c.height?`${c.width}×${c.height}`:'—'; const sharedMode=cameraProcessStatus?.mode_actual||cameraProcessStatus?.mode_requested||'rgb'; $('cameraMeta').textContent=`${res} · ${n(c.display_fps,0,' fps')} · ${cameraModeLabel(sharedMode)}`; $('cameraHudInfo').textContent=`${res} · ${n(c.display_fps,0,' fps')} · ${cameraModeLabel(sharedMode)} · shared with headset`; $('statusCamera').textContent=c.webrtc_enabled?`WebRTC ${res}`:'disabled'; updateCameraButtons(t); if(!cameraPc&&!cameraConnecting)setChip($('cameraChip'),c.webrtc_enabled?'CAMERA OFFLINE':'CAMERA OFF',c.webrtc_enabled?'warn':null);
   updateFaultBanner(env,t); renderEvents(env);
 }
 
