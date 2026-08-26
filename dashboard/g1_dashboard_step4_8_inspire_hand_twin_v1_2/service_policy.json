@@ -1,0 +1,18 @@
+{
+  "schema": "g1_dashboard.service_policy.v1",
+  "version": "step5.2-v1",
+  "allowed_services": [
+    "lidar_driver",
+    "unitree_slam"
+  ],
+  "read_only_services": [],
+  "hard_deny_services": [
+    "ai_sport",
+    "auto_test_arm",
+    "auto_test_low",
+    "bashrunner",
+    "basic_service",
+    "battery_guard",
+    "emergency_stop"
+  ]
+}

@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
-"""G1 dashboard bridge v1.4.8 — Inspire-hand twin + read-only system/base-sensing bridge.
+"""G1 dashboard bridge v1.6.2 — point-cloud orbit + 2-D top occupancy + verified service actions.
 
 Safety boundary:
 - Receives controller telemetry only from localhost UDP (127.0.0.1:8765).
-- Exposes read-only HTTP/JSON to the lab network.
 - Uses only the Python standard library: no FastAPI/Uvicorn/WebSocket packages.
-- Does NOT import Unitree DDS libraries.
-- Does NOT publish robot commands.
-- Does NOT provide mode-switch/control endpoints.
-- Browser/client disconnects have no effect on robot control.
+- Does NOT import Unitree DDS libraries and does NOT publish DDS commands.
+- Keeps authenticated start/stop lifecycle requests for one exact validated controller.
+- Couples a root-helper-managed Inspire service to the managed controller lifecycle.
+- Adds authenticated teleimager process start/stop; browser WebRTC remains separate.
+- Step 5.1 adds an authenticated XR action request endpoint. The bridge does not
+  decide robot state or publish DDS: it forwards only a whitelisted operation to
+  the controller's loopback action socket, where the controller re-validates it.
+- Step 5.2 adds authenticated, explicitly allowlisted service requests forwarded
+  to a separate g1_xr worker. The bridge itself still imports no Unitree DDS.
+- Browser/client disconnects have no effect on an already running controller.
 """
 from __future__ import annotations
 
@@ -16,6 +21,7 @@ import argparse
 import json
 import math
 import mimetypes
+import os
 import socket
 import threading
 import time
@@ -24,10 +30,14 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
+
+from g1_dashboard_process_manager import ControllerProcessManager
+from g1_dashboard_service_client import ServiceActionClient
+from g1_dashboard_service_policy import classify_service, load_policy, public_policy
 
 SCHEMA = "g1_dashboard.telemetry.v1"
-BRIDGE_VERSION = "g1_dashboard_bridge.v1.4.8.2-inspire-ghost-overlay"
+BRIDGE_VERSION = "g1_dashboard_bridge.v1.7.0-clean-shutdown-webgl-pointcloud"
 SYSTEM_SCHEMA = "g1_dashboard.system.v1"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -375,12 +385,12 @@ class UdpSystemThread(threading.Thread):
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
-    server_version = "G1Dashboard/1.4.8.2"
+    server_version = "G1Dashboard/1.5.0"
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt: str, *args: object) -> None:
         # /api/pose is intentionally high-rate; do not flood the terminal at 30 Hz.
-        if self.path.startswith("/api/pose"):
+        if self.path.startswith("/api/pose") or self.path.startswith("/api/camera/pointcloud"):
             return
         print(f"HTTP {self.client_address[0]} - {fmt % args}")
 
@@ -397,6 +407,37 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _send_json(self, status: int, payload: Any) -> None:
         body = json.dumps(payload, separators=(",", ":"), allow_nan=False).encode("utf-8")
         self._send_bytes(status, body, "application/json; charset=utf-8", cache=False)
+
+    def _read_json_body(self, *, max_bytes: int = 65536) -> Any:
+        content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            raise ValueError("Content-Type must be application/json")
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise ValueError("invalid Content-Length") from exc
+        if length < 0 or length > max_bytes:
+            raise ValueError(f"request body must be <= {max_bytes} bytes")
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except Exception as exc:
+            raise ValueError(f"invalid JSON body: {exc}") from exc
+
+    def _process_action_authorized(self) -> bool:
+        import secrets
+        expected: str = self.server.action_token  # type: ignore[attr-defined]
+        supplied = self.headers.get("X-G1-Management-Key", "")
+        return bool(expected) and bool(supplied) and secrets.compare_digest(supplied, expected)
+
+    def _require_process_action_auth(self) -> bool:
+        if not self.server.process_actions_enabled:  # type: ignore[attr-defined]
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": "controller process actions are disabled"})
+            return False
+        if not self._process_action_authorized():
+            self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "invalid or missing management key"})
+            return False
+        return True
 
     def _serve_file(self, path: Path, *, cache: bool = False) -> None:
         try:
@@ -445,14 +486,83 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path == "/api/system":
             self._send_json(HTTPStatus.OK, system_state.envelope())
             return
+        if path == "/api/controller":
+            manager: ControllerProcessManager = self.server.process_manager  # type: ignore[attr-defined]
+            self._send_json(HTTPStatus.OK, manager.status())
+            return
+        if path == "/api/controller/config":
+            manager: ControllerProcessManager = self.server.process_manager  # type: ignore[attr-defined]
+            self._send_json(HTTPStatus.OK, manager.config_schema())
+            return
+        if path == "/api/controller/log":
+            manager: ControllerProcessManager = self.server.process_manager  # type: ignore[attr-defined]
+            query = parse_qs(parsed.query)
+            try:
+                lines = int((query.get("lines") or ["80"])[0])
+            except ValueError:
+                lines = 80
+            self._send_json(HTTPStatus.OK, manager.log_tail(lines))
+            return
+        if path == "/api/camera":
+            manager: ControllerProcessManager = self.server.process_manager  # type: ignore[attr-defined]
+            self._send_json(HTTPStatus.OK, manager.camera_status())
+            return
+        if path == "/api/camera/pointcloud":
+            manager: ControllerProcessManager = self.server.process_manager  # type: ignore[attr-defined]
+            packet = manager.camera_pointcloud_snapshot()
+            if packet is None:
+                self._send_bytes(HTTPStatus.NO_CONTENT, b"", "application/octet-stream", cache=False)
+            else:
+                self._send_bytes(HTTPStatus.OK, packet, "application/vnd.g1.pointcloud", cache=False)
+            return
+        if path == "/api/camera/log":
+            manager: ControllerProcessManager = self.server.process_manager  # type: ignore[attr-defined]
+            query = parse_qs(parsed.query)
+            try:
+                lines = int((query.get("lines") or ["80"])[0])
+            except ValueError:
+                lines = 80
+            self._send_json(HTTPStatus.OK, manager.camera_log_tail(lines))
+            return
+        if path == "/api/services/control":
+            client: ServiceActionClient = self.server.service_action_client  # type: ignore[attr-defined]
+            policy = load_policy()
+            worker = client.ping() if self.server.service_actions_enabled else {"status": "DISABLED", "reason": "service actions disabled"}  # type: ignore[attr-defined]
+            self._send_json(HTTPStatus.OK, {
+                "schema": "g1_dashboard.service_control.v1",
+                "enabled": bool(self.server.service_actions_enabled),  # type: ignore[attr-defined]
+                "management_key_required": bool(self.server.service_actions_enabled),  # type: ignore[attr-defined]
+                "policy": public_policy(policy),
+                "worker": worker,
+            })
+            return
         if path == "/api/info":
             env = state.envelope()
             self._send_json(HTTPStatus.OK, {
                 "bridge": env["bridge"],
                 "safety_boundary": {
-                    "read_only": True,
-                    "dds_imported": False,
-                    "command_endpoints": False,
+                    "bridge_imports_robot_dds": False,
+                    "browser_direct_robot_dds_commands": False,
+                    "service_switch_worker_isolated": True,
+                    "controller_xr_action_endpoint": bool(self.server.process_actions_enabled),
+                    "controller_xr_action_controller_validated": True,
+                    "controller_process_actions": bool(self.server.process_actions_enabled),  # type: ignore[attr-defined]
+                    "controller_process_actions_authenticated": True,
+                    "inspire_dependency_lifecycle": "root-owned fixed helper; controller first on stop",
+                    "camera_process_actions": bool(self.server.process_actions_enabled),
+                    "camera_process_actions_authenticated": True,
+                    "camera_display_modes": ["rgb", "depth", "overlay", "near", "disparity", "pointcloud", "topdown"],
+                    "camera_mode_switch_preserves_webrtc": True,
+                    "camera_point_view_orbit_control": True,
+                    "camera_pointcloud_browser_webgl": True,
+                    "camera_pointcloud_transport": "latest-only binary G1PC over same-origin HTTP",
+                    "camera_topdown_projection": "orthographic X/Z occupancy grid",
+                    "unitree_service_actions": bool(self.server.service_actions_enabled),  # type: ignore[attr-defined]
+                    "unitree_service_actions_authenticated": True,
+                    "unitree_service_actions_allowlisted": True,
+                    "unitree_service_actions_post_verified": True,
+                    "bridge_imports_unitree_dds": False,
+                    "arbitrary_process_launch": False,
                     "telemetry_input": f"udp://127.0.0.1:{self.server.udp_port}",  # type: ignore[attr-defined]
                     "system_input": f"udp://127.0.0.1:{self.server.system_udp_port}",  # type: ignore[attr-defined]
                 },
@@ -466,8 +576,100 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
-        # Explicit safety boundary: there are no command endpoints in v1.4.
-        self._send_json(HTTPStatus.METHOD_NOT_ALLOWED, {"error": "read-only bridge; POST is disabled"})
+        parsed = urlparse(self.path)
+        path = parsed.path
+        manager: ControllerProcessManager = self.server.process_manager  # type: ignore[attr-defined]
+
+        if path not in (
+            "/api/controller/auth",
+            "/api/controller/start",
+            "/api/controller/stop",
+            "/api/controller/action",
+            "/api/camera/start",
+            "/api/camera/stop",
+            "/api/camera/mode",
+            "/api/camera/view",
+            "/api/services/set",
+        ):
+            self._send_json(HTTPStatus.METHOD_NOT_ALLOWED, {
+                "error": "unsupported POST; authenticated endpoints are controller auth/start/stop/action, camera start/stop/mode/view, and allowlisted service set"
+            })
+            return
+        if not self._require_process_action_auth():
+            return
+        try:
+            payload = self._read_json_body()
+            if not isinstance(payload, dict):
+                raise ValueError("JSON body must be an object")
+            if path == "/api/controller/auth":
+                self._send_json(HTTPStatus.OK, {
+                    "ok": True,
+                    "authenticated": True,
+                    "controller": manager.status(),
+                })
+            elif path == "/api/controller/start":
+                status = manager.start(payload.get("parameters", {}))
+                self._send_json(HTTPStatus.ACCEPTED, {"ok": True, "controller": status})
+            elif path == "/api/controller/stop":
+                status = manager.stop()
+                self._send_json(HTTPStatus.ACCEPTED, {"ok": True, "controller": status})
+            elif path == "/api/controller/action":
+                response = manager.request_xr_action(payload.get("operation", ""))
+                accepted = response.get("status") == "ACCEPTED"
+                self._send_json(
+                    HTTPStatus.ACCEPTED if accepted else HTTPStatus.CONFLICT,
+                    {"ok": accepted, "action": response, "controller": manager.status()},
+                )
+            elif path == "/api/services/set":
+                if not self.server.service_actions_enabled:  # type: ignore[attr-defined]
+                    raise PermissionError("Unitree service actions are disabled")
+                service = str(payload.get("service") or "").strip()
+                enabled = payload.get("enabled")
+                if not service or len(service) > 128:
+                    raise ValueError("service must be a non-empty service name")
+                if not isinstance(enabled, bool):
+                    raise ValueError("enabled must be boolean")
+                policy = load_policy()
+                bridge_policy = classify_service(service, unitree_protect=False, policy=policy)
+                if bridge_policy != "ALLOWED":
+                    raise PermissionError(f"service {service!r} policy is {bridge_policy}; explicit ALLOWED policy is required")
+                client: ServiceActionClient = self.server.service_action_client  # type: ignore[attr-defined]
+                response = client.request("SET_SERVICE", service=service, enabled=enabled)
+                completed = response.get("status") == "COMPLETED" and response.get("verified") is True
+                self._send_json(
+                    HTTPStatus.OK if completed else HTTPStatus.CONFLICT,
+                    {"ok": completed, "service_action": response},
+                )
+            elif path == "/api/camera/start":
+                status = manager.start_camera()
+                self._send_json(HTTPStatus.ACCEPTED, {"ok": True, "camera": status})
+            elif path == "/api/camera/stop":
+                status = manager.stop_camera()
+                self._send_json(HTTPStatus.ACCEPTED, {"ok": True, "camera": status})
+            elif path == "/api/camera/mode":
+                mode = str(payload.get("mode") or "").strip().lower()
+                status = manager.set_camera_mode(mode)
+                acknowledged = bool(status.get("mode_ack_online") and status.get("mode_actual") == mode)
+                self._send_json(
+                    HTTPStatus.OK if acknowledged else HTTPStatus.ACCEPTED,
+                    {"ok": True, "acknowledged": acknowledged, "camera": status},
+                )
+            elif path == "/api/camera/view":
+                view = payload.get("view")
+                if not isinstance(view, dict):
+                    raise ValueError("view must be an object")
+                status = manager.set_camera_point_view(view)
+                self._send_json(HTTPStatus.OK, {"ok": True, "camera": status})
+        except PermissionError as exc:
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": str(exc), "controller": manager.status(), "camera": manager.camera_status()})
+        except FileNotFoundError as exc:
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc), "controller": manager.status(), "camera": manager.camera_status()})
+        except (ValueError, RuntimeError) as exc:
+            self._send_json(HTTPStatus.CONFLICT if isinstance(exc, RuntimeError) else HTTPStatus.BAD_REQUEST, {
+                "error": str(exc), "controller": manager.status(), "camera": manager.camera_status()
+            })
+        except Exception as exc:
+            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"dashboard action failed: {exc}"})
 
 
 def parse_args() -> argparse.Namespace:
@@ -478,6 +680,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--http-host", default="0.0.0.0")
     p.add_argument("--http-port", type=int, default=8080)
     p.add_argument("--stale-after-s", type=float, default=1.5)
+    p.add_argument(
+        "--enable-process-actions",
+        action="store_true",
+        help="Enable authenticated controller/Inspire/camera lifecycle actions and Step 5.1 XR action forwarding.",
+    )
+    p.add_argument(
+        "--enable-service-actions",
+        action="store_true",
+        help="Enable authenticated, explicitly allowlisted Unitree RobotState service actions through the separate g1_xr worker.",
+    )
     return p.parse_args()
 
 
@@ -503,19 +715,50 @@ def main() -> int:
     server.system_state = system_state  # type: ignore[attr-defined]
     server.udp_port = args.udp_port  # type: ignore[attr-defined]
     server.system_udp_port = args.system_udp_port  # type: ignore[attr-defined]
+    process_manager = ControllerProcessManager(enabled=args.enable_process_actions)
+    action_token = os.environ.get("G1_DASHBOARD_ACTION_TOKEN", "") if args.enable_process_actions else ""
+    if args.enable_process_actions and len(action_token) < 16:
+        raise SystemExit("--enable-process-actions requires G1_DASHBOARD_ACTION_TOKEN with at least 16 characters")
+    server.process_manager = process_manager  # type: ignore[attr-defined]
+    server.process_actions_enabled = args.enable_process_actions  # type: ignore[attr-defined]
+    server.action_token = action_token  # type: ignore[attr-defined]
+    service_action_client = ServiceActionClient()
+    if args.enable_service_actions and not service_action_client.configured():
+        raise SystemExit("--enable-service-actions requires G1_DASHBOARD_SERVICE_SOCKET and G1_DASHBOARD_SERVICE_TOKEN")
+    if args.enable_service_actions and not args.enable_process_actions:
+        raise SystemExit("--enable-service-actions requires --enable-process-actions so management-key auth is available")
+    server.service_action_client = service_action_client  # type: ignore[attr-defined]
+    server.service_actions_enabled = args.enable_service_actions  # type: ignore[attr-defined]
 
-    print(f"{BRIDGE_VERSION} READ-ONLY")
+    print(f"{BRIDGE_VERSION} PROCESS+DEPENDENCY+XR+SERVICE-ACTION-CONTROL")
     print(f"Telemetry input : udp://127.0.0.1:{args.udp_port}")
     print(f"System input    : udp://127.0.0.1:{args.system_udp_port}")
     print(f"Dashboard HTTP  : http://{args.http_host}:{args.http_port}")
     print("Transport       : dual-rate latest-only HTTP (30 Hz pose / 4 Hz status)")
     print("Dependencies    : Python standard library only")
-    print("No DDS imports. No robot command endpoints.")
+    print(f"Process actions : {'ENABLED' if args.enable_process_actions else 'DISABLED'}")
+    print(f"Service actions : {'ENABLED (explicit allowlist + post-verification)' if args.enable_service_actions else 'DISABLED'}")
+    if args.enable_process_actions:
+        print(f"Controller      : {process_manager.script_path}")
+        print(f"Controller Py   : {process_manager.python_path}")
+        print("Auth            : X-G1-Management-Key required")
+    print("Bridge imports no DDS. XR requests are controller-validated; Unitree ServiceSwitch is isolated in the allowlisted service worker and post-verified with ServiceList.")
+    interrupted = False
     try:
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:
+        interrupted = True
         print("\nStopping dashboard bridge...")
     finally:
+        # A direct Ctrl+C of the bridge is an explicit lifecycle command. An
+        # unexpected bridge exception remains non-authoritative and does not
+        # automatically change robot-side process state.
+        if interrupted and args.enable_process_actions:
+            try:
+                summary = process_manager.shutdown_dashboard_managed(timeout_s=15.0)
+                print(f"Managed dependency shutdown: {summary}")
+            except Exception as exc:
+                print(f"WARNING: managed dependency shutdown failed: {exc}")
         # serve_forever() has already returned here; calling shutdown() from the
         # same thread can deadlock. Close the socket directly.
         server.server_close()

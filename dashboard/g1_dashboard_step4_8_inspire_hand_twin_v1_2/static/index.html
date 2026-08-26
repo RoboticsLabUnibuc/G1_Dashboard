@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>G1 Teleop Control Center</title>
   <link rel="icon" href="data:," />
-  <link rel="stylesheet" href="/static/styles.css?v=step4-8-v1.2" />
+  <link rel="stylesheet" href="/static/styles.css?v=camera-v1-3" />
 </head>
 <body>
   <header class="topbar">
@@ -13,7 +13,7 @@
       <div class="eyebrow">UNITREE G1 · XR TELEOPERATION</div>
       <div class="title-row">
         <h1>Teleop Control Center</h1>
-        <span class="readonly">READ ONLY</span>
+        <span class="readonly process-control-label">BRIDGE NO DDS · SERVICE WORKER ISOLATED</span>
       </div>
     </div>
 
@@ -25,6 +25,7 @@
 
     <div class="header-status">
       <span id="bridgeChip" class="chip">BRIDGE —</span>
+      <span id="controllerProcessChip" class="chip">CTRL —</span>
       <span id="telemetryChip" class="chip">TELEMETRY —</span>
       <span id="cameraChip" class="chip">CAMERA —</span>
       <span id="versionText" class="version">—</span>
@@ -51,18 +52,44 @@
               <div class="panel-title-line"><strong>Live view</strong><span id="cameraMeta" class="dim">—</span></div>
             </div>
             <div class="camera-actions">
-              <button id="cameraConnectBtn" class="primary-btn">Connect camera</button>
-              <button id="cameraStopBtn" class="ghost-btn hidden">Disconnect</button>
+              <span id="cameraProcessState" class="camera-process-state">SERVER —</span>
+              <button id="cameraConnectBtn" class="primary-btn">Start &amp; connect</button>
+              <button id="cameraStopBtn" class="ghost-btn hidden">Stop camera</button>
               <a id="cameraTrustLink" class="ghost-link" target="_blank" rel="noreferrer">Trust cert</a>
             </div>
           </div>
 
-          <div class="camera-stage">
+          <div class="camera-mode-strip" aria-label="Shared head-camera display mode">
+            <div class="camera-mode-buttons">
+              <button class="camera-mode-btn active" data-camera-mode="rgb" title="Normal RGB camera">RGB</button>
+              <button class="camera-mode-btn" data-camera-mode="depth" title="Metric Z16 depth heatmap">DEPTH</button>
+              <button class="camera-mode-btn" data-camera-mode="overlay" title="RGB with valid-depth heatmap overlay">OVERLAY</button>
+              <button class="camera-mode-btn" data-camera-mode="near" title="Near-field proximity bands">NEAR</button>
+              <button class="camera-mode-btn" data-camera-mode="disparity" title="Stereo disparity-proportional inverse-depth view">DISP</button>
+              <button class="camera-mode-btn" data-camera-mode="pointcloud" title="Orbitable RGB-textured 3-D point cloud">POINT</button>
+              <button class="camera-mode-btn" data-camera-mode="topdown" title="Orthographic X/Z 2-D occupancy projection">TOP</button>
+            </div>
+            <span id="cameraModeState" class="camera-mode-state">MODE RGB</span>
+          </div>
+
+          <div id="pointViewStrip" class="point-view-strip hidden" aria-label="Point-cloud virtual camera controls">
+            <span class="point-view-label">POINT VIEW</span>
+            <button class="point-view-btn" data-point-view-preset="front">FRONT</button>
+            <button class="point-view-btn" data-point-view-preset="left">LEFT</button>
+            <button class="point-view-btn" data-point-view-preset="right">RIGHT</button>
+            <button class="point-view-btn" data-point-view-preset="above">ABOVE</button>
+            <button class="point-view-btn" data-point-view-preset="reset">RESET</button>
+            <span id="pointViewReadout" class="point-view-readout">Y +22° · P +14° · 3.2m · waiting</span>
+            <span class="point-view-hint">LOCAL WEBGL · drag orbit · wheel zoom</span>
+          </div>
+
+          <div id="cameraStage" class="camera-stage">
             <video id="cameraVideo" autoplay playsinline muted></video>
+            <canvas id="pointCloudCanvas" class="pointcloud-canvas hidden" aria-label="Interactive camera-relative 3-D point cloud"></canvas>
             <div id="cameraOverlay" class="camera-overlay">
               <div class="camera-overlay-icon">◉</div>
               <strong id="cameraOverlayTitle">Camera not connected</strong>
-              <span id="cameraOverlayText">Start teleimager, then connect.</span>
+              <span id="cameraOverlayText">Click Start & connect to launch teleimager.</span>
             </div>
             <div class="camera-hud top-left">
               <span id="cameraStateDot" class="dot"></span>
@@ -168,6 +195,23 @@
             </div>
           </section>
 
+          <section class="panel controller-process-panel">
+            <div class="panel-head controller-process-head">
+              <div><div class="panel-kicker">TELEOP LISTENER</div><strong id="controllerProcessTitle">Controller process</strong></div>
+              <span id="controllerProcessState" class="chip">—</span>
+            </div>
+            <div class="controller-process-meta">
+              <span id="controllerProcessPid">pid —</span>
+              <span id="controllerProcessUptime">uptime —</span>
+              <span id="controllerInspireState">Inspire —</span>
+            </div>
+            <div id="controllerProcessDetail" class="controller-process-detail">Checking process manager…</div>
+            <div class="controller-process-actions">
+              <button id="controllerConfigureBtn" class="primary-btn">Configure &amp; start</button>
+              <button id="controllerStopBtn" class="danger-btn" disabled>Stop listener</button>
+            </div>
+          </section>
+
           <section class="panel action-readiness-panel">
             <div class="panel-head action-readiness-head">
               <div><div class="panel-kicker">ACTION READINESS</div><strong id="actionLabel">Controller V1.8 required</strong></div>
@@ -180,6 +224,10 @@
               <span id="actionCondXr">XR —</span>
               <span id="actionCondStop">STOP —</span>
               <span id="actionCondFault">FAULT —</span>
+            </div>
+            <div class="xr-action-row">
+              <button id="xrActionBtn" class="primary-btn xr-action-btn" disabled>ENTER TELEOP</button>
+              <span id="xrActionResult" class="xr-action-result">Controller request channel not ready.</span>
             </div>
           </section>
 
@@ -315,6 +363,19 @@
             <div><div class="panel-kicker">UNITREE ROBOTSTATE API</div><strong>Service inventory</strong></div>
             <div class="service-head-actions">
               <input id="serviceFilter" class="service-filter" type="search" placeholder="Filter services…" autocomplete="off" />
+              <select id="serviceStateFilter" class="service-select" aria-label="Filter service state">
+                <option value="ALL">STATE · ALL</option>
+                <option value="ON">STATE · ON</option>
+                <option value="OFF">STATE · OFF</option>
+              </select>
+              <select id="servicePolicyFilter" class="service-select" aria-label="Filter service policy">
+                <option value="ALL">POLICY · ALL</option>
+                <option value="ALLOWED">POLICY · ALLOWED</option>
+                <option value="PROTECTED">POLICY · PROTECTED</option>
+                <option value="READ_ONLY">POLICY · READ ONLY</option>
+                <option value="UNKNOWN">POLICY · UNKNOWN</option>
+              </select>
+              <span id="serviceControlChip" class="chip">CONTROL —</span>
               <span id="robotStateChip" class="chip">API —</span>
             </div>
           </div>
@@ -329,7 +390,7 @@
             <div id="robotServiceCounts" class="service-counts">—</div>
           </div>
           <div class="service-table">
-            <div class="service-row service-header"><span>SERVICE</span><span>PROTECTION</span><span>STATE</span></div>
+            <div class="service-row service-header"><span>SERVICE</span><span>POLICY</span><span>STATE</span><span>CONTROL</span></div>
             <div id="robotServiceList" class="service-list"><div class="empty">No service inventory yet</div></div>
           </div>
         </section>
@@ -392,7 +453,7 @@
             <div><span>Would enter</span><strong id="statusActionNextState">—</strong></div>
             <div><span>Request channel</span><strong id="statusActionChannel">DISABLED</strong></div>
           </div>
-          <div id="statusActionReason" class="status-action-reason">Controller V1.8 action-readiness telemetry required.</div>
+          <div id="statusActionReason" class="status-action-reason">Controller action-readiness telemetry required.</div>
         </section>
 
         <section class="panel events-panel-full">
@@ -403,6 +464,79 @@
     </section>
   </main>
 
-  <script type="module" src="/static/app.js?v=step4-8-v1.2"></script>
+  <div id="managementKeyModal" class="modal-backdrop hidden" role="presentation">
+    <section class="management-key-modal" role="dialog" aria-modal="true" aria-labelledby="managementKeyTitle">
+      <div class="controller-modal-head">
+        <div>
+          <div class="panel-kicker">DASHBOARD INTERACTIONS</div>
+          <h2 id="managementKeyTitle">Management access</h2>
+          <p>Enter the management key printed by the currently running <strong>./start_dashboard.sh</strong>. The key is required for listener start/stop and ENTER/EXIT TELEOP. Monitoring remains read-only without it.</p>
+        </div>
+      </div>
+
+      <label class="management-key-field">
+        <span>Management key</span>
+        <input id="managementKeyInput" type="password" autocomplete="off" placeholder="Paste current dashboard management key" />
+      </label>
+      <div class="management-key-note">A saved key is verified against the current dashboard on every page load, so restarting the dashboard automatically requires the new key.</div>
+      <div id="managementKeyError" class="controller-modal-error hidden"></div>
+
+      <div class="management-key-actions">
+        <button id="managementKeyReadOnlyBtn" class="ghost-btn">Continue read-only</button>
+        <button id="managementKeySubmitBtn" class="primary-btn">Unlock interactions</button>
+      </div>
+    </section>
+  </div>
+
+  <div id="controllerModal" class="modal-backdrop hidden" role="presentation">
+    <section class="controller-modal" role="dialog" aria-modal="true" aria-labelledby="controllerModalTitle">
+      <div class="controller-modal-head">
+        <div>
+          <div class="panel-kicker">STEP 5.1 · PROCESS + XR CONTROL</div>
+          <h2 id="controllerModalTitle">Start teleop listener</h2>
+          <p>Starts the exact whitelisted controller. It starts in locomotion-ready state; use <strong>ENTER TELEOP</strong> in Action Readiness after startup.</p>
+        </div>
+        <button id="controllerModalCloseBtn" class="icon-btn" aria-label="Close">×</button>
+      </div>
+
+      <div id="controllerModalNotice" class="controller-modal-notice">Dashboard parameter ranges are editing bounds, not robot safety limits. Controller and Unitree checks remain authoritative.</div>
+
+      <div class="controller-auth-row">
+        <label>
+          <span>Management key</span>
+          <input id="controllerManagementKey" type="password" autocomplete="off" placeholder="Paste key printed by ./start_dashboard.sh" />
+        </label>
+        <button id="controllerResetDefaultsBtn" class="ghost-btn">Reset known-good</button>
+      </div>
+      <label class="controller-safety-ack">
+        <input id="controllerSafetyAck" type="checkbox" />
+        <span>I confirm the robot is prepared and the R3 safety operator is ready. Starting the listener enables the live controller process, but does not enter XR ownership.</span>
+      </label>
+
+      <div class="controller-locked-block">
+        <div class="controller-section-title">LOCKED WORKING SETTINGS</div>
+        <div id="controllerLockedSettings" class="controller-locked-grid"></div>
+      </div>
+
+      <div id="controllerParameterSections" class="controller-parameter-sections"></div>
+
+      <details class="controller-command-details">
+        <summary>Resolved launch command</summary>
+        <pre id="controllerCommandPreview">Loading controller configuration…</pre>
+      </details>
+
+      <div id="controllerModalError" class="controller-modal-error hidden"></div>
+
+      <div class="controller-modal-footer">
+        <span id="controllerModalRuntime" class="dim">—</span>
+        <div>
+          <button id="controllerModalCancelBtn" class="ghost-btn">Cancel</button>
+          <button id="controllerStartBtn" class="primary-btn">Launch V1.8 listener</button>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script type="module" src="/static/app.js?v=camera-v1-3"></script>
 </body>
 </html>

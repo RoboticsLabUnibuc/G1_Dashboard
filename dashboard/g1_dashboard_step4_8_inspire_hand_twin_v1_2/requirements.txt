@@ -1,2 +1,2 @@
-# No third-party Python dependencies.
-# The bridge uses only the Python standard library.
+# No third-party Python dependencies are required by the dashboard bridge/process manager.
+# The system monitor and the separately launched V1.8 controller still use the already-installed robot environments.

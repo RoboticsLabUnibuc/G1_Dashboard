@@ -1,4 +1,5 @@
 import { G1Twin } from './g1_model.js';
+import { PointCloud3D } from './pointcloud_view.js';
 
 (()=>{
 'use strict';
@@ -25,6 +26,15 @@ let cameraFallback=false;
 let cameraUrl=null;
 let cameraFrameWatch=null;
 let cameraConnecting=false;
+let cameraProcessStatus=null;
+let cameraProcessPollBusy=false;
+let cameraProcessActionBusy=false;
+let cameraModeActionBusy=false;
+let pointViewSendBusy=false;
+let pointViewLocal=null;
+let pointViewInitialized=false;
+let pointCloudFetchBusy=false;
+let pointCloudPollTimer=null;
 let selectedJointIndex=18;
 
 function switchView(name){
@@ -37,7 +47,340 @@ document.querySelectorAll('.tab').forEach(b=>b.addEventListener('click',()=>swit
 document.querySelectorAll('[data-view-jump]').forEach(b=>b.addEventListener('click',()=>switchView(b.dataset.viewJump)));
 $('faultDetailsBtn').addEventListener('click',()=>switchView('status'));
 
-/* ---------- Camera / teleimager ---------- */
+/* ---------- Step 5.1 controller process + XR action manager ---------- */
+let controllerConfig=null;
+let controllerStatus=null;
+let controllerPollBusy=false;
+let controllerActionBusy=false;
+let xrActionBusy=false;
+let latestActionReadiness=null;
+let managementAuthBusy=false;
+let managementAfterAuth=null;
+
+function currentManagementKey(){
+  return sessionStorage.getItem('g1ManagementKey')||'';
+}
+function storeManagementKey(key){
+  const value=String(key||'').trim();
+  if(value)sessionStorage.setItem('g1ManagementKey',value);
+  else sessionStorage.removeItem('g1ManagementKey');
+  if($('managementKeyInput'))$('managementKeyInput').value=value;
+  if($('controllerManagementKey'))$('controllerManagementKey').value=value;
+}
+function setManagementKeyError(message){
+  const el=$('managementKeyError'); if(!el)return;
+  if(!message){el.textContent='';el.classList.add('hidden');return;}
+  el.textContent=message;el.classList.remove('hidden');
+}
+function showManagementKeyPrompt(message='',afterAuth=null){
+  managementAfterAuth=typeof afterAuth==='function'?afterAuth:null;
+  setManagementKeyError(message);
+  $('managementKeyInput').value=currentManagementKey();
+  $('managementKeyModal').classList.remove('hidden');
+  document.body.classList.add('modal-open');
+  setTimeout(()=>$('managementKeyInput').focus(),0);
+}
+function closeManagementKeyPrompt(){
+  $('managementKeyModal').classList.add('hidden');
+  if($('controllerModal').classList.contains('hidden'))document.body.classList.remove('modal-open');
+  managementAfterAuth=null;
+}
+async function verifyManagementKey(key){
+  const value=String(key||'').trim();
+  if(!value)throw new Error('Paste the management key printed by the current ./start_dashboard.sh.');
+  const r=await fetch('/api/controller/auth',{
+    method:'POST',
+    headers:{'Content-Type':'application/json','X-G1-Management-Key':value},
+    body:'{}',
+    cache:'no-store'
+  });
+  let body={};try{body=await r.json();}catch{}
+  if(!r.ok)throw new Error(body.error||`HTTP ${r.status}`);
+  return body;
+}
+async function bootstrapManagementKey(){
+  try{
+    const cfg=await loadControllerConfig();
+    if(!cfg?.enabled||!cfg?.management_key_required)return;
+    const saved=currentManagementKey();
+    if(saved){
+      try{await verifyManagementKey(saved);return;}
+      catch{storeManagementKey('');showManagementKeyPrompt('The saved management key is no longer valid. The dashboard may have restarted; enter the new key printed by ./start_dashboard.sh.');return;}
+    }
+    showManagementKeyPrompt('Enter the current management key to enable listener, camera, ENTER/EXIT TELEOP, and allowlisted service controls.');
+  }catch(err){
+    console.debug('management-key bootstrap unavailable',err);
+  }
+}
+
+function controllerStateTone(state){
+  if(state==='RUNNING') return 'good';
+  if(state==='STOPPING'||state==='RUNNING_EXTERNAL') return 'warn';
+  if(state==='UNAVAILABLE') return 'bad';
+  return null;
+}
+function controllerStateLabel(state){
+  if(state==='RUNNING_EXTERNAL') return 'EXTERNAL';
+  return state||'—';
+}
+function renderControllerProcess(st){
+  controllerStatus=st||{};
+  const state=controllerStatus.state||'UNAVAILABLE';
+  const tone=controllerStateTone(state);
+  setChip($('controllerProcessChip'),`CTRL ${controllerStateLabel(state)}`,tone);
+  setChip($('controllerProcessState'),controllerStateLabel(state),tone);
+  const pid=controllerStatus.pid;
+  $('controllerProcessPid').textContent=pid?`pid ${pid}`:'pid —';
+  $('controllerProcessUptime').textContent=finite(controllerStatus.uptime_s)?`uptime ${duration(controllerStatus.uptime_s)}`:'uptime —';
+  const inspire=controllerStatus?.dependencies?.inspire||{};
+  const inspireState=inspire.state||'—';
+  const inspireLabel=inspireState==='RUNNING_MANAGED'?'Inspire MANAGED':inspireState==='RUNNING_EXTERNAL'?'Inspire EXTERNAL':inspireState==='STOPPED'?'Inspire STOPPED':inspireState==='CONFLICT'?'Inspire CONFLICT':inspireState==='UNAVAILABLE'?'Inspire SETUP':'Inspire —';
+  $('controllerInspireState').textContent=inspireLabel;
+  setTone($('controllerInspireState'),inspireState==='RUNNING_MANAGED'||inspireState==='RUNNING_EXTERNAL'?'good':inspireState==='CONFLICT'?'bad':inspireState==='UNAVAILABLE'?'warn':null);
+  let detail='Process manager unavailable.';
+  if(state==='STOPPED') detail=inspireState==='RUNNING_EXTERNAL'?'Ready; external Inspire service will be reused and left running on stop.':'Ready; Start launches Inspire first, then the whitelisted teleop listener.';
+  else if(state==='RUNNING') detail=inspireState==='RUNNING_MANAGED'?'Listener + dashboard-managed Inspire service are running.':'Dashboard-managed listener is running; Inspire is externally owned.';
+  else if(state==='STOPPING') detail='Controlled listener stop requested; Inspire stops only after controller handback/exit.';
+  else if(state==='RUNNING_EXTERNAL') detail='Teleop listener is already running outside this dashboard. Lifecycle and XR actions are locked here.';
+  else if(controllerStatus.last_error) detail=controllerStatus.last_error;
+  else if(inspire.error) detail=`Inspire dependency: ${inspire.error}`;
+  else if(controllerStatus.enabled===false) detail='Process actions disabled by dashboard startup configuration.';
+  $('controllerProcessDetail').textContent=detail;
+  $('controllerConfigureBtn').disabled=controllerActionBusy || !controllerStatus.can_start;
+  $('controllerConfigureBtn').textContent=state==='STOPPED'?'Configure & start':'Configure & start';
+  $('controllerStopBtn').disabled=controllerActionBusy || state!=='RUNNING' || !controllerStatus.can_stop;
+  if(state==='STOPPING') $('controllerStopBtn').textContent='Stopping…'; else $('controllerStopBtn').textContent='Stop listener';
+}
+async function pollControllerProcess(){
+  if(controllerPollBusy)return; controllerPollBusy=true;
+  try{
+    const r=await fetch('/api/controller',{cache:'no-store'});
+    if(!r.ok) throw new Error(`HTTP ${r.status}`);
+    renderControllerProcess(await r.json());
+  }catch(err){
+    setChip($('controllerProcessChip'),'CTRL OFFLINE','warn');
+    setChip($('controllerProcessState'),'OFFLINE','warn');
+    $('controllerProcessDetail').textContent='Controller process manager endpoint unavailable.';
+    $('controllerConfigureBtn').disabled=true; $('controllerStopBtn').disabled=true;
+    console.debug('controller process manager unavailable',err);
+  }finally{controllerPollBusy=false;}
+}
+async function loadControllerConfig(){
+  if(controllerConfig)return controllerConfig;
+  const r=await fetch('/api/controller/config',{cache:'no-store'});
+  if(!r.ok)throw new Error(`controller config HTTP ${r.status}`);
+  controllerConfig=await r.json();
+  return controllerConfig;
+}
+function setControllerModalError(message){
+  const el=$('controllerModalError');
+  if(!message){el.textContent='';el.classList.add('hidden');return;}
+  el.textContent=message; el.classList.remove('hidden');
+}
+function shellPreviewArg(arg){
+  const s=String(arg); return /^[A-Za-z0-9_./:=+-]+$/.test(s)?s:`'${s.replaceAll("'","'\\''")}'`;
+}
+function controllerParamValue(spec){
+  const input=$(`controller-param-${spec.name}`);
+  if(!input)return spec.default;
+  if(spec.type==='bool')return !!input.checked;
+  const x=Number(input.value);
+  return spec.type==='int'?Math.round(x):x;
+}
+function controllerModalParameters(){
+  const out={};
+  for(const spec of controllerConfig?.parameter_specs||[])out[spec.name]=controllerParamValue(spec);
+  return out;
+}
+function updateControllerCommandPreview(){
+  if(!controllerConfig)return;
+  const cmd=[controllerConfig.controller_python,controllerConfig.controller_script,...(controllerConfig.fixed_args||[])];
+  for(const spec of controllerConfig.parameter_specs||[]){
+    const value=controllerParamValue(spec);
+    if(spec.type==='bool'){if(value)cmd.push(spec.flag);}
+    else cmd.push(`${spec.flag}=${value}`);
+  }
+  $('controllerCommandPreview').textContent=cmd.map(shellPreviewArg).join(' \\\n  ');
+}
+function setControllerParam(spec,value){
+  const input=$(`controller-param-${spec.name}`); if(!input)return;
+  if(spec.type==='bool'){input.checked=!!value;return;}
+  input.value=String(value);
+  const range=$(`controller-range-${spec.name}`); if(range)range.value=String(value);
+}
+function resetControllerDefaults(){
+  if(!controllerConfig)return;
+  for(const spec of controllerConfig.parameter_specs||[])setControllerParam(spec,controllerConfig.known_good?.[spec.name]??spec.default);
+  updateControllerCommandPreview(); setControllerModalError('');
+}
+function makeControllerParamRow(spec){
+  const row=document.createElement('div');
+  row.className=`controller-param-row${spec.type==='bool'?' controller-bool-row':''}`;
+  const label=document.createElement('label'); label.textContent=spec.label; label.title=`${spec.flag}${spec.unit?` · ${spec.unit}`:''}`;
+  if(spec.type==='bool'){
+    const wrap=document.createElement('label'); wrap.className='toggle';
+    const input=document.createElement('input'); input.type='checkbox'; input.id=`controller-param-${spec.name}`; input.checked=!!spec.default;
+    const text=document.createElement('span'); text.textContent=spec.default?'Enabled':'Disabled';
+    input.addEventListener('change',()=>{text.textContent=input.checked?'Enabled':'Disabled';updateControllerCommandPreview();});
+    wrap.append(input,text); row.append(label,wrap); return row;
+  }
+  const range=document.createElement('input'); range.type='range'; range.id=`controller-range-${spec.name}`; range.min=spec.min; range.max=spec.max; range.step=spec.step; range.value=spec.default;
+  const numWrap=document.createElement('div'); numWrap.className='controller-param-number';
+  const number=document.createElement('input'); number.type='number'; number.id=`controller-param-${spec.name}`; number.min=spec.min; number.max=spec.max; number.step=spec.step; number.value=spec.default;
+  const unit=document.createElement('span'); unit.textContent=spec.unit||'';
+  const sync=(from,to)=>{to.value=from.value;updateControllerCommandPreview();};
+  range.addEventListener('input',()=>sync(range,number)); number.addEventListener('input',()=>sync(number,range));
+  numWrap.append(number,unit); row.append(label,range,numWrap); return row;
+}
+function buildControllerModal(cfg){
+  const locked=$('controllerLockedSettings'); locked.innerHTML='';
+  for(const item of cfg.locked_settings||[]){const d=document.createElement('div');const a=document.createElement('span');a.textContent=item.label;const b=document.createElement('strong');b.textContent=item.value;b.title=item.value;d.append(a,b);locked.appendChild(d);}
+  const sections=$('controllerParameterSections'); sections.innerHTML='';
+  const groups=new Map();
+  for(const spec of cfg.parameter_specs||[]){if(!groups.has(spec.section))groups.set(spec.section,[]);groups.get(spec.section).push(spec);}
+  for(const [name,specs] of groups){
+    const section=document.createElement('section');section.className='controller-param-section';
+    const head=document.createElement('header');head.textContent=name.toUpperCase();
+    const list=document.createElement('div');list.className='controller-param-list';
+    for(const spec of specs)list.appendChild(makeControllerParamRow(spec));
+    section.append(head,list);sections.appendChild(section);
+  }
+  $('controllerModalRuntime').textContent=`${cfg.controller_python} · ${cfg.controller_script}`;
+  resetControllerDefaults();
+}
+function updateControllerStartEnabled(){
+  const cfg=controllerConfig;
+  const ready=!!cfg?.enabled&&!!cfg?.controller_script_exists&&!!cfg?.controller_hash_match&&!!cfg?.controller_python_exists&&controllerStatus?.state==='STOPPED'&&$('controllerSafetyAck').checked&&!controllerActionBusy;
+  $('controllerStartBtn').disabled=!ready;
+}
+async function openControllerModal(){
+  setControllerModalError('');
+  $('controllerModal').classList.remove('hidden');
+  document.body.classList.add('modal-open');
+  $('controllerManagementKey').value=currentManagementKey();
+  $('controllerSafetyAck').checked=false;
+  try{
+    const cfg=await loadControllerConfig();
+    buildControllerModal(cfg);
+    if(!cfg.enabled)setControllerModalError('Process actions are disabled. Restart the dashboard with G1_DASHBOARD_PROCESS_ACTIONS=1.');
+    else if(!cfg.controller_script_exists)setControllerModalError(`Controller script not found: ${cfg.controller_script}`);
+    else if(!cfg.controller_hash_match)setControllerModalError(`Controller hash mismatch. Expected ${cfg.controller_expected_sha256}; got ${cfg.controller_actual_sha256||'unreadable'}. Launch is locked.`);
+    else if(!cfg.controller_python_exists)setControllerModalError(`Controller Python not executable: ${cfg.controller_python}`);
+    else if(cfg?.inspire_dependency?.state==='CONFLICT')setControllerModalError('Multiple/conflicting inspire_g1 processes detected. Resolve them before launching the managed listener.');
+    else if(cfg?.inspire_dependency?.state==='UNAVAILABLE'&&!cfg?.inspire_dependency?.helper_installed)setControllerModalError('Inspire lifecycle setup required on PC2: run sudo ./install_inspire_helper.sh once, then reopen this window.');
+    updateControllerStartEnabled();
+  }catch(err){setControllerModalError(String(err));$('controllerStartBtn').disabled=true;}
+}
+function closeControllerModal(){ $('controllerModal').classList.add('hidden'); document.body.classList.remove('modal-open'); }
+async function controllerPost(path,payload={}){
+  const key=String($('controllerManagementKey')?.value||currentManagementKey()||'').trim();
+  if(!key)throw new Error('Enter the management key first.');
+  const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-G1-Management-Key':key},body:JSON.stringify(payload)});
+  let body={}; try{body=await r.json();}catch{}
+  if(r.status===401){storeManagementKey('');showManagementKeyPrompt('Management key rejected. Enter the key printed by the currently running ./start_dashboard.sh.');}
+  if(!r.ok)throw new Error(body.error||`HTTP ${r.status}`);
+  storeManagementKey(key);
+  if(body.controller)renderControllerProcess(body.controller);
+  return body;
+}
+
+function xrActionButtonLabel(operation){
+  if(operation==='REQUEST_XR')return 'ENTER TELEOP';
+  if(operation==='CANCEL_XR_REQUEST')return 'CANCEL ENTRY';
+  if(operation==='HAND_BACK_ARMS')return 'EXIT TELEOP';
+  if(operation==='TRANSITION_IN_PROGRESS')return 'TRANSITIONING…';
+  return 'TELEOP ACTION';
+}
+function setXrActionResult(text,tone=null){
+  const el=$('xrActionResult'); if(!el)return;
+  el.textContent=text||'';
+  el.classList.remove('good','warn');
+  if(tone)el.classList.add(tone);
+}
+async function requestXrAction(operation){
+  const key=currentManagementKey();
+  if(!key)throw new Error('Enter the management key first.');
+  const r=await fetch('/api/controller/action',{
+    method:'POST',
+    headers:{'Content-Type':'application/json','X-G1-Management-Key':key},
+    body:JSON.stringify({operation})
+  });
+  let body={}; try{body=await r.json();}catch{}
+  if(body.controller)renderControllerProcess(body.controller);
+  if(r.status===401){storeManagementKey('');showManagementKeyPrompt('Management key rejected. Enter the key printed by the currently running ./start_dashboard.sh.');}
+  if(!r.ok){
+    const reason=body?.action?.reason||body?.error||`HTTP ${r.status}`;
+    throw new Error(reason);
+  }
+  return body.action||{};
+}
+$('managementKeySubmitBtn').addEventListener('click',async()=>{
+  if(managementAuthBusy)return;
+  managementAuthBusy=true;$('managementKeySubmitBtn').disabled=true;setManagementKeyError('');
+  try{
+    const key=$('managementKeyInput').value.trim();
+    await verifyManagementKey(key);
+    storeManagementKey(key);
+    const next=managementAfterAuth;
+    closeManagementKeyPrompt();
+    if(next)setTimeout(next,0);
+  }catch(err){setManagementKeyError(err.message||String(err));}
+  finally{managementAuthBusy=false;$('managementKeySubmitBtn').disabled=false;}
+});
+$('managementKeyInput').addEventListener('keydown',(e)=>{if(e.key==='Enter')$('managementKeySubmitBtn').click();});
+$('managementKeyReadOnlyBtn').addEventListener('click',()=>closeManagementKeyPrompt());
+
+$('controllerConfigureBtn').addEventListener('click',()=>{
+  if(!currentManagementKey()){showManagementKeyPrompt('Enter the management key before configuring a managed listener.',()=>openControllerModal());return;}
+  openControllerModal();
+});
+$('controllerModalCloseBtn').addEventListener('click',closeControllerModal);
+$('controllerModalCancelBtn').addEventListener('click',closeControllerModal);
+$('controllerModal').addEventListener('click',(e)=>{if(e.target===$('controllerModal'))closeControllerModal();});
+$('controllerManagementKey').addEventListener('input',()=>storeManagementKey($('controllerManagementKey').value));
+$('controllerSafetyAck').addEventListener('change',updateControllerStartEnabled);
+$('controllerResetDefaultsBtn').addEventListener('click',resetControllerDefaults);
+$('controllerStartBtn').addEventListener('click',async()=>{
+  if(controllerActionBusy)return; controllerActionBusy=true; setControllerModalError(''); $('controllerStartBtn').disabled=true;
+  try{
+    await controllerPost('/api/controller/start',{parameters:controllerModalParameters()});
+    closeControllerModal(); await pollControllerProcess();
+  }catch(err){setControllerModalError(err.message||String(err));}
+  finally{controllerActionBusy=false; renderControllerProcess(controllerStatus||{}); if(!$('controllerModal').classList.contains('hidden'))updateControllerStartEnabled();}
+});
+$('controllerStopBtn').addEventListener('click',async()=>{
+  if(controllerActionBusy)return;
+  if(!currentManagementKey()){showManagementKeyPrompt('Enter the management key to request a controlled listener stop.',$('controllerStopBtn').click.bind($('controllerStopBtn')));return;}
+  if(!window.confirm('Request a controlled stop? The controller performs its normal handback first; a dashboard-managed Inspire server is stopped only after the controller exits.'))return;
+  controllerActionBusy=true;renderControllerProcess(controllerStatus||{});
+  try{await controllerPost('/api/controller/stop',{});await pollControllerProcess();}
+  catch(err){window.alert(`Stop request failed: ${err.message||err}`);}
+  finally{controllerActionBusy=false;renderControllerProcess(controllerStatus||{});}
+});
+
+$('xrActionBtn').addEventListener('click',async()=>{
+  if(xrActionBusy)return;
+  if(!currentManagementKey()){showManagementKeyPrompt('Enter the management key to use ENTER/EXIT TELEOP.',$('xrActionBtn').click.bind($('xrActionBtn')));return;}
+  const handover=latestActionReadiness?.xr_handover||{};
+  const operation=handover.operation||'NONE';
+  if(!['REQUEST_XR','CANCEL_XR_REQUEST','HAND_BACK_ARMS'].includes(operation))return;
+  xrActionBusy=true;
+  $('xrActionBtn').disabled=true;
+  setXrActionResult(`Sending ${xrActionButtonLabel(operation).toLowerCase()} request…`);
+  try{
+    const response=await requestXrAction(operation);
+    setXrActionResult(`${response.status||'ACCEPTED'} · ${response.reason||operation}`,'good');
+  }catch(err){
+    setXrActionResult(err.message||String(err),'warn');
+  }finally{
+    xrActionBusy=false;
+    if(latestEnv?.telemetry)renderActionReadiness(latestEnv.telemetry);
+    await pollControllerProcess();
+  }
+});
+document.addEventListener('keydown',(e)=>{if(e.key==='Escape'&&!$('controllerModal').classList.contains('hidden'))closeControllerModal();});
+
+/* ---------- Camera / teleimager process + WebRTC ---------- */
 function fallbackCameraOffer(){
   const host=window.location.hostname;
   return host ? `https://${host}:60001/offer` : null;
@@ -48,13 +391,205 @@ function cameraBaseFromTelemetry(t){
   try{ const u=new URL(offer); u.pathname='/'; u.search=''; u.hash=''; return u.toString().replace(/\/$/,''); }catch{return null;}
 }
 function cameraOfferFromTelemetry(t){ return val(t,['camera','webrtc_offer_url']) || fallbackCameraOffer(); }
+function cameraProcessTone(state){
+  if(state==='RUNNING'||state==='RUNNING_EXTERNAL')return 'good';
+  if(state==='STOPPING')return 'warn';
+  if(state==='CONFLICT'||state==='UNAVAILABLE')return 'bad';
+  return null;
+}
+function renderCameraProcess(st){
+  cameraProcessStatus=st||{};
+  const state=cameraProcessStatus.state||'UNAVAILABLE';
+  const badge=$('cameraProcessState');
+  const text=state==='RUNNING'?'SERVER ON':state==='RUNNING_EXTERNAL'?'SERVER EXT':state==='STOPPED'?'SERVER OFF':state==='STOPPING'?'SERVER STOPPING':state==='CONFLICT'?'SERVER CONFLICT':'SERVER SETUP';
+  badge.textContent=text;badge.className=`camera-process-state${cameraProcessTone(state)?` ${cameraProcessTone(state)}`:''}`;
+  const connected=!!cameraPc && ['connected','connecting','new'].includes(cameraPc.connectionState||'new');
+  if(state==='RUNNING'){
+    $('cameraStopBtn').textContent='Stop camera';
+    if(!connected)$('cameraStopBtn').classList.remove('hidden');
+  }else if(state==='RUNNING_EXTERNAL'){
+    $('cameraStopBtn').textContent='Disconnect';
+    if(!connected)$('cameraStopBtn').classList.add('hidden');
+  }else if(!connected){
+    $('cameraStopBtn').classList.add('hidden');
+  }
+  if(state==='STOPPED')$('cameraConnectBtn').textContent='Start & connect';
+  else $('cameraConnectBtn').textContent='Connect camera';
+  renderCameraModes();
+  updateCameraButtons(latestEnv?.telemetry||{});
+}
+async function pollCameraProcess(){
+  if(cameraProcessPollBusy)return cameraProcessStatus;
+  cameraProcessPollBusy=true;
+  try{
+    const r=await fetch('/api/camera',{cache:'no-store'});
+    if(!r.ok)throw new Error(`HTTP ${r.status}`);
+    const st=await r.json();renderCameraProcess(st);return st;
+  }catch(err){
+    cameraProcessStatus={state:'UNAVAILABLE',can_start:false,can_stop:false,last_error:String(err)};
+    renderCameraProcess(cameraProcessStatus);
+    console.debug('camera process endpoint unavailable',err);
+    return cameraProcessStatus;
+  }finally{cameraProcessPollBusy=false;}
+}
+async function cameraProcessPost(path,payload={}){
+  const key=currentManagementKey();
+  if(!key)throw new Error('Enter the management key first.');
+  const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-G1-Management-Key':key},body:JSON.stringify(payload||{})});
+  let body={};try{body=await r.json();}catch{}
+  if(r.status===401){storeManagementKey('');showManagementKeyPrompt('Management key rejected. Enter the key printed by the currently running ./start_dashboard.sh.');}
+  if(!r.ok)throw new Error(body.error||`HTTP ${r.status}`);
+  if(body.camera)renderCameraProcess(body.camera);
+  return body.camera||cameraProcessStatus;
+}
+function cameraModeLabel(mode){
+  return ({rgb:'RGB',depth:'DEPTH',overlay:'OVERLAY',near:'NEAR',disparity:'DISPARITY',pointcloud:'POINT CLOUD',topdown:'TOP-DOWN'})[mode]||String(mode||'—').toUpperCase();
+}
+function renderCameraModes(){
+  const st=cameraProcessStatus||{};
+  const requested=st.mode_requested||'rgb';
+  const actual=st.mode_actual||null;
+  const controllable=!!st.mode_control && st.state==='RUNNING';
+  document.querySelectorAll('[data-camera-mode]').forEach(btn=>{
+    const mode=btn.dataset.cameraMode;
+    btn.classList.toggle('active',mode===requested);
+    btn.disabled=!controllable || cameraModeActionBusy;
+    btn.title=controllable?'Switch the shared Teleimager WebRTC output without reconnecting.':'Mode switching requires the dashboard-managed RealSense camera server.';
+  });
+  const badge=$('cameraModeState');
+  if(badge){
+    const waiting=controllable && actual!==requested;
+    badge.textContent=waiting?`MODE ${cameraModeLabel(requested)}…`:`MODE ${cameraModeLabel(actual||requested)}`;
+    badge.className=`camera-mode-state${waiting?' warn':actual?' good':''}`;
+  }
+  renderPointViewControls();
+}
+
+const POINT_VIEW_DEFAULT={yaw_deg:22,pitch_deg:14,distance_m:3.16,target_z_m:2.0};
+function pointClamp(x,lo,hi){return Math.max(lo,Math.min(hi,Number(x)));}
+function normalizePointView(raw={}){
+  return {
+    yaw_deg:pointClamp(finite(raw.yaw_deg)?raw.yaw_deg:POINT_VIEW_DEFAULT.yaw_deg,-180,180),
+    pitch_deg:pointClamp(finite(raw.pitch_deg)?raw.pitch_deg:POINT_VIEW_DEFAULT.pitch_deg,-82,82),
+    distance_m:pointClamp(finite(raw.distance_m)?raw.distance_m:POINT_VIEW_DEFAULT.distance_m,1,8),
+    target_z_m:pointClamp(finite(raw.target_z_m)?raw.target_z_m:POINT_VIEW_DEFAULT.target_z_m,.5,5),
+  };
+}
+function pointCloudActive(){return (cameraProcessStatus?.mode_requested||'rgb')==='pointcloud'&&cameraProcessStatus?.state==='RUNNING';}
+function currentPointView(){return normalizePointView(PointCloud3D.getView?.()||pointViewLocal||POINT_VIEW_DEFAULT);}
+
+async function syncPointViewToCamera(view){
+  // Local WebGL orbit never requires authentication. If management access is
+  // unlocked, sync only the final viewpoint to the server-rendered WebRTC
+  // point cloud so the headset roughly follows without making drag latency
+  // depend on HTTP/H.264 round trips.
+  if(pointViewSendBusy||!currentManagementKey()||cameraProcessStatus?.state!=='RUNNING'||!cameraProcessStatus?.point_view_control)return;
+  pointViewSendBusy=true;
+  try{
+    const st=await cameraProcessPost('/api/camera/view',{view:normalizePointView(view)});
+    if(st)cameraProcessStatus=st;
+  }catch(err){console.warn('headset point-view sync failed',err);}
+  finally{pointViewSendBusy=false;renderPointViewControls();}
+}
+
+const pointCloudViewer=PointCloud3D.init($('pointCloudCanvas'),(view,final)=>{
+  pointViewLocal=normalizePointView(view);
+  renderPointViewControls();
+  if(final)syncPointViewToCamera(pointViewLocal);
+});
+PointCloud3D.setView(POINT_VIEW_DEFAULT,false);
+
+function updatePointCloudReadout(){
+  const readout=$('pointViewReadout');if(!readout)return;
+  const v=currentPointView(),st=PointCloud3D.getStats();
+  const points=st.points?`${(st.points/1000).toFixed(st.points>=10000?0:1)}k pts`:'waiting';
+  const hz=st.dataHz>0?`${st.dataHz.toFixed(0)} Hz`:'— Hz';
+  readout.textContent=`Y ${v.yaw_deg>=0?'+':''}${v.yaw_deg.toFixed(0)}° · P ${v.pitch_deg>=0?'+':''}${v.pitch_deg.toFixed(0)}° · ${v.distance_m.toFixed(1)}m · ${points} · ${hz}`;
+}
+function renderPointViewControls(){
+  const strip=$('pointViewStrip');if(!strip)return;
+  const show=(cameraProcessStatus?.mode_requested||'rgb')==='pointcloud'&&cameraProcessStatus?.state==='RUNNING';
+  strip.classList.toggle('hidden',!show);
+  strip.querySelectorAll('[data-point-view-preset]').forEach(b=>b.disabled=!show);
+  const stage=$('cameraStage');
+  if(stage)stage.classList.toggle('pointcloud-webgl-active',show);
+  PointCloud3D.setVisible(show);
+  if(show&&!pointViewInitialized){
+    const initial=normalizePointView(cameraProcessStatus?.point_view_actual||cameraProcessStatus?.point_view_requested||POINT_VIEW_DEFAULT);
+    PointCloud3D.setView(initial,false);pointViewInitialized=true;
+  }
+  updatePointCloudReadout();
+  if(show)ensurePointCloudPoll();
+}
+async function pollPointCloud(){
+  pointCloudPollTimer=null;
+  if(!pointCloudActive())return;
+  if(pointCloudFetchBusy){ensurePointCloudPoll();return;}
+  pointCloudFetchBusy=true;
+  try{
+    const r=await fetch('/api/camera/pointcloud',{cache:'no-store'});
+    if(r.ok&&r.status!==204){
+      const b=await r.arrayBuffer();
+      PointCloud3D.setSnapshot(b);
+      updatePointCloudReadout();
+    }
+  }catch(err){console.debug('point-cloud snapshot unavailable',err);}
+  finally{pointCloudFetchBusy=false;if(pointCloudActive())pointCloudPollTimer=setTimeout(pollPointCloud,65);}
+}
+function ensurePointCloudPoll(){
+  if(!pointCloudActive()||pointCloudPollTimer||pointCloudFetchBusy)return;
+  pointCloudPollTimer=setTimeout(pollPointCloud,0);
+}
+const POINT_VIEW_PRESETS={
+  front:{yaw_deg:0,pitch_deg:0,distance_m:3.0,target_z_m:2.0},
+  left:{yaw_deg:-70,pitch_deg:12,distance_m:3.35,target_z_m:2.0},
+  right:{yaw_deg:70,pitch_deg:12,distance_m:3.35,target_z_m:2.0},
+  above:{yaw_deg:0,pitch_deg:78,distance_m:3.8,target_z_m:2.0},
+  reset:POINT_VIEW_DEFAULT,
+};
+function applyPointViewPreset(name){
+  const preset=POINT_VIEW_PRESETS[name];if(!preset)return;
+  pointViewLocal=normalizePointView(preset);
+  PointCloud3D.setView(pointViewLocal,true);
+  updatePointCloudReadout();
+}
+
+async function setCameraMode(mode){
+  mode=String(mode||'').toLowerCase();
+  if(!['rgb','depth','overlay','near','disparity','pointcloud','topdown'].includes(mode)||cameraModeActionBusy)return;
+  if(!currentManagementKey()){
+    showManagementKeyPrompt('Enter the management key to switch the shared camera view.',()=>setCameraMode(mode));
+    return;
+  }
+  if(cameraProcessStatus?.state!=='RUNNING'||!cameraProcessStatus?.mode_control){
+    window.alert('Camera modes are available only while the dashboard-managed RealSense camera server is running.');
+    return;
+  }
+  cameraModeActionBusy=true;
+  renderCameraModes();
+  try{
+    const st=await cameraProcessPost('/api/camera/mode',{mode});
+    if(st)renderCameraProcess(st);
+  }catch(err){
+    window.alert(`Camera mode switch failed: ${err.message||err}`);
+  }finally{
+    cameraModeActionBusy=false;
+    await pollCameraProcess();
+    renderCameraModes();
+  }
+}
+document.querySelectorAll('[data-camera-mode]').forEach(btn=>btn.addEventListener('click',()=>setCameraMode(btn.dataset.cameraMode)));
+document.querySelectorAll('[data-point-view-preset]').forEach(btn=>btn.addEventListener('click',()=>applyPointViewPreset(btn.dataset.pointViewPreset)));
+
 function updateCameraButtons(t){
   const base=cameraBaseFromTelemetry(t);
   cameraUrl=cameraOfferFromTelemetry(t);
   const link=$('cameraTrustLink');
   if(base){ link.href=base; link.classList.remove('hidden'); } else { link.removeAttribute('href'); link.classList.add('hidden'); }
   const configured=val(t,['camera','webrtc_enabled'], cameraUrl?true:false);
-  $('cameraConnectBtn').disabled=!configured || !cameraUrl || cameraConnecting;
+  const state=cameraProcessStatus?.state||'UNAVAILABLE';
+  const serverActionable=state==='RUNNING'||state==='RUNNING_EXTERNAL'||(state==='STOPPED'&&cameraProcessStatus?.can_start);
+  $('cameraConnectBtn').disabled=!configured || !cameraUrl || cameraConnecting || cameraProcessActionBusy || !serverActionable;
 }
 function cameraState(text,tone,detail){
   $('cameraStateText').textContent=text;
@@ -69,8 +604,10 @@ function stopCamera({silent=false}={}){
   cameraConnecting=false; cameraFallback=false;
   $('cameraOverlay').classList.remove('hidden');
   $('cameraOverlayTitle').textContent='Camera not connected';
-  $('cameraOverlayText').textContent='Start teleimager, then connect.';
-  $('cameraConnectBtn').classList.remove('hidden'); $('cameraStopBtn').classList.add('hidden');
+  $('cameraOverlayText').textContent=cameraProcessStatus?.state==='RUNNING'?'teleimager is running; connect when ready.':'Click Start & connect to launch teleimager.';
+  $('cameraConnectBtn').classList.remove('hidden');
+  if(cameraProcessStatus?.state==='RUNNING'){$('cameraStopBtn').textContent='Stop camera';$('cameraStopBtn').classList.remove('hidden');}
+  else $('cameraStopBtn').classList.add('hidden');
   if(!silent) cameraState('OFFLINE',null);
 }
 async function waitIceComplete(pc,timeoutMs=3500){
@@ -106,6 +643,7 @@ async function connectCamera(codec=null){
       const v=$('cameraVideo'); v.srcObject=evt.streams[0]; v.play().catch(()=>{});
       $('cameraOverlay').classList.add('hidden');
       $('cameraConnectBtn').classList.add('hidden'); $('cameraStopBtn').classList.remove('hidden');
+      $('cameraStopBtn').textContent=cameraProcessStatus?.state==='RUNNING'?'Stop camera':'Disconnect';
       cameraState('LIVE','good');
       const t0=v.currentTime;
       cameraFrameWatch=setTimeout(()=>{
@@ -119,12 +657,54 @@ async function connectCamera(codec=null){
   }catch(err){
     console.error('camera connection failed',err); stopCamera({silent:true});
     $('cameraOverlayTitle').textContent='Camera connection failed';
-    $('cameraOverlayText').textContent='Camera may be occupied, teleimager may be down, or its certificate may need trust.';
+    $('cameraOverlayText').textContent='teleimager may still be starting, the camera may be occupied, or its certificate may need trust.';
     cameraState('ERROR','bad');
-  }finally{ cameraConnecting=false; $('cameraConnectBtn').disabled=false; }
+  }finally{ cameraConnecting=false; updateCameraButtons(latestEnv?.telemetry||{}); }
 }
-$('cameraConnectBtn').addEventListener('click',()=>connectCamera());
-$('cameraStopBtn').addEventListener('click',()=>stopCamera());
+async function startAndConnectCamera(){
+  if(cameraProcessActionBusy||cameraConnecting)return;
+  let st=await pollCameraProcess();
+  if(st?.state==='STOPPED'){
+    if(!currentManagementKey()){showManagementKeyPrompt('Enter the management key to start the camera server.',()=>startAndConnectCamera());return;}
+    cameraProcessActionBusy=true;updateCameraButtons(latestEnv?.telemetry||{});
+    $('cameraOverlayTitle').textContent='Starting camera server…';
+    $('cameraOverlayText').textContent='Launching the dashboard-managed RealSense Teleimager stream on PC2.';
+    cameraState('STARTING','warn');
+    try{st=await cameraProcessPost('/api/camera/start');}
+    catch(err){cameraState('ERROR','bad',err.message||String(err));window.alert(`Camera server start failed: ${err.message||err}`);return;}
+    finally{cameraProcessActionBusy=false;}
+  }
+  if(st?.state==='CONFLICT'||st?.state==='UNAVAILABLE'||st?.state==='STOPPING'){
+    cameraState('ERROR','bad',st?.last_error||`Camera process state: ${st?.state||'unknown'}`);return;
+  }
+  // teleimager process starts before its HTTPS/WebRTC socket. Give it a bounded
+  // readiness window, then attempt the normal WebRTC negotiation.
+  for(let i=0;i<24;i++){
+    st=await pollCameraProcess();
+    if(st?.port_ready)break;
+    if(!['RUNNING','RUNNING_EXTERNAL'].includes(st?.state))break;
+    await new Promise(resolve=>setTimeout(resolve,250));
+  }
+  await connectCamera();
+}
+async function stopCameraButton(){
+  if(cameraProcessActionBusy)return;
+  const st=await pollCameraProcess();
+  if(st?.state==='RUNNING'){
+    if(!currentManagementKey()){showManagementKeyPrompt('Enter the management key to stop the camera server.',()=>stopCameraButton());return;}
+    if(!window.confirm('Stop the dashboard-managed camera server? The browser video connection will close first.'))return;
+    stopCamera({silent:true});
+    cameraProcessActionBusy=true;updateCameraButtons(latestEnv?.telemetry||{});
+    try{await cameraProcessPost('/api/camera/stop');cameraState('OFFLINE',null,'teleimager stop requested.');}
+    catch(err){window.alert(`Camera stop failed: ${err.message||err}`);}
+    finally{cameraProcessActionBusy=false;await pollCameraProcess();}
+    return;
+  }
+  // Never stop an externally-owned camera server from the dashboard.
+  stopCamera();
+}
+$('cameraConnectBtn').addEventListener('click',()=>startAndConnectCamera());
+$('cameraStopBtn').addEventListener('click',()=>stopCameraButton());
 
 /* ---------- Robot twin ---------- */
 function jointGroup(i){
@@ -247,19 +827,23 @@ function updateFaultBanner(env,t){
 
 function renderActionReadiness(t){
   const actions=t?.actions||{}, handover=actions?.xr_handover||{}, cond=actions?.engagement_conditions||{};
+  latestActionReadiness=actions;
   const has=!!actions?.schema;
   const available=has && handover?.available===true;
-  const label=has?(handover?.label||'No action'):'Controller V1.8 required';
+  const label=has?(handover?.label||'No action'):'Controller action telemetry required';
   const operation=has?(handover?.operation||'NONE'):'—';
   const next=has?(handover?.would_enter_state||'—'):'—';
-  const reason=has?(handover?.reason||'—'):'Read-only action readiness requires controller V1.8.';
+  const reason=has?(handover?.reason||'—'):'Controller action-readiness telemetry required.';
   const channel=actions?.request_channel_enabled===true;
+  const managerReady=controllerStatus?.can_request_action===true;
 
   $('actionLabel').textContent=label;
   $('actionOperation').textContent=operation;
   $('actionNextState').textContent=next;
   $('actionReason').textContent=reason;
-  setChip($('actionReadinessChip'),has?(available?'READY':'BLOCKED'):'READ ONLY',has?(available?'good':'warn'):null);
+  const readinessText=!has?'READ ONLY':!channel?'READ ONLY':available?'READY':'BLOCKED';
+  const readinessTone=has&&channel?(available?'good':'warn'):null;
+  setChip($('actionReadinessChip'),readinessText,readinessTone);
 
   const condChip=(id,text,ok,neutral=false)=>{const el=$(id); el.textContent=text; el.classList.toggle('cond-good',!!ok); el.classList.toggle('cond-warn',!ok&&!neutral); el.classList.toggle('cond-neutral',!!neutral);};
   condChip('actionCondLowstate',`LOW ${cond.lowstate_ok?'OK':'BAD'}`,cond.lowstate_ok===true,!has);
@@ -267,13 +851,25 @@ function renderActionReadiness(t){
   condChip('actionCondStop',`STOP ${cond.stop_gate_ready?'READY':cond.stop_gate_instant?'TIMING':'WAIT'}`,cond.stop_gate_ready===true,!has);
   condChip('actionCondFault',`FAULT ${cond.safety_fault_clear?'CLEAR':'HOLD'}`,cond.safety_fault_clear===true,!has);
 
-  setChip($('statusActionChip'),has?(available?'READY':'BLOCKED'):'READ ONLY',has?(available?'good':'warn'):null);
+  const actionBtn=$('xrActionBtn');
+  actionBtn.textContent=xrActionButtonLabel(operation);
+  actionBtn.disabled=xrActionBusy || !channel || !available || !managerReady || !['REQUEST_XR','CANCEL_XR_REQUEST','HAND_BACK_ARMS'].includes(operation);
+  actionBtn.classList.toggle('danger-btn',operation==='HAND_BACK_ARMS');
+  actionBtn.classList.toggle('primary-btn',operation!=='HAND_BACK_ARMS');
+  if(!xrActionBusy){
+    if(!channel)setXrActionResult('Controller request channel disabled.');
+    else if(!managerReady)setXrActionResult('Start the listener from this dashboard to enable XR requests.');
+    else if(!available)setXrActionResult(reason,'warn');
+    else setXrActionResult('Controller will re-check this action when clicked.');
+  }
+
+  setChip($('statusActionChip'),readinessText,readinessTone);
   $('statusActionLabel').textContent=label;
   $('statusActionOperation').textContent=operation;
   $('statusActionNextState').textContent=next;
   $('statusActionChannel').textContent=channel?'ENABLED':'DISABLED';
   setTone($('statusActionChannel'),channel?'good':null);
-  $('statusActionReason').textContent=reason+(channel?'':' Browser requests are intentionally disabled in this revision.');
+  $('statusActionReason').textContent=reason+(channel?'':' Browser requests are unavailable until the controller action channel is enabled.');
 }
 
 function render(env){
@@ -312,7 +908,7 @@ function render(env){
   $('handFeedbackDetail').textContent=handFbFault?`STALE ${n(handFbAge,2,'s')}`:handFbValid?`${n(handFbAge,2,'s')}`:'INVALID RANGE';
   setTone($('handFeedbackDetail'),handFbFault||!handFbValid?'warn':'good');
   $('handRetargets').textContent=val(t,['hands','retarget_count'],'—'); $('handReacquire').textContent=val(t,['hands','reacquire_ready'])?'READY':`${val(t,['hands','reacquire_count'],0)}/${val(t,['hands','reacquire_required_frames'],'—')}`; $('thumbStatus').textContent=val(t,['controller','symmetric_thumb_rotation'])===false?'NO':'YES';
-  const c=t.camera||{}; const res=c.width&&c.height?`${c.width}×${c.height}`:'—'; $('cameraMeta').textContent=`${res} · ${n(c.display_fps,0,' fps')} · ${c.display_mode||'—'}`; $('cameraHudInfo').textContent=$('cameraMeta').textContent; $('statusCamera').textContent=c.webrtc_enabled?`WebRTC ${res}`:'disabled'; updateCameraButtons(t); if(!cameraPc&&!cameraConnecting)setChip($('cameraChip'),c.webrtc_enabled?'CAMERA OFFLINE':'CAMERA OFF',c.webrtc_enabled?'warn':null);
+  const c=t.camera||{}; const res=c.width&&c.height?`${c.width}×${c.height}`:'—'; const sharedMode=cameraProcessStatus?.mode_actual||cameraProcessStatus?.mode_requested||'rgb'; $('cameraMeta').textContent=`${res} · ${n(c.display_fps,0,' fps')} · ${cameraModeLabel(sharedMode)}`; $('cameraHudInfo').textContent=`${res} · ${n(c.display_fps,0,' fps')} · ${cameraModeLabel(sharedMode)} · shared with headset`; $('statusCamera').textContent=c.webrtc_enabled?`WebRTC ${res}`:'disabled'; updateCameraButtons(t); if(!cameraPc&&!cameraConnecting)setChip($('cameraChip'),c.webrtc_enabled?'CAMERA OFFLINE':'CAMERA OFF',c.webrtc_enabled?'warn':null);
   updateFaultBanner(env,t); renderEvents(env);
 }
 
@@ -332,6 +928,43 @@ const duration = (sec) => {
 function endpointState(id,on){ const el=$(id); if(!el)return; el.textContent=on?'LISTENING':'OFFLINE'; setTone(el,on?'good':'warn'); }
 function processState(id,count){ const el=$(id); if(!el)return; const n=Number(count||0); el.textContent=n>0?`${n} running`:'not found'; setTone(el,n>0?'good':'warn'); }
 let lastRobotServices=[];
+let serviceControlConfig=null;
+let serviceControlPollBusy=false;
+let serviceActionBusyName=null;
+
+const serviceEnabled=(s)=>typeof s?.enabled==='boolean'?s.enabled:Number(s?.status)===0?true:Number(s?.status)===1?false:null;
+function servicePolicyFor(svc){
+  const name=String(svc?.name||'');
+  if(svc?.protect)return 'PROTECTED';
+  const p=serviceControlConfig?.policy||{};
+  if(Array.isArray(p.hard_deny_services)&&p.hard_deny_services.includes(name))return 'PROTECTED';
+  if(Array.isArray(p.read_only_services)&&p.read_only_services.includes(name))return 'READ_ONLY';
+  if(Array.isArray(p.allowed_services)&&p.allowed_services.includes(name))return 'ALLOWED';
+  return 'UNKNOWN';
+}
+function renderServiceControlConfig(cfg){
+  serviceControlConfig=cfg||{};
+  const enabled=!!serviceControlConfig.enabled;
+  const worker=serviceControlConfig.worker||{};
+  const ready=enabled&&worker.status==='READY';
+  setChip($('serviceControlChip'),ready?'CONTROL READY':enabled?'CONTROL OFFLINE':'CONTROL OFF',ready?'good':enabled?'warn':null);
+  if($('serviceControlChip'))$('serviceControlChip').title=worker.reason||'';
+  renderServiceList();
+}
+async function pollServiceControl(){
+  if(serviceControlPollBusy)return;
+  serviceControlPollBusy=true;
+  try{
+    const r=await fetch('/api/services/control',{cache:'no-store'});
+    if(!r.ok)throw new Error(`HTTP ${r.status}`);
+    renderServiceControlConfig(await r.json());
+  }catch(err){
+    serviceControlConfig={enabled:false,worker:{status:'OFFLINE',reason:String(err)},policy:{}};
+    setChip($('serviceControlChip'),'CONTROL OFFLINE','warn');
+    console.debug('service control endpoint unavailable',err);
+    renderServiceList();
+  }finally{serviceControlPollBusy=false;}
+}
 function renderRobotServices(api){
   const available=!!api?.available;
   setChip($('robotStateChip'),available?'API ONLINE':api?.enabled===false?'API OFF':'API UNAVAILABLE',available?'good':api?.enabled===false?null:'warn');
@@ -342,39 +975,99 @@ function renderRobotServices(api){
   setTone($('robotStateVersionMatch'),match===true?'good':match===false?'warn':null);
   $('robotStateServiceCount').textContent=finite(api?.service_count)?String(api.service_count):'—';
   const err=$('robotStateError');
-  if(api?.error){err.textContent=api.error;}else{err.textContent=api?.module?`read-only via ${api.module}`:'read-only service inventory';}
+  if(api?.error){err.textContent=api.error;}else{err.textContent=api?.module?`inventory via ${api.module} · writes isolated in allowlisted worker`:'service inventory';}
   err.classList.remove('hidden');
   lastRobotServices=Array.isArray(api?.services)?api.services:[];
   renderServiceList();
 }
+function servicePolicyClassName(policy){return String(policy||'UNKNOWN').toLowerCase();}
 function renderServiceList(){
   const list=$('robotServiceList'); if(!list)return;
   list.innerHTML='';
-  const filter=String($('serviceFilter')?.value||'').trim().toLowerCase();
+  const textFilter=String($('serviceFilter')?.value||'').trim().toLowerCase();
+  const stateFilter=String($('serviceStateFilter')?.value||'ALL');
+  const policyFilter=String($('servicePolicyFilter')?.value||'ALL');
   const all=Array.isArray(lastRobotServices)?lastRobotServices:[];
-  const services=filter?all.filter(s=>String(s?.name||'').toLowerCase().includes(filter)):all;
-  // Unitree RobotState service status polarity is 0 = ON, 1 = OFF.
-  // New monitor packets publish `enabled`; fall back to the raw Unitree status
-  // for compatibility with a monitor that was started before this UI update.
-  const serviceEnabled=(s)=>typeof s?.enabled==='boolean'?s.enabled:Number(s?.status)===0?true:Number(s?.status)===1?false:null;
-  const on=all.filter(s=>serviceEnabled(s)===true).length;
-  const off=all.filter(s=>serviceEnabled(s)===false).length;
-  const unknown=all.length-on-off;
-  const protectedCount=all.filter(s=>!!s?.protect).length;
+  const classified=all.map(s=>({svc:s,enabled:serviceEnabled(s),policy:servicePolicyFor(s)}));
+  const services=classified.filter(({svc,enabled,policy})=>{
+    if(textFilter&&!String(svc?.name||'').toLowerCase().includes(textFilter))return false;
+    if(stateFilter==='ON'&&enabled!==true)return false;
+    if(stateFilter==='OFF'&&enabled!==false)return false;
+    if(policyFilter!=='ALL'&&policy!==policyFilter)return false;
+    return true;
+  });
+  const on=classified.filter(x=>x.enabled===true).length;
+  const off=classified.filter(x=>x.enabled===false).length;
+  const unknownState=all.length-on-off;
+  const allowedCount=classified.filter(x=>x.policy==='ALLOWED').length;
+  const protectedCount=classified.filter(x=>x.policy==='PROTECTED').length;
   const counts=$('robotServiceCounts');
-  if(counts) counts.textContent=`${on} on · ${off} off${unknown?` · ${unknown} unknown`:''} · ${protectedCount} protected${filter?` · ${services.length} shown`:''}`;
-  if(!services.length){list.innerHTML=`<div class="empty">${all.length?'No matching services':'No service inventory yet'}</div>`;return;}
-  for(const svc of services){
+  const filtering=!!textFilter||stateFilter!=='ALL'||policyFilter!=='ALL';
+  if(counts)counts.textContent=`${on} on · ${off} off${unknownState?` · ${unknownState} state?`:''} · ${allowedCount} allowed · ${protectedCount} protected${filtering?` · ${services.length} shown`:''}`;
+  if(!services.length){list.innerHTML=`<div class="empty">${all.length?'No services match the active filters':'No service inventory yet'}</div>`;return;}
+  const workerReady=!!serviceControlConfig?.enabled&&serviceControlConfig?.worker?.status==='READY';
+  for(const {svc,enabled,policy} of services){
     const row=document.createElement('div'); row.className='service-row';
     const name=document.createElement('span'); name.className='service-name'; name.textContent=String(svc?.name||'?'); name.title=name.textContent;
-    const protect=document.createElement('span'); protect.className='service-protect'; protect.textContent=svc?.protect?'PROTECTED':'—';
+    const policyEl=document.createElement('span'); policyEl.className=`service-policy ${servicePolicyClassName(policy)}`; policyEl.textContent=policy==='READ_ONLY'?'READ ONLY':policy;
+    if(svc?.protect)policyEl.title='Unitree RobotState protect flag is set';
     const state=document.createElement('strong');
-    const enabled=serviceEnabled(svc), rawStatus=Number(svc?.status);
+    const rawStatus=Number(svc?.status);
     state.textContent=enabled===true?'ON':enabled===false?'OFF':`STATE ${Number.isFinite(rawStatus)?rawStatus:'—'}`;
-    state.title=Number.isFinite(rawStatus)?`Unitree raw service status: ${rawStatus} (0=ON, 1=OFF)`:'';
-    if(enabled===true) state.className='good-text'; else if(enabled===false) state.className='dim'; else state.className='warn-text';
-    row.append(name,protect,state); list.appendChild(row);
+    state.title=Number.isFinite(rawStatus)?`Unitree raw service status: ${rawStatus} (0=ON, 1=OFF)`:'unknown service state';
+    if(enabled===true)state.className='good-text';else if(enabled===false)state.className='dim';else state.className='warn-text';
+    const control=document.createElement('span');control.className='service-control-cell';
+    if(serviceActionBusyName===name.textContent){
+      const busy=document.createElement('span');busy.className='service-switching';busy.textContent='SWITCHING…';control.appendChild(busy);
+    }else if(policy==='ALLOWED'&&enabled!==null){
+      const label=document.createElement('label');label.className='service-switch';label.title=workerReady?'Switch service through verified RobotState action worker':'Service action worker is not ready';
+      const input=document.createElement('input');input.type='checkbox';input.checked=enabled===true;input.disabled=!workerReady;
+      const track=document.createElement('span');track.className='service-switch-track';
+      input.addEventListener('change',()=>{
+        const desired=input.checked; input.checked=enabled===true;
+        requestServiceState(name.textContent,desired);
+      });
+      label.append(input,track);control.appendChild(label);
+    }else{
+      const na=document.createElement('span');na.className='service-control-na';na.textContent=policy==='PROTECTED'?'LOCKED':'—';control.appendChild(na);
+    }
+    row.append(name,policyEl,state,control);list.appendChild(row);
   }
+}
+async function postServiceState(name,enabled){
+  const key=currentManagementKey();
+  if(!key)throw new Error('Enter the management key first.');
+  const r=await fetch('/api/services/set',{
+    method:'POST',headers:{'Content-Type':'application/json','X-G1-Management-Key':key},
+    body:JSON.stringify({service:name,enabled})
+  });
+  let body={};try{body=await r.json();}catch{}
+  if(r.status===401){storeManagementKey('');showManagementKeyPrompt('Management key rejected. Enter the key printed by the currently running ./start_dashboard.sh.');}
+  if(!r.ok)throw new Error(body?.service_action?.reason||body.error||`HTTP ${r.status}`);
+  return body.service_action||{};
+}
+async function requestServiceState(name,enabled){
+  if(serviceActionBusyName)return;
+  const desiredWord=enabled?'ON':'OFF';
+  if(!currentManagementKey()){
+    showManagementKeyPrompt(`Enter the management key to switch ${name} ${desiredWord}.`,()=>requestServiceState(name,enabled));
+    return;
+  }
+  if(!window.confirm(`Switch Unitree service "${name}" ${desiredWord}?\n\nOnly explicitly ALLOWED services can reach ServiceSwitch. The worker will re-read ServiceList and report success only if the requested state is verified.`))return;
+  serviceActionBusyName=name;renderServiceList();
+  try{
+    const action=await postServiceState(name,enabled);
+    if(action?.after){
+      const idx=lastRobotServices.findIndex(s=>String(s?.name||'')===name);
+      if(idx>=0)lastRobotServices[idx]={...lastRobotServices[idx],...action.after};
+    }
+    renderServiceList();
+    await pollSystem();
+  }catch(err){
+    window.alert(`Service switch failed: ${err.message||err}`);
+    await pollServiceControl();
+    await pollSystem();
+  }finally{serviceActionBusyName=null;renderServiceList();}
 }
 function renderBaseSensing(base){
   const imu=base?.imu||{}, odom=base?.odometry||{};
@@ -454,6 +1147,8 @@ function renderSystem(env){
   renderBaseSensing(sys.base_sensing||{});
 }
 $('serviceFilter')?.addEventListener('input',renderServiceList);
+$('serviceStateFilter')?.addEventListener('change',renderServiceList);
+$('servicePolicyFilter')?.addEventListener('change',renderServiceList);
 
 let systemBusy=false;
 async function pollSystem(){
@@ -490,6 +1185,6 @@ async function poll(){
   finally{pollBusy=false;}
 }
 
-pollPose(); poll(); pollSystem(); setInterval(poll,250); setInterval(updatePoseHud,250); setInterval(pollSystem,250);
+pollPose(); poll(); pollSystem(); pollControllerProcess(); pollCameraProcess(); pollServiceControl(); bootstrapManagementKey(); setInterval(poll,250); setInterval(updatePoseHud,250); setInterval(pollSystem,250); setInterval(pollControllerProcess,750); setInterval(pollCameraProcess,750); setInterval(pollServiceControl,2000);
 
 })();
