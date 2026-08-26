@@ -56,6 +56,7 @@ else:
     import pyrealsense2 as _g1_pyrealsense2  # noqa: F401
 
 import teleimager.image_server as image_server
+from g1_quest_udp_sender import create_quest_udp_sender
 
 ALLOWED_MODES = {
     "rgb",
@@ -589,6 +590,9 @@ def _patched_rs_init(
     self._g1_next_point_view_poll = 0.0
     self._g1_next_pointcloud_export = 0.0
     self._g1_pointcloud_seq = 0
+    self._g1_cam_topic = str(cam_topic)
+    self._g1_quest_udp_sender_initialized = False
+    self._g1_quest_udp_sender = None
 
 
 def _patched_rs_update_frame(self):
@@ -614,6 +618,15 @@ def _patched_rs_update_frame(self):
         _heat, depth_m, valid = _depth_products(depth_numpy, depth_scale)
         _publish_pointcloud_snapshot(self, bgr_numpy, depth_m, valid)
     output = _render_mode(self, bgr_numpy, depth_numpy, depth_scale, mode)
+
+    if not getattr(self, "_g1_quest_udp_sender_initialized", False):
+        self._g1_quest_udp_sender_initialized = True
+        if getattr(self, "_g1_cam_topic", "") == "head_camera":
+            self._g1_quest_udp_sender = create_quest_udp_sender(image_server.logger_mp)
+
+    quest_sender = getattr(self, "_g1_quest_udp_sender", None)
+    if quest_sender is not None:
+        quest_sender.submit(output)
 
     if self._enable_webrtc:
         self._webrtc_buffer.write(output)

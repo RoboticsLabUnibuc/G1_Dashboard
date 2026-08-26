@@ -24,12 +24,14 @@ import time
 from pathlib import Path
 from typing import Any
 
+from g1_dashboard_fullbody_sender_manager import FullBodySenderManager
+
 CONTROLLER_BASENAME = (
     "g1_locomotion_xr_handover_live_v6_7_4_symmetric_thumb_control_"
     "dashboard_telemetry_v1_8.py"
 )
 MANAGER_SCHEMA = "g1_dashboard.controller_process.v1"
-MANAGER_VERSION = "g1_dashboard_process_manager.v1.4.0-clean-shutdown-webgl-pointcloud"
+MANAGER_VERSION = "g1_dashboard_process_manager.v1.5.0-quest-fullbody"
 CONTROLLER_SHA256 = "1e5d92c3c460c4f652e22e8de00ae2305d444f3e4a2485dfa8cebbb68c2b8484"
 
 ACTION_REQUEST_SCHEMA = "g1_dashboard.action_request.v1"
@@ -485,8 +487,16 @@ class ControllerProcessManager:
         self._camera_managed: dict[str, Any] | None = None
         self._camera_last_error: str | None = None
         self._camera_last_exit_code: int | None = None
+        self.fullbody_sender = FullBodySenderManager(
+            python_path=self.python_path,
+        )
         self._load_state()
         self._load_camera_state()
+        if self._managed is None:
+            try:
+                self.fullbody_sender.stop(timeout_s=2.0)
+            except Exception as exc:
+                self._last_error = f"full-body orphan cleanup failed: {exc}"
 
     # ---------- persisted controller state ----------
     def _load_state(self) -> None:
@@ -1122,7 +1132,12 @@ class ControllerProcessManager:
         controller is gone.
         """
         deadline = time.monotonic() + max(2.0, float(timeout_s))
-        result: dict[str, Any] = {"controller": "not-running", "camera": "not-running", "inspire": "not-running"}
+        result: dict[str, Any] = {
+            "controller": "not-running",
+            "camera": "not-running",
+            "fullbody": "not-running",
+            "inspire": "not-running",
+        }
 
         with self._lock:
             self._refresh()
@@ -1191,6 +1206,12 @@ class ControllerProcessManager:
                         self.camera_pointcloud_path.unlink(missing_ok=True)
                     except Exception:
                         pass
+
+        try:
+            fullbody = self.fullbody_sender.stop(timeout_s=3.0)
+            result["fullbody"] = str(fullbody.get("state", "stopped"))
+        except Exception as exc:
+            result["fullbody"] = f"error:{exc}"
 
         # Inspire is stopped after the controller is confirmed gone. A helper-
         # managed orphan is also cleaned up on dashboard exit; external/manual
@@ -1316,6 +1337,10 @@ class ControllerProcessManager:
         alive, _pid = self._managed_alive()
         if self._managed is not None and not alive:
             finished = self._managed
+            try:
+                self.fullbody_sender.stop(timeout_s=2.0)
+            except Exception as exc:
+                self._last_error = f"controller exited, but full-body sender cleanup failed: {exc}"
             self._managed = None
             self._save_state()
             if finished.get("stop_requested_unix_time_s") and finished.get("inspire_stop_with_controller"):
@@ -1463,11 +1488,22 @@ class ControllerProcessManager:
 
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
             log = open(self.log_path, "ab", buffering=0)
+            try:
+                fullbody = self.fullbody_sender.start()
+            except Exception:
+                log.close()
+                if inspire_started_now:
+                    try:
+                        self._stop_inspire_managed_dependency()
+                    except Exception as cleanup_exc:
+                        self._last_error = f"full-body start failed and Inspire rollback failed: {cleanup_exc}"
+                raise
             banner = (
                 f"\n===== dashboard launch {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n"
                 f"command: {' '.join(cmd)}\n"
                 "managed_env: PYTHONNOUSERSITE=1; PYTHONPATH/PYTHONHOME cleared; keyboard disabled; loopback XR actions enabled\n"
                 f"inspire_dependency: state={inspire.get('state')} pid={inspire.get('pid')} stop_with_controller={inspire_stop_with_controller}\n"
+                f"quest_fullbody: state={fullbody.get('state')} pid={fullbody.get('pid')} log={fullbody.get('log_path')}\n"
                 f"preflight:\n{preflight}\n"
             ).encode("utf-8", "replace")
             log.write(banner)
@@ -1489,6 +1525,11 @@ class ControllerProcessManager:
                         self._stop_inspire_managed_dependency()
                     except Exception as cleanup_exc:
                         self._last_error = f"controller spawn failed and Inspire rollback also failed: {cleanup_exc}"
+                if fullbody.get("started_now"):
+                    try:
+                        self.fullbody_sender.stop(timeout_s=3.0)
+                    except Exception:
+                        pass
                 raise
             log.close()
             self._popen = proc
@@ -1523,6 +1564,11 @@ class ControllerProcessManager:
                         self._stop_inspire_managed_dependency()
                     except Exception as cleanup_exc:
                         self._last_error = f"controller exited immediately and Inspire rollback failed: {cleanup_exc}"
+                if fullbody.get("started_now"):
+                    try:
+                        self.fullbody_sender.stop(timeout_s=3.0)
+                    except Exception:
+                        pass
                 raise RuntimeError(f"controller exited immediately with code {rc}; inspect {self.log_path}")
             return self.status()
 
@@ -1628,6 +1674,10 @@ class ControllerProcessManager:
                 return self.status()
             if self._managed.get("stop_requested_unix_time_s"):
                 return self.status()
+            try:
+                self.fullbody_sender.stop(timeout_s=3.0)
+            except Exception as exc:
+                self._last_error = f"Quest full-body sender stop failed: {exc}"
             # Controller must stop first.  _refresh() stops a helper-managed
             # Inspire service only after the controlled controller process exits.
             ticks = self._managed.get("start_ticks")
