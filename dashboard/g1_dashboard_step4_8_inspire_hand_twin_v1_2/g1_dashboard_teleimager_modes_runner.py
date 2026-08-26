@@ -56,6 +56,11 @@ else:
     import pyrealsense2 as _g1_pyrealsense2  # noqa: F401
 
 import teleimager.image_server as image_server
+from g1_dashboard_yolo_client import create_yolo_client
+from g1_dashboard_yolo_overlay import (
+    draw_aligned_detections,
+    draw_projected_pointcloud_detections,
+)
 from g1_quest_udp_sender import create_quest_udp_sender
 
 ALLOWED_MODES = {
@@ -71,6 +76,19 @@ MODE_FILE = Path(os.environ.get("TELEIMAGER_DISPLAY_MODE_FILE", "/tmp/g1_dashboa
 STATUS_FILE = Path(os.environ.get("TELEIMAGER_DISPLAY_STATUS_FILE", "/tmp/g1_dashboard_camera_mode_status.json"))
 POINT_VIEW_FILE = Path(os.environ.get("TELEIMAGER_POINT_VIEW_FILE", "/tmp/g1_dashboard_point_view.json"))
 POINTCLOUD_FILE = Path(os.environ.get("TELEIMAGER_POINTCLOUD_SNAPSHOT_FILE", "/tmp/g1_dashboard_camera_pointcloud.bin"))
+YOLO_REQUEST_FILE = Path(
+    os.environ.get(
+        "G1_DASHBOARD_YOLO_REQUEST_FILE",
+        f"/tmp/g1_dashboard_yolo_request_{os.getuid()}.txt",
+    )
+)
+YOLO_RESULT_MAX_AGE_S = max(
+    0.05,
+    min(
+        2.0,
+        float(os.environ.get("G1_DASHBOARD_YOLO_RESULT_MAX_AGE_S", "0.40")),
+    ),
+)
 
 POINT_VIEW_DEFAULT = {
     "yaw_deg": 22.0,
@@ -142,6 +160,35 @@ def _read_requested_mode(camera) -> str:
     return mode
 
 
+def _read_yolo_requested(camera) -> bool:
+    now = time.monotonic()
+    if now < getattr(camera, "_g1_next_yolo_request_poll", 0.0):
+        return bool(getattr(camera, "_g1_yolo_requested", False))
+
+    camera._g1_next_yolo_request_poll = now + 0.10
+    enabled = False
+    try:
+        raw = YOLO_REQUEST_FILE.read_text(encoding="utf-8").strip().lower()
+        enabled = raw in {"1", "true", "yes", "on", "enabled"}
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        image_server.logger_mp.debug(
+            f"[G1 YOLO] request file read failed: {exc}"
+        )
+        enabled = bool(getattr(camera, "_g1_yolo_requested", False))
+
+    previous = bool(getattr(camera, "_g1_yolo_requested", False))
+    camera._g1_yolo_requested = enabled
+    if enabled != previous:
+        image_server.logger_mp.info(
+            "[G1 YOLO] %s request_file=%s",
+            "enabled" if enabled else "disabled",
+            YOLO_REQUEST_FILE,
+        )
+    return enabled
+
+
 def _sanitize_point_view(raw: object) -> dict[str, float]:
     base = dict(POINT_VIEW_DEFAULT)
     if isinstance(raw, dict):
@@ -179,8 +226,36 @@ def _read_point_view(camera) -> dict[str, float]:
 def _write_status(camera, mode: str, depth_ready: bool) -> None:
     now_mono = time.monotonic()
     point_view = _read_point_view(camera)
+    yolo_requested = bool(
+        getattr(camera, "_g1_yolo_requested", False)
+    )
+    yolo_client = getattr(camera, "_g1_yolo_client", None)
+    if yolo_client is None:
+        yolo_status = {
+            "state": "UNAVAILABLE",
+            "available": False,
+        }
+    else:
+        try:
+            yolo_status = dict(yolo_client.status())
+            yolo_status["available"] = True
+        except Exception as exc:
+            yolo_status = {
+                "state": "ERROR",
+                "available": True,
+                "last_error": str(exc),
+            }
+
+    yolo_status["requested"] = yolo_requested
+    yolo_status["active"] = bool(
+        yolo_requested
+        and yolo_client is not None
+        and yolo_status.get("state") == "RUNNING"
+    )
+
     fingerprint = (
         mode,
+        yolo_requested,
         round(point_view["yaw_deg"], 2),
         round(point_view["pitch_deg"], 2),
         round(point_view["distance_m"], 3),
@@ -192,7 +267,7 @@ def _write_status(camera, mode: str, depth_ready: bool) -> None:
     camera._g1_next_status_write = now_mono + 0.35
     camera._g1_status_fingerprint = fingerprint
     payload = {
-        "schema": "g1_dashboard.camera_display_status.v1.2",
+        "schema": "g1_dashboard.camera_display_status.v1.3",
         "mode": mode,
         "depth_ready": bool(depth_ready),
         "width": int(camera._img_shape[1]),
@@ -201,6 +276,7 @@ def _write_status(camera, mode: str, depth_ready: bool) -> None:
         "depth_scale_m_per_unit": float(getattr(camera, "g_depth_scale", 0.0)),
         "derived_modes": ["disparity", "pointcloud", "topdown"],
         "point_view": point_view,
+        "yolo": yolo_status,
         "topdown_projection": "orthographic_xz_occupancy_grid",
         "topdown_cell_m": float(TOPDOWN_CELL_M),
         "pointcloud_browser_webgl": True,
@@ -360,7 +436,13 @@ def _publish_pointcloud_snapshot(camera, bgr: np.ndarray, depth_m: np.ndarray, v
         image_server.logger_mp.debug(f"[G1 camera modes] point-cloud snapshot write failed: {exc}")
 
 
-def _pointcloud_view(camera, bgr: np.ndarray, depth_m: np.ndarray, valid: np.ndarray) -> np.ndarray:
+def _pointcloud_view(
+    camera,
+    bgr: np.ndarray,
+    depth_m: np.ndarray,
+    valid: np.ndarray,
+    detections: tuple | list = (),
+) -> np.ndarray:
     """Render an RGB-textured point cloud from an orbitable virtual viewpoint."""
     h, w = depth_m.shape
     canvas = np.full((h, w, 3), (8, 12, 17), dtype=np.uint8)
@@ -403,12 +485,29 @@ def _pointcloud_view(camera, bgr: np.ndarray, depth_m: np.ndarray, valid: np.nda
         return canvas
 
     su, sv, qz, pix = su[inside], sv[inside], qz[inside], pix[inside]
+    source_depth_m = depth_m[pix[:, 1], pix[:, 0]]
     colors = bgr[pix[:, 1], pix[:, 0]]
 
     order = np.argsort(qz)[::-1]
-    su, sv, colors = su[order], sv[order], colors[order]
+    su = su[order]
+    sv = sv[order]
+    pix = pix[order]
+    source_depth_m = source_depth_m[order]
+    colors = colors[order]
     for dx, dy in ((0, 0), (1, 0), (0, 1), (1, 1)):
         canvas[sv + dy, su + dx] = colors
+
+    if detections:
+        draw_projected_pointcloud_detections(
+            canvas,
+            detections,
+            pix,
+            su,
+            sv,
+            source_depth_m,
+            w,
+            h,
+        )
 
     cv2.putText(canvas, "POINT CLOUD | DRAG TO ORBIT / WHEEL TO ZOOM", (16, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (205, 220, 235), 1, cv2.LINE_AA)
     cv2.putText(
@@ -506,25 +605,42 @@ def _topdown_view(camera, depth_m: np.ndarray, valid: np.ndarray) -> np.ndarray:
     cv2.putText(canvas, f"cell={TOPDOWN_CELL_M:.2f}m  Y={TOPDOWN_MIN_Y_M:+.2f}..{TOPDOWN_MAX_Y_M:+.2f}m", (map_left, h - 9), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (110, 132, 150), 1, cv2.LINE_AA)
     return canvas
 
-def _render_mode(camera, bgr: np.ndarray, depth_z16: np.ndarray | None, depth_scale: float, mode: str) -> np.ndarray:
-    if mode == "rgb" or depth_z16 is None:
-        return bgr
+def _render_mode(
+    camera,
+    bgr: np.ndarray,
+    depth_z16: np.ndarray | None,
+    depth_scale: float,
+    mode: str,
+    frame_cache: dict | None = None,
+) -> np.ndarray:
+    """Render one mode, reusing products and final views within this source frame."""
+    if frame_cache is None:
+        frame_cache = {}
+    rendered = frame_cache.setdefault("rendered", {})
+    if mode in rendered:
+        return rendered[mode]
 
-    heat, depth_m, valid = _depth_products(depth_z16, depth_scale)
+    detections = tuple(frame_cache.get("yolo_detections") or ())
+
+    if mode == "rgb" or depth_z16 is None:
+        output = bgr
+        if detections and mode != "topdown":
+            output = draw_aligned_detections(output, detections)
+        rendered[mode] = output
+        return output
+
+    products = frame_cache.get("depth_products")
+    if products is None:
+        products = _depth_products(depth_z16, depth_scale)
+        frame_cache["depth_products"] = products
+    heat, depth_m, valid = products
 
     if mode == "depth":
-        return heat
-
-    if mode == "overlay":
-        mixed = cv2.addWeighted(bgr, 0.58, heat, 0.42, 0.0)
-        # Preserve real RGB where depth is invalid; do not paint stereo holes as
-        # fake black geometry.
-        mixed[~valid] = bgr[~valid]
-        return mixed
-
-    if mode == "near":
-        # Operator-oriented near-field visualization. Keep the scene
-        # recognizable, then strongly mark only valid pixels inside bands.
+        output = heat
+    elif mode == "overlay":
+        output = cv2.addWeighted(bgr, 0.58, heat, 0.42, 0.0)
+        output[~valid] = bgr[~valid]
+    elif mode == "near":
         output = cv2.convertScaleAbs(bgr, alpha=0.38, beta=0)
         tint = np.zeros_like(bgr)
         red = valid & (depth_m < NEAR_RED_M)
@@ -537,19 +653,26 @@ def _render_mode(camera, bgr: np.ndarray, depth_z16: np.ndarray | None, depth_sc
         if np.any(marked):
             blended = cv2.addWeighted(bgr, 0.28, tint, 0.72, 0.0)
             output[marked] = blended[marked]
-        return output
+    elif mode == "disparity":
+        output = _disparity_view(depth_m, valid)
+    elif mode == "pointcloud":
+        output = _pointcloud_view(
+            camera,
+            bgr,
+            depth_m,
+            valid,
+            detections,
+        )
+    elif mode == "topdown":
+        output = _topdown_view(camera, depth_m, valid)
+    else:
+        output = bgr
 
-    if mode == "disparity":
-        return _disparity_view(depth_m, valid)
+    if detections and mode not in {"pointcloud", "topdown"}:
+        output = draw_aligned_detections(output, detections)
 
-    if mode == "pointcloud":
-        return _pointcloud_view(camera, bgr, depth_m, valid)
-
-    if mode == "topdown":
-        return _topdown_view(camera, depth_m, valid)
-
-    return bgr
-
+    rendered[mode] = output
+    return output
 
 _original_rs_init = image_server.RealSenseCamera.__init__
 
@@ -593,6 +716,10 @@ def _patched_rs_init(
     self._g1_cam_topic = str(cam_topic)
     self._g1_quest_udp_sender_initialized = False
     self._g1_quest_udp_sender = None
+    self._g1_yolo_requested = False
+    self._g1_next_yolo_request_poll = 0.0
+    self._g1_yolo_client_initialized = False
+    self._g1_yolo_client = None
 
 
 def _patched_rs_update_frame(self):
@@ -614,10 +741,39 @@ def _patched_rs_update_frame(self):
     bgr_numpy = np.asanyarray(color_frame.get_data())
     mode = _read_requested_mode(self)
     depth_scale = getattr(self, "g_depth_scale", 0.001)
-    if mode == "pointcloud" and depth_numpy is not None:
-        _heat, depth_m, valid = _depth_products(depth_numpy, depth_scale)
-        _publish_pointcloud_snapshot(self, bgr_numpy, depth_m, valid)
-    output = _render_mode(self, bgr_numpy, depth_numpy, depth_scale, mode)
+
+    if not getattr(self, "_g1_yolo_client_initialized", False):
+        self._g1_yolo_client_initialized = True
+        if getattr(self, "_g1_cam_topic", "") == "head_camera":
+            try:
+                self._g1_yolo_client = create_yolo_client(
+                    image_server.logger_mp
+                )
+            except Exception as exc:
+                image_server.logger_mp.warning(
+                    "[G1 YOLO] client initialization failed: %s",
+                    exc,
+                )
+                self._g1_yolo_client = None
+
+    yolo_detections = ()
+    yolo_requested = _read_yolo_requested(self)
+    yolo_client = getattr(self, "_g1_yolo_client", None)
+    if yolo_requested and yolo_client is not None:
+        try:
+            yolo_client.submit(bgr_numpy)
+            yolo_result = yolo_client.latest(
+                YOLO_RESULT_MAX_AGE_S
+            )
+            if yolo_result:
+                yolo_detections = tuple(
+                    yolo_result.get("detections") or ()
+                )
+        except Exception as exc:
+            image_server.logger_mp.warning(
+                "[G1 YOLO] frame processing failed: %s",
+                exc,
+            )
 
     if not getattr(self, "_g1_quest_udp_sender_initialized", False):
         self._g1_quest_udp_sender_initialized = True
@@ -625,9 +781,39 @@ def _patched_rs_update_frame(self):
             self._g1_quest_udp_sender = create_quest_udp_sender(image_server.logger_mp)
 
     quest_sender = getattr(self, "_g1_quest_udp_sender", None)
-    if quest_sender is not None:
-        quest_sender.submit(output)
+    quest_modes = quest_sender.requested_modes() if quest_sender is not None else ()
 
+    frame_cache = {
+        "yolo_detections": yolo_detections,
+    }
+    output = _render_mode(
+        self,
+        bgr_numpy,
+        depth_numpy,
+        depth_scale,
+        mode,
+        frame_cache,
+    )
+
+    if mode == "pointcloud" and depth_numpy is not None:
+        products = frame_cache.get("depth_products")
+        if products is not None:
+            _heat, depth_m, valid = products
+            _publish_pointcloud_snapshot(self, bgr_numpy, depth_m, valid)
+
+    if quest_sender is not None:
+        quest_outputs = {
+            quest_mode: _render_mode(
+                self,
+                bgr_numpy,
+                depth_numpy,
+                depth_scale,
+                quest_mode,
+                frame_cache,
+            )
+            for quest_mode in quest_modes
+        }
+        quest_sender.submit_views(quest_outputs)
     if self._enable_webrtc:
         self._webrtc_buffer.write(output)
 

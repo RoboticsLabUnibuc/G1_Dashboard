@@ -30,6 +30,7 @@ let cameraProcessStatus=null;
 let cameraProcessPollBusy=false;
 let cameraProcessActionBusy=false;
 let cameraModeActionBusy=false;
+let cameraYoloActionBusy=false;
 let pointViewSendBusy=false;
 let pointViewLocal=null;
 let pointViewInitialized=false;
@@ -456,12 +457,48 @@ function renderCameraModes(){
     btn.disabled=!controllable || cameraModeActionBusy;
     btn.title=controllable?'Switch the shared Teleimager WebRTC output without reconnecting.':'Mode switching requires the dashboard-managed RealSense camera server.';
   });
+
   const badge=$('cameraModeState');
   if(badge){
     const waiting=controllable && actual!==requested;
     badge.textContent=waiting?`MODE ${cameraModeLabel(requested)}…`:`MODE ${cameraModeLabel(actual||requested)}`;
     badge.className=`camera-mode-state${waiting?' warn':actual?' good':''}`;
   }
+
+  const yoloToggle=$('cameraYoloToggle');
+  const yoloControl=$('cameraYoloControl');
+  const yoloBadge=$('cameraYoloState');
+  const yoloRequested=!!st.yolo_requested;
+  const yoloControllable=!!st.yolo_control && st.state==='RUNNING';
+  const yoloWaiting=yoloControllable && (
+    !st.yolo_ack_online ||
+    st.yolo_actual!==yoloRequested
+  );
+
+  if(yoloToggle){
+    yoloToggle.checked=yoloRequested;
+    yoloToggle.indeterminate=yoloWaiting;
+    yoloToggle.disabled=!yoloControllable || cameraYoloActionBusy;
+  }
+
+  if(yoloControl){
+    yoloControl.classList.toggle('active',yoloRequested);
+    yoloControl.classList.toggle(
+      'busy',
+      cameraYoloActionBusy || yoloWaiting
+    );
+    yoloControl.title=yoloControllable
+      ?'Run one YOLO inference pipeline on RGB and reuse detections across aligned camera views.'
+      :'YOLO control requires the dashboard-managed RealSense camera server.';
+  }
+
+  if(yoloBadge){
+    yoloBadge.textContent=yoloWaiting
+      ?`YOLO ${yoloRequested?'ON':'OFF'}…`
+      :`YOLO ${yoloRequested?'ON':'OFF'}`;
+    yoloBadge.className=`camera-yolo-state${yoloWaiting?' warn':yoloRequested?' good':''}`;
+  }
+
   renderPointViewControls();
 }
 
@@ -578,7 +615,50 @@ async function setCameraMode(mode){
     renderCameraModes();
   }
 }
+async function setCameraYolo(enabled){
+  enabled=!!enabled;
+  if(cameraYoloActionBusy)return;
+
+  if(!currentManagementKey()){
+    renderCameraModes();
+    showManagementKeyPrompt(
+      'Enter the management key to enable or disable YOLO.',
+      ()=>setCameraYolo(enabled)
+    );
+    return;
+  }
+
+  if(
+    cameraProcessStatus?.state!=='RUNNING' ||
+    !cameraProcessStatus?.yolo_control
+  ){
+    renderCameraModes();
+    window.alert(
+      'YOLO control is available only while the dashboard-managed RealSense camera server is running.'
+    );
+    return;
+  }
+
+  cameraYoloActionBusy=true;
+  renderCameraModes();
+
+  try{
+    const st=await cameraProcessPost(
+      '/api/camera/yolo',
+      {enabled}
+    );
+    if(st)renderCameraProcess(st);
+  }catch(err){
+    window.alert(`YOLO switch failed: ${err.message||err}`);
+  }finally{
+    cameraYoloActionBusy=false;
+    await pollCameraProcess();
+    renderCameraModes();
+  }
+}
+
 document.querySelectorAll('[data-camera-mode]').forEach(btn=>btn.addEventListener('click',()=>setCameraMode(btn.dataset.cameraMode)));
+$('cameraYoloToggle')?.addEventListener('change',event=>setCameraYolo(event.target.checked));
 document.querySelectorAll('[data-point-view-preset]').forEach(btn=>btn.addEventListener('click',()=>applyPointViewPreset(btn.dataset.pointViewPreset)));
 
 function updateCameraButtons(t){

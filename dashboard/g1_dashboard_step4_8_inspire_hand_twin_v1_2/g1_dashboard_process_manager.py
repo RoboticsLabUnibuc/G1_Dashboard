@@ -469,6 +469,10 @@ class ControllerProcessManager:
             "G1_DASHBOARD_CAMERA_POINTCLOUD_FILE",
             f"/tmp/g1_dashboard_camera_pointcloud_{os.getuid()}.bin",
         )).expanduser()
+        self.camera_yolo_request_path = Path(os.environ.get(
+            "G1_DASHBOARD_YOLO_REQUEST_FILE",
+            f"/tmp/g1_dashboard_yolo_request_{os.getuid()}.txt",
+        )).expanduser()
         self.camera_state_path = Path(os.environ.get(
             "G1_DASHBOARD_CAMERA_STATE",
             "/tmp/g1_dashboard_camera_teleimager_state.json",
@@ -769,6 +773,30 @@ class ControllerProcessManager:
         tmp.replace(self.camera_mode_path)
         return normalized
 
+    def _read_camera_yolo_requested(self) -> bool:
+        try:
+            raw = self.camera_yolo_request_path.read_text(
+                encoding="utf-8"
+            ).strip().lower()
+            return raw in {"1", "true", "yes", "on", "enabled"}
+        except Exception:
+            return False
+
+    def _write_camera_yolo(self, enabled: bool) -> bool:
+        value = bool(enabled)
+        self.camera_yolo_request_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+        tmp = self.camera_yolo_request_path.with_suffix(".tmp")
+        tmp.write_text(
+            "1\n" if value else "0\n",
+            encoding="utf-8",
+        )
+        os.chmod(tmp, 0o600)
+        tmp.replace(self.camera_yolo_request_path)
+        return value
+
     def _sanitize_camera_point_view(self, raw: Any) -> dict[str, float]:
         current = dict(POINT_VIEW_DEFAULT)
         if isinstance(raw, dict):
@@ -836,6 +864,46 @@ class ControllerProcessManager:
                 time.sleep(0.03)
             return self.camera_status()
 
+    def set_camera_yolo(self, enabled: bool) -> dict[str, Any]:
+        with self._lock:
+            if not self.enabled:
+                raise PermissionError(
+                    "dashboard process actions are disabled"
+                )
+            if not isinstance(enabled, bool):
+                raise ValueError("enabled must be a boolean")
+
+            status = self.camera_status()
+            if (
+                status.get("state") != "RUNNING"
+                or not status.get("yolo_control")
+            ):
+                raise PermissionError(
+                    "YOLO control requires the dashboard-managed "
+                    "RealSense mode runner"
+                )
+
+            self._write_camera_yolo(enabled)
+
+            deadline = time.monotonic() + 1.2
+            while time.monotonic() < deadline:
+                acknowledgement = self._read_camera_mode_status()
+                yolo = (
+                    acknowledgement.get("yolo")
+                    if isinstance(acknowledgement, dict)
+                    else None
+                )
+                if (
+                    acknowledgement
+                    and acknowledgement.get("online")
+                    and isinstance(yolo, dict)
+                    and bool(yolo.get("requested")) == enabled
+                ):
+                    break
+                time.sleep(0.03)
+
+            return self.camera_status()
+
     def camera_status(self) -> dict[str, Any]:
         with self._lock:
             self._refresh_camera()
@@ -853,6 +921,19 @@ class ControllerProcessManager:
             mode_ack_online = bool(mode_status and mode_status.get("online"))
             point_view_requested = self._read_camera_point_view_requested()
             point_view_actual = mode_status.get("point_view") if mode_status and mode_status.get("online") else None
+            yolo_requested = self._read_camera_yolo_requested()
+            yolo_status = (
+                mode_status.get("yolo")
+                if mode_status and mode_status.get("online")
+                and isinstance(mode_status.get("yolo"), dict)
+                else None
+            )
+            yolo_ack_online = bool(yolo_status is not None)
+            yolo_actual = (
+                bool(yolo_status.get("requested"))
+                if yolo_status is not None
+                else None
+            )
 
             if managed_alive and self._camera_managed is not None:
                 # teleimager uses multiprocessing and normally creates one or
@@ -892,6 +973,11 @@ class ControllerProcessManager:
                     "mode_actual": mode_actual,
                     "mode_ack_online": mode_ack_online,
                     "mode_control": state == "RUNNING" and not external_groups and managed_mode_runner,
+                    "yolo_control": state == "RUNNING" and not external_groups and managed_mode_runner,
+                    "yolo_requested": yolo_requested,
+                    "yolo_actual": yolo_actual,
+                    "yolo_ack_online": yolo_ack_online,
+                    "yolo_status": yolo_status,
                     "point_view_control": state == "RUNNING" and not external_groups and managed_mode_runner,
                     "point_view_requested": point_view_requested,
                     "point_view_actual": point_view_actual,
@@ -930,6 +1016,11 @@ class ControllerProcessManager:
                     "mode_actual": mode_actual,
                     "mode_ack_online": mode_ack_online,
                     "mode_control": False,
+                    "yolo_control": False,
+                    "yolo_requested": yolo_requested,
+                    "yolo_actual": yolo_actual,
+                    "yolo_ack_online": yolo_ack_online,
+                    "yolo_status": yolo_status,
                     "point_view_control": False,
                     "point_view_requested": point_view_requested,
                     "point_view_actual": point_view_actual,
@@ -965,6 +1056,11 @@ class ControllerProcessManager:
                 "mode_actual": mode_actual,
                 "mode_ack_online": mode_ack_online,
                 "mode_control": False,
+                "yolo_control": False,
+                "yolo_requested": yolo_requested,
+                "yolo_actual": yolo_actual,
+                "yolo_ack_online": yolo_ack_online,
+                "yolo_status": yolo_status,
                 "point_view_control": False,
                 "point_view_requested": point_view_requested,
                 "point_view_actual": point_view_actual,
@@ -1004,10 +1100,14 @@ class ControllerProcessManager:
             env["TELEIMAGER_DISPLAY_STATUS_FILE"] = str(self.camera_mode_status_path)
             env["TELEIMAGER_POINT_VIEW_FILE"] = str(self.camera_point_view_path)
             env["TELEIMAGER_POINTCLOUD_SNAPSHOT_FILE"] = str(self.camera_pointcloud_path)
+            env["G1_DASHBOARD_YOLO_REQUEST_FILE"] = str(
+                self.camera_yolo_request_path
+            )
             # Every camera-server launch returns to the normal RGB operator
             # view. Mode changes are live-session choices, not boot defaults.
             self._write_camera_mode("rgb")
             self._write_camera_point_view(dict(POINT_VIEW_DEFAULT))
+            self._write_camera_yolo(False)
             try:
                 self.camera_mode_status_path.unlink(missing_ok=True)
                 self.camera_pointcloud_path.unlink(missing_ok=True)

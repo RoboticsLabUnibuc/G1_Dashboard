@@ -477,7 +477,15 @@ button,a{font:inherit}.topbar{height:var(--top);display:grid;grid-template-colum
 .camera-mode-state{font-size:7px;font-weight:850;letter-spacing:.06em;color:#7e91a5;white-space:nowrap}
 .camera-mode-state.good{color:var(--good)}
 .camera-mode-state.warn{color:var(--warn)}
-@media(max-width:1280px){.camera-mode-btn{padding:4px 5px}.camera-mode-state{display:none}}
+.camera-mode-options{display:flex;align-items:center;justify-content:flex-end;gap:5px;white-space:nowrap}
+.camera-yolo-toggle{padding:3px 6px;font-size:8px;border-radius:6px;border-color:#315440}
+.camera-yolo-toggle input{width:12px;height:12px}
+.camera-yolo-toggle.active{background:#123927;border-color:#2e7655;color:#bff5d9}
+.camera-yolo-toggle.busy{border-color:#66562c;color:var(--warn)}
+.camera-yolo-state{font-size:7px;font-weight:850;letter-spacing:.06em;color:#7e91a5;white-space:nowrap}
+.camera-yolo-state.good{color:var(--good)}
+.camera-yolo-state.warn{color:var(--warn)}
+@media(max-width:1280px){.camera-mode-btn{padding:4px 5px}.camera-mode-state,.camera-yolo-state{display:none}.camera-yolo-toggle{padding:3px 5px}}
 
 /* Camera modes v1.2 — point-cloud orbit controls + explicit 2-D TOP map */
 .point-view-strip{height:30px;flex:0 0 30px;display:flex;align-items:center;gap:4px;padding:3px 9px;border-bottom:1px solid var(--line);background:#0a1118}

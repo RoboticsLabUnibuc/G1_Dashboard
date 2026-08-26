@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>G1 Teleop Control Center</title>
   <link rel="icon" href="data:," />
-  <link rel="stylesheet" href="/static/styles.css?v=camera-v1-3" />
+  <link rel="stylesheet" href="/static/styles.css?v=yolo-camera-v1" />
 </head>
 <body>
   <header class="topbar">
@@ -69,7 +69,14 @@
               <button class="camera-mode-btn" data-camera-mode="pointcloud" title="Orbitable RGB-textured 3-D point cloud">POINT</button>
               <button class="camera-mode-btn" data-camera-mode="topdown" title="Orthographic X/Z 2-D occupancy projection">TOP</button>
             </div>
-            <span id="cameraModeState" class="camera-mode-state">MODE RGB</span>
+            <div class="camera-mode-options">
+              <label id="cameraYoloControl" class="toggle camera-yolo-toggle" title="Run one YOLO inference pipeline on RGB and reuse detections across aligned camera views">
+                <input id="cameraYoloToggle" type="checkbox" />
+                <span>YOLO</span>
+              </label>
+              <span id="cameraYoloState" class="camera-yolo-state">YOLO OFF</span>
+              <span id="cameraModeState" class="camera-mode-state">MODE RGB</span>
+            </div>
           </div>
 
           <div id="pointViewStrip" class="point-view-strip hidden" aria-label="Point-cloud virtual camera controls">
@@ -537,6 +544,6 @@
     </section>
   </div>
 
-  <script type="module" src="/static/app.js?v=camera-v1-3"></script>
+  <script type="module" src="/static/app.js?v=yolo-camera-v1"></script>
 </body>
 </html>

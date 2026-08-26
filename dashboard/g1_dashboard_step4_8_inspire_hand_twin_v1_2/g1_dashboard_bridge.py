@@ -37,7 +37,7 @@ from g1_dashboard_service_client import ServiceActionClient
 from g1_dashboard_service_policy import classify_service, load_policy, public_policy
 
 SCHEMA = "g1_dashboard.telemetry.v1"
-BRIDGE_VERSION = "g1_dashboard_bridge.v1.7.0-clean-shutdown-webgl-pointcloud"
+BRIDGE_VERSION = "g1_dashboard_bridge.v1.7.1-yolo-camera-toggle"
 SYSTEM_SCHEMA = "g1_dashboard.system.v1"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -553,6 +553,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "camera_process_actions_authenticated": True,
                     "camera_display_modes": ["rgb", "depth", "overlay", "near", "disparity", "pointcloud", "topdown"],
                     "camera_mode_switch_preserves_webrtc": True,
+                    "camera_yolo_live_toggle": True,
+                    "camera_yolo_inference_source": "single aligned RGB frame",
                     "camera_point_view_orbit_control": True,
                     "camera_pointcloud_browser_webgl": True,
                     "camera_pointcloud_transport": "latest-only binary G1PC over same-origin HTTP",
@@ -588,11 +590,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "/api/camera/start",
             "/api/camera/stop",
             "/api/camera/mode",
+            "/api/camera/yolo",
             "/api/camera/view",
             "/api/services/set",
         ):
             self._send_json(HTTPStatus.METHOD_NOT_ALLOWED, {
-                "error": "unsupported POST; authenticated endpoints are controller auth/start/stop/action, camera start/stop/mode/view, and allowlisted service set"
+                "error": "unsupported POST; authenticated endpoints are controller auth/start/stop/action, camera start/stop/mode/yolo/view, and allowlisted service set"
             })
             return
         if not self._require_process_action_auth():
@@ -653,6 +656,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json(
                     HTTPStatus.OK if acknowledged else HTTPStatus.ACCEPTED,
                     {"ok": True, "acknowledged": acknowledged, "camera": status},
+                )
+            elif path == "/api/camera/yolo":
+                enabled = payload.get("enabled")
+                if not isinstance(enabled, bool):
+                    raise ValueError("enabled must be a boolean")
+                status = manager.set_camera_yolo(enabled)
+                acknowledged = bool(
+                    status.get("yolo_ack_online")
+                    and status.get("yolo_actual") == enabled
+                )
+                self._send_json(
+                    HTTPStatus.OK if acknowledged else HTTPStatus.ACCEPTED,
+                    {
+                        "ok": True,
+                        "acknowledged": acknowledged,
+                        "camera": status,
+                    },
                 )
             elif path == "/api/camera/view":
                 view = payload.get("view")
