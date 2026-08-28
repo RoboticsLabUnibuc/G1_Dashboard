@@ -270,7 +270,7 @@ class SlamSnapshotWorker(Node):
         )
 
         self.create_timer(0.1, self.poll_initialize_request)
-        self.create_timer(0.2, self.publish_status)
+        self.create_timer(0.1, self.publish_status)
         self.publish_status()
 
         self.get_logger().info(

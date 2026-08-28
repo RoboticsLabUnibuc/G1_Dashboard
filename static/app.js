@@ -853,6 +853,11 @@ function renderRobot(t){
 }
 
 G1Twin.init($('robotTwinCanvas'),(i)=>{selectedJointIndex=i;renderSelectedJoint(latestEnv?.telemetry||{});});
+
+const slamRobotModel=G1Twin.createSceneReplica();
+if(slamRobotModel){
+  slamViewer.setRobotModel(slamRobotModel);
+}
 G1Twin.selectJoint(selectedJointIndex);
 $('ghostToggle').addEventListener('change',e=>G1Twin.setGhostVisible(e.target.checked));
 $('jointToggle').addEventListener('change',e=>G1Twin.setJointsVisible(e.target.checked));
@@ -1577,6 +1582,6 @@ async function poll(){
   finally{pollBusy=false;}
 }
 
-pollPose(); poll(); pollSystem(); pollControllerProcess(); pollCameraProcess(); pollServiceControl(); pollSlamStatus(); bootstrapManagementKey(); setInterval(poll,250); setInterval(updatePoseHud,250); setInterval(pollSystem,250); setInterval(pollControllerProcess,750); setInterval(pollCameraProcess,750); setInterval(pollSlamStatus,500); setInterval(pollServiceControl,2000);
+pollPose(); poll(); pollSystem(); pollControllerProcess(); pollCameraProcess(); pollServiceControl(); pollSlamStatus(); bootstrapManagementKey(); setInterval(poll,250); setInterval(updatePoseHud,250); setInterval(pollSystem,250); setInterval(pollControllerProcess,750); setInterval(pollCameraProcess,750); setInterval(pollSlamStatus,100); setInterval(pollServiceControl,2000);
 
 })();

@@ -129,7 +129,7 @@ class MeshTwin {
     this.targetHandFbLeft=new Array(6).fill(1); this.targetHandFbRight=new Array(6).fill(1); this.displayHandFbLeft=new Array(6).fill(1); this.displayHandFbRight=new Array(6).fill(1); this.haveHandPose=false; this.handFeedbackValid={left:false,right:false};
     this.sequence=null; this.sourceAgeMs=null; this.packetAgeMs=null; this.rxHz=0; this.fps=0; this.lastRxPerf=null; this.rxIntervals=[]; this.frameCount=0; this.fpsStamp=performance.now();
     this.loaded=0; this.failed=[]; this.inspireLoaded=0; this.inspireFailed=[]; this.inspireReady=false; this.modelStatus='loading G1 + Inspire RH56DFX meshes';
-    this.measuredMeshes=new Map(); this.ghostMeshes=new Map(); this.inspireMeasuredMeshes={left:new Map(),right:new Map()}; this.inspireGhostMeshes={left:new Map(),right:new Map()}; this.pickMeshes=[]; this.markerMeshes=[]; this.lastFk=null; this.jointHealth=new Array(29).fill(null); this.healthSummary={label:'NO DATA',severity:null,watchCount:0,highCount:0,veryHighCount:0,peakTempC:null,peakTempIndex:null,peakTorqueUtil:null,peakTorqueIndex:null};
+    this.measuredMeshes=new Map(); this.ghostMeshes=new Map(); this.inspireMeasuredMeshes={left:new Map(),right:new Map()}; this.inspireGhostMeshes={left:new Map(),right:new Map()}; this.pickMeshes=[]; this.markerMeshes=[]; this.lastFk=null; this.sceneReplicas=new Set(); this.jointHealth=new Array(29).fill(null); this.healthSummary={label:'NO DATA',severity:null,watchCount:0,highCount:0,veryHighCount:0,peakTempC:null,peakTempIndex:null,peakTorqueUtil:null,peakTorqueIndex:null};
     this.scene=new THREE.Scene(); this.scene.background=new THREE.Color(0x071018);
     this.camera=new THREE.PerspectiveCamera(34,1,0.02,20); this.camera.up.set(0,0,1);
     this.renderer=new THREE.WebGLRenderer({canvas,antialias:true,powerPreference:'high-performance'}); this.renderer.setPixelRatio(Math.min(window.devicePixelRatio||1,1.5)); this.renderer.outputColorSpace=THREE.SRGBColorSpace;
@@ -152,6 +152,66 @@ class MeshTwin {
   ghostMaterial(){return new THREE.MeshStandardMaterial({color:0x40cfff,roughness:.5,metalness:.08,transparent:true,opacity:.22,depthWrite:false,side:THREE.DoubleSide});}
   inspireGhostMaterial(){return new THREE.MeshStandardMaterial({color:0x40cfff,roughness:.42,metalness:.05,transparent:true,opacity:.34,depthWrite:false,side:THREE.DoubleSide,polygonOffset:true,polygonOffsetFactor:-2,polygonOffsetUnits:-2});}
   inspireMaterial(){return new THREE.MeshStandardMaterial({color:0x35414c,roughness:.70,metalness:.10,emissive:0x000000});}
+
+  createSceneReplica(){
+    const root=new THREE.Group();
+    root.name='G1 SLAM mesh replica';
+
+    const replica={
+      root,
+      meshes:new Map()
+    };
+
+    this.sceneReplicas.add(replica);
+
+    for(const [name,source] of this.measuredMeshes){
+      this.addSceneReplicaMesh(
+        replica,
+        name,
+        source
+      );
+    }
+
+    this.syncSceneReplicas(
+      this.lastFk||forward(this.displayQ)
+    );
+
+    return root;
+  }
+
+  addSceneReplicaMesh(replica,name,source){
+    if(replica.meshes.has(name))return;
+
+    const material=source.material.clone();
+    if(material.emissive){
+      material.emissive.setHex(0x000000);
+    }
+
+    const mesh=new THREE.Mesh(
+      source.geometry,
+      material
+    );
+
+    mesh.name=`slam_${name}`;
+    mesh.matrixAutoUpdate=false;
+    mesh.castShadow=false;
+    mesh.receiveShadow=false;
+
+    replica.meshes.set(name,mesh);
+    replica.root.add(mesh);
+  }
+
+  syncSceneReplicas(fk){
+    if(!fk)return;
+
+    for(const replica of this.sceneReplicas){
+      for(const [name,mesh] of replica.meshes){
+        const matrix=fk.links[name];
+        mesh.visible=Boolean(matrix);
+        if(matrix)applyMatrix(mesh,matrix);
+      }
+    }
+  }
   refreshModelStatus(){
     this.inspireReady=this.inspireLoaded===INSPIRE_MESH_COUNT;
     const bodyReady=this.loaded===MESH_NAMES.length;
@@ -162,7 +222,7 @@ class MeshTwin {
   async loadMeshes(){
     const loader=new STLLoader(); const tasks=MESH_NAMES.map(name=>new Promise(resolve=>{
       loader.load(`${MODEL_BASE}${name}.STL`,geo=>{
-        geo.computeVertexNormals(); const measured=new THREE.Mesh(geo,this.materialFor(name)); measured.matrixAutoUpdate=false; measured.userData.linkName=name; measured.userData.jointIndex=CHILD_TO_JOINT.has(name)?CHILD_TO_JOINT.get(name):null; this.measuredMeshes.set(name,measured); this.scene.add(measured); if(measured.userData.jointIndex!==null)this.pickMeshes.push(measured);
+        geo.computeVertexNormals(); const measured=new THREE.Mesh(geo,this.materialFor(name)); measured.matrixAutoUpdate=false; measured.userData.linkName=name; measured.userData.jointIndex=CHILD_TO_JOINT.has(name)?CHILD_TO_JOINT.get(name):null; this.measuredMeshes.set(name,measured); this.scene.add(measured); for(const replica of this.sceneReplicas)this.addSceneReplicaMesh(replica,name,measured); this.syncSceneReplicas(this.lastFk||forward(this.displayQ)); if(measured.userData.jointIndex!==null)this.pickMeshes.push(measured);
         if(ARM_MESHES.has(name)){const ghost=new THREE.Mesh(geo,this.ghostMaterial());ghost.matrixAutoUpdate=false;ghost.renderOrder=3;ghost.visible=this.showGhost;this.ghostMeshes.set(name,ghost);this.scene.add(ghost);}
         this.loaded++; this.modelStatus=`loading official G1 meshes ${this.loaded}/${MESH_NAMES.length}`; resolve(true);
       },undefined,()=>{this.failed.push(name);resolve(false);});
@@ -235,6 +295,7 @@ class MeshTwin {
       if(this.inspireReady&&(name==='left_rubber_hand'||name==='right_rubber_hand')){mesh.visible=false;continue;}
       const m=fk.links[name];if(m){applyMatrix(mesh,m);mesh.visible=true;}else mesh.visible=false;
     }
+    this.syncSceneReplicas(fk);
     const qg=this.displayQ.slice(); if(this.targetPub)for(let i=0;i<14;i++)qg[15+i]=this.displayPub[i]; const gfk=forward(qg);
     for(const [name,mesh] of this.ghostMeshes){
       if(this.inspireReady&&(name==='left_rubber_hand'||name==='right_rubber_hand')){mesh.visible=false;continue;}
@@ -340,6 +401,7 @@ let twin=null;
 export const G1Twin={
   init(canvas,onSelect){if(!twin)twin=new MeshTwin(canvas,onSelect);return twin;},
   updatePose(p){twin?.setPose(p);},
+  createSceneReplica(){return twin?.createSceneReplica()||null;},
   setGhostVisible(v){twin?.setGhostVisible(v);},
   setJointsVisible(v){twin?.setJointsVisible(v);},
   setHealthVisible(v){twin?.setHealthVisible(v);},

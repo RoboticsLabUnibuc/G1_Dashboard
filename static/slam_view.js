@@ -3,6 +3,13 @@ import * as THREE from './vendor/three.module.min.js';
 const clamp=(value,minimum,maximum)=>
   Math.max(minimum,Math.min(maximum,Number(value)));
 
+const stepAngle=(current,target,alpha)=>{
+  let difference=target-current;
+  while(difference>Math.PI)difference-=Math.PI*2;
+  while(difference<-Math.PI)difference+=Math.PI*2;
+  return current+difference*alpha;
+};
+
 class SlamViewer {
   constructor(canvas){
     this.canvas=canvas;
@@ -71,6 +78,13 @@ class SlamViewer {
 
     this.grid=null;
     this.robot=this.buildRobot();
+    this.robotModel=null;
+    this.robotTargetPosition=new THREE.Vector3();
+    this.robotDisplayPosition=new THREE.Vector3();
+    this.robotTargetYaw=0;
+    this.robotDisplayYaw=0;
+    this.robotPoseInitialized=false;
+    this.lastRenderTime=performance.now();
     this.scene.add(this.robot);
 
     this.initialPoseMarker=this.buildInitialPoseMarker();
@@ -91,41 +105,23 @@ class SlamViewer {
 
   buildRobot(){
     const group=new THREE.Group();
-    const light=new THREE.MeshStandardMaterial({
-      color:0xc8d2db,roughness:0.55,metalness:0.18
-    });
-    const dark=new THREE.MeshStandardMaterial({
-      color:0x25303a,roughness:0.7
-    });
-
-    const part=(geometry,material,position)=>{
-      const mesh=new THREE.Mesh(geometry,material);
-      mesh.position.set(...position);
-      group.add(mesh);
-      return mesh;
-    };
-
-    part(new THREE.BoxGeometry(0.38,0.24,0.48),light,[0,0,0.93]);
-    part(new THREE.BoxGeometry(0.26,0.25,0.23),dark,[0.02,0,1.31]);
-    part(new THREE.BoxGeometry(0.30,0.22,0.20),dark,[0,0,0.64]);
-
-    for(const side of [-1,1]){
-      part(new THREE.BoxGeometry(0.11,0.10,0.54),light,[0,side*0.12,0.34]);
-      part(new THREE.BoxGeometry(0.26,0.12,0.08),dark,[0.07,side*0.12,0.04]);
-      part(new THREE.BoxGeometry(0.10,0.10,0.48),light,[0,side*0.25,0.88]);
-    }
-
-    const heading=new THREE.ArrowHelper(
-      new THREE.Vector3(1,0,0),
-      new THREE.Vector3(0,0,0.12),
-      0.9,
-      0xff5364,
-      0.24,
-      0.15
-    );
-    group.add(heading);
+    group.name='Localized G1';
     group.visible=false;
     return group;
+  }
+
+  setRobotModel(model){
+    if(this.robotModel){
+      this.robot.remove(this.robotModel);
+    }
+
+    this.robotModel=model||null;
+
+    if(this.robotModel){
+      this.robot.add(this.robotModel);
+    }
+
+    this.updateVisibility();
   }
 
   buildInitialPoseMarker(){
@@ -309,12 +305,21 @@ class SlamViewer {
     this.camera.lookAt(this.target);
   }
 
-  loop(){
+  loop(now=performance.now()){
+    const dt=Math.min(
+      0.1,
+      Math.max(0,(now-this.lastRenderTime)/1000)
+    );
+    this.lastRenderTime=now;
+
+    this.updateRobotPose(dt);
+
     if(this.visible){
       this.updateCamera();
       this.renderer.render(this.scene,this.camera);
     }
-    requestAnimationFrame(()=>this.loop());
+
+    requestAnimationFrame(time=>this.loop(time));
   }
 
   setVisible(value){
@@ -465,41 +470,86 @@ class SlamViewer {
 
   setRobotPose(pose,localized){
     this.robotLocalized=Boolean(localized);
+
     const valid=Boolean(
       pose
       && Number.isFinite(Number(pose.x))
       && Number.isFinite(Number(pose.y))
       && Number.isFinite(Number(pose.yaw))
     );
+
     this.robotHasPose=valid;
+
     if(valid){
       const x=Number(pose.x);
       const y=Number(pose.y);
       const yaw=Number(pose.yaw);
 
-      const robotPosition=this.levelPoint(
+      const position=this.levelPoint(
         x,
         y,
         this.floorHeight(x,y),
         new THREE.Vector3()
       );
 
-      const headingX=x+Math.cos(yaw);
-      const headingY=y+Math.sin(yaw);
-      const robotHeading=this.levelPoint(
-        headingX,
-        headingY,
-        this.floorHeight(headingX,headingY),
+      const heading=this.levelPoint(
+        x+Math.cos(yaw),
+        y+Math.sin(yaw),
+        this.floorHeight(
+          x+Math.cos(yaw),
+          y+Math.sin(yaw)
+        ),
         new THREE.Vector3()
-      ).sub(robotPosition);
+      ).sub(position);
 
-      this.robot.position.copy(robotPosition);
-      this.robot.rotation.z=Math.atan2(
-        robotHeading.y,
-        robotHeading.x
+      this.robotTargetPosition.copy(position);
+      this.robotTargetYaw=Math.atan2(
+        heading.y,
+        heading.x
       );
+
+      if(!this.robotPoseInitialized){
+        this.robotDisplayPosition.copy(
+          this.robotTargetPosition
+        );
+        this.robotDisplayYaw=this.robotTargetYaw;
+        this.robot.position.copy(
+          this.robotDisplayPosition
+        );
+        this.robot.rotation.z=
+          this.robotDisplayYaw;
+        this.robotPoseInitialized=true;
+      }
+    }else{
+      this.robotPoseInitialized=false;
     }
+
     this.updateVisibility();
+  }
+
+  updateRobotPose(dt){
+    if(!this.robotPoseInitialized)return;
+
+    const alpha=
+      1-Math.exp(-Math.max(0,dt)/0.08);
+
+    this.robotDisplayPosition.lerp(
+      this.robotTargetPosition,
+      alpha
+    );
+
+    this.robotDisplayYaw=stepAngle(
+      this.robotDisplayYaw,
+      this.robotTargetYaw,
+      alpha
+    );
+
+    this.robot.position.copy(
+      this.robotDisplayPosition
+    );
+
+    this.robot.rotation.z=
+      this.robotDisplayYaw;
   }
 
   loadAsciiPcd(text){
