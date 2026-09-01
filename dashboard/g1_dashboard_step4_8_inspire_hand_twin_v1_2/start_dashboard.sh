@@ -10,6 +10,15 @@ BASE_SENSING="${G1_DASHBOARD_BASE_SENSING:-auto}"
 SYSTEM_HZ="${G1_DASHBOARD_SYSTEM_HZ:-5}"
 PROCESS_ACTIONS="${G1_DASHBOARD_PROCESS_ACTIONS:-1}"
 SERVICE_ACTIONS="${G1_DASHBOARD_SERVICE_ACTIONS:-$PROCESS_ACTIONS}"
+SLAM_ENABLED="${G1_DASHBOARD_SLAM_ENABLED:-1}"
+SLAM_PY="${G1_DASHBOARD_SLAM_PYTHON:-/usr/bin/python3}"
+SLAM_MAP="${G1_DASHBOARD_SLAM_MAP:-$HOME/g1_ws/map/harta_buna_2707.pcd}"
+SLAM_STATE_DIR="${G1_DASHBOARD_SLAM_STATE_DIR:-/tmp/g1_dashboard_slam_$(id -u)}"
+DASHBOARD_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/g1_dashboard"
+SLAM_LOG="$DASHBOARD_STATE_DIR/slam_worker.log"
+
+export G1_DASHBOARD_SLAM_MAP="$SLAM_MAP"
+export G1_DASHBOARD_SLAM_STATE_DIR="$SLAM_STATE_DIR"
 
 if [[ -n "${G1_DASHBOARD_MONITOR_PYTHON:-}" ]]; then
   MONITOR_PY="$G1_DASHBOARD_MONITOR_PYTHON"
@@ -27,6 +36,7 @@ BRIDGE_PY="${G1_DASHBOARD_BRIDGE_PYTHON:-$(command -v python3)}"
 MONITOR_PID=""
 BRIDGE_PID=""
 SERVICE_PID=""
+SLAM_PID=""
 REQUEST_STACK_SHUTDOWN=0
 CLEANUP_STARTED=0
 
@@ -47,17 +57,32 @@ cleanup() {
   # Browser closure or an unexpected bridge exit still does NOT become a robot
   # control input. External/manual controller/camera/Inspire processes are never
   # killed; only dashboard-owned state is stopped.
-  if [[ "$REQUEST_STACK_SHUTDOWN" == "1" ]] && [[ "$PROCESS_ACTIONS" == "1" || "$PROCESS_ACTIONS" == "true" || "$PROCESS_ACTIONS" == "yes" ]]; then
+  if [[ "$REQUEST_STACK_SHUTDOWN" == "1" ]]; then
     echo
-    echo "Stopping dashboard-managed listener, camera and Inspire dependency..."
-    "$BRIDGE_PY" - <<'PY' || true
+
+    if [[ "$PROCESS_ACTIONS" == "1" || "$PROCESS_ACTIONS" == "true" || "$PROCESS_ACTIONS" == "yes" ]]; then
+      echo "Stopping dashboard-managed listener, camera, full-body sender and Inspire dependency..."
+      "$BRIDGE_PY" - <<'PY' || true
 from g1_dashboard_process_manager import ControllerProcessManager
 manager = ControllerProcessManager(enabled=True)
 summary = manager.shutdown_dashboard_managed(timeout_s=15.0)
 print("Managed shutdown:", summary)
 PY
+    else
+      echo "Stopping dashboard-managed full-body sender..."
+      "$BRIDGE_PY" - <<'PY' || true
+from g1_dashboard_process_manager import ControllerProcessManager
+manager = ControllerProcessManager(enabled=False)
+summary = manager.fullbody_sender.stop(timeout_s=3.0)
+print("Full-body shutdown:", summary)
+PY
+    fi
   fi
 
+  if [[ -n "${SLAM_PID:-}" ]] && kill -0 "$SLAM_PID" 2>/dev/null; then
+    kill "$SLAM_PID" 2>/dev/null || true
+    wait "$SLAM_PID" 2>/dev/null || true
+  fi
   if [[ -n "${BRIDGE_PID:-}" ]] && kill -0 "$BRIDGE_PID" 2>/dev/null; then
     kill "$BRIDGE_PID" 2>/dev/null || true
     wait "$BRIDGE_PID" 2>/dev/null || true
@@ -175,6 +200,67 @@ if [[ "$SERVICE_ENABLED" == "1" ]]; then
     echo "WARNING: service action worker did not become ready; controls will show offline." >&2
     tail -20 "$SERVICE_LOG" 2>/dev/null || true
   fi
+fi
+
+if [[ "$SLAM_ENABLED" == "1" || "$SLAM_ENABLED" == "true" || "$SLAM_ENABLED" == "yes" ]]; then
+  if [[ ! -f "$HERE/g1_dashboard_slam_worker.py" ]]; then
+    echo "ERROR: missing SLAM worker: $HERE/g1_dashboard_slam_worker.py" >&2
+    exit 2
+  fi
+  if [[ ! -f "$SLAM_MAP" ]]; then
+    echo "ERROR: missing SLAM map: $SLAM_MAP" >&2
+    exit 2
+  fi
+  if [[ ! -x "$SLAM_PY" ]]; then
+    echo "ERROR: SLAM Python is not executable: $SLAM_PY" >&2
+    exit 2
+  fi
+
+  mkdir -p "$DASHBOARD_STATE_DIR" "$SLAM_STATE_DIR"
+  rm -f \
+    "$SLAM_STATE_DIR/status.json" \
+    "$SLAM_STATE_DIR/live_cloud_f32.bin" \
+    "$SLAM_STATE_DIR/initialize_request.json"
+
+  (
+    set +u
+    source /opt/ros/humble/setup.bash
+
+    for workspace in       "$HOME/workspace/unitree_ros2"       "$HOME/unitree_ros2/cyclonedds_ws"       "$HOME/unitree_ros2"       "$HOME/cyclonedds_ws"       "$HOME/ros2_ws"
+    do
+      if [[ -f "$workspace/install/setup.bash" ]]; then
+        source "$workspace/install/setup.bash"
+        break
+      fi
+    done
+
+    export ROS_LOCALHOST_ONLY=0
+    export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+    export CYCLONEDDS_URI="${CYCLONEDDS_URI:-$HOME/cyclonedds.xml}"
+    export G1_DASHBOARD_SLAM_MAP="$SLAM_MAP"
+    export G1_DASHBOARD_SLAM_STATE_DIR="$SLAM_STATE_DIR"
+
+    exec "$SLAM_PY"       "$HERE/g1_dashboard_slam_worker.py"       --map "$SLAM_MAP"       --state-dir "$SLAM_STATE_DIR"
+  ) >"$SLAM_LOG" 2>&1 &
+  SLAM_PID=$!
+
+  for _ in $(seq 1 30); do
+    [[ -s "$SLAM_STATE_DIR/status.json" ]] && break
+    kill -0 "$SLAM_PID" 2>/dev/null || break
+    sleep 0.10
+  done
+
+  if kill -0 "$SLAM_PID" 2>/dev/null       && [[ -s "$SLAM_STATE_DIR/status.json" ]]; then
+    echo "SLAM worker pid : $SLAM_PID"
+    echo "SLAM map        : $SLAM_MAP"
+    echo "SLAM worker log : $SLAM_LOG"
+  else
+    echo "ERROR: SLAM worker did not become ready." >&2
+    tail -40 "$SLAM_LOG" 2>/dev/null || true
+    exit 2
+  fi
+else
+  echo "SLAM worker     : DISABLED"
 fi
 
 echo "System monitor pid: $MONITOR_PID"

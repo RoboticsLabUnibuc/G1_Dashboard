@@ -31,8 +31,8 @@ CONTROLLER_BASENAME = (
     "dashboard_telemetry_v1_8.py"
 )
 MANAGER_SCHEMA = "g1_dashboard.controller_process.v1"
-MANAGER_VERSION = "g1_dashboard_process_manager.v1.5.0-quest-fullbody"
-CONTROLLER_SHA256 = "1e5d92c3c460c4f652e22e8de00ae2305d444f3e4a2485dfa8cebbb68c2b8484"
+MANAGER_VERSION = "g1_dashboard_process_manager.v1.7.0-independent-robot-stream"
+CONTROLLER_SHA256 = "6a2ac6c3ec7851082caa4f7c40081bbf66935392f15733ad3c8239410a5c2ac7"
 
 ACTION_REQUEST_SCHEMA = "g1_dashboard.action_request.v1"
 ACTION_RESPONSE_SCHEMA = "g1_dashboard.action_response.v1"
@@ -494,13 +494,43 @@ class ControllerProcessManager:
         self.fullbody_sender = FullBodySenderManager(
             python_path=self.python_path,
         )
+        self._fullbody_retry_not_before = 0.0
         self._load_state()
         self._load_camera_state()
-        if self._managed is None:
+
+    def ensure_dashboard_fullbody_sender(self) -> dict[str, Any]:
+        """Keep full-body telemetry alive for the dashboard lifetime."""
+        with self._lock:
+            current = self.fullbody_sender.status()
+
+            if current.get("state") != "STOPPED":
+                return current
+
+            now = time.monotonic()
+            if now < self._fullbody_retry_not_before:
+                return current
+
+            self._fullbody_retry_not_before = now + 5.0
+
             try:
-                self.fullbody_sender.stop(timeout_s=2.0)
+                current = self.fullbody_sender.start()
+                self._fullbody_retry_not_before = 0.0
+
+                if (
+                    self._last_error is not None
+                    and self._last_error.startswith(
+                        "dashboard full-body sender startup failed:"
+                    )
+                ):
+                    self._last_error = None
+
+                return current
             except Exception as exc:
-                self._last_error = f"full-body orphan cleanup failed: {exc}"
+                self._last_error = (
+                    "dashboard full-body sender startup failed: "
+                    f"{exc}"
+                )
+                return self.fullbody_sender.status()
 
     # ---------- persisted controller state ----------
     def _load_state(self) -> None:
@@ -1437,10 +1467,6 @@ class ControllerProcessManager:
         alive, _pid = self._managed_alive()
         if self._managed is not None and not alive:
             finished = self._managed
-            try:
-                self.fullbody_sender.stop(timeout_s=2.0)
-            except Exception as exc:
-                self._last_error = f"controller exited, but full-body sender cleanup failed: {exc}"
             self._managed = None
             self._save_state()
             if finished.get("stop_requested_unix_time_s") and finished.get("inspire_stop_with_controller"):
@@ -1462,6 +1488,7 @@ class ControllerProcessManager:
             external = [pid for pid in matching if pid != managed_pid]
             now = time.time()
             inspire = self._inspire_status()
+            fullbody = self.ensure_dashboard_fullbody_sender()
 
             if managed_alive and self._managed is not None:
                 stop_requested = self._managed.get("stop_requested_unix_time_s")
@@ -1488,7 +1515,10 @@ class ControllerProcessManager:
                     "can_start": False,
                     "can_stop": True,
                     "can_request_action": bool(self._managed.get("action_token")) and not bool(stop_requested),
-                    "dependencies": {"inspire": inspire},
+                    "dependencies": {
+                        "inspire": inspire,
+                        "fullbody": fullbody,
+                    },
                 }
 
             if matching:
@@ -1511,7 +1541,10 @@ class ControllerProcessManager:
                     "can_start": False,
                     "can_stop": False,
                     "can_request_action": False,
-                    "dependencies": {"inspire": inspire},
+                    "dependencies": {
+                        "inspire": inspire,
+                        "fullbody": fullbody,
+                    },
                 }
 
             script_hash = _sha256_file(self.script_path) if self.script_path.is_file() else None
@@ -1550,7 +1583,10 @@ class ControllerProcessManager:
                 "can_start": ready,
                 "can_stop": False,
                 "can_request_action": False,
-                "dependencies": {"inspire": inspire},
+                "dependencies": {
+                    "inspire": inspire,
+                    "fullbody": fullbody,
+                },
             }
 
     def start(self, parameters: Any) -> dict[str, Any]:
@@ -1625,11 +1661,6 @@ class ControllerProcessManager:
                         self._stop_inspire_managed_dependency()
                     except Exception as cleanup_exc:
                         self._last_error = f"controller spawn failed and Inspire rollback also failed: {cleanup_exc}"
-                if fullbody.get("started_now"):
-                    try:
-                        self.fullbody_sender.stop(timeout_s=3.0)
-                    except Exception:
-                        pass
                 raise
             log.close()
             self._popen = proc
@@ -1664,11 +1695,6 @@ class ControllerProcessManager:
                         self._stop_inspire_managed_dependency()
                     except Exception as cleanup_exc:
                         self._last_error = f"controller exited immediately and Inspire rollback failed: {cleanup_exc}"
-                if fullbody.get("started_now"):
-                    try:
-                        self.fullbody_sender.stop(timeout_s=3.0)
-                    except Exception:
-                        pass
                 raise RuntimeError(f"controller exited immediately with code {rc}; inspect {self.log_path}")
             return self.status()
 
@@ -1774,10 +1800,8 @@ class ControllerProcessManager:
                 return self.status()
             if self._managed.get("stop_requested_unix_time_s"):
                 return self.status()
-            try:
-                self.fullbody_sender.stop(timeout_s=3.0)
-            except Exception as exc:
-                self._last_error = f"Quest full-body sender stop failed: {exc}"
+            # Full-body telemetry is dashboard-owned and remains active
+            # when only the teleop controller is stopped.
             # Controller must stop first.  _refresh() stops a helper-managed
             # Inspire service only after the controlled controller process exits.
             ticks = self._managed.get("start_ticks")

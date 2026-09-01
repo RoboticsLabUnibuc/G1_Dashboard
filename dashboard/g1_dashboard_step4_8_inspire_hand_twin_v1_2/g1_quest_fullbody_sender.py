@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+import json
+import math
 import os
 import signal
 import socket
@@ -40,10 +42,42 @@ SEND_HZ = float(os.environ.get(
 ))
 NUM_JOINTS = 29
 
+DASHBOARD_HOST = os.environ.get(
+    "G1_DASHBOARD_ROBOT_TELEMETRY_HOST",
+    "127.0.0.1",
+)
+DASHBOARD_PORT = int(os.environ.get(
+    "G1_DASHBOARD_ROBOT_TELEMETRY_PORT",
+    "8768",
+))
+DASHBOARD_SCHEMA = "g1_dashboard.robot_telemetry.v1"
+
+JOINT_NAMES = (
+    "L_hip_pitch", "L_hip_roll", "L_hip_yaw",
+    "L_knee", "L_ankle_pitch", "L_ankle_roll",
+    "R_hip_pitch", "R_hip_roll", "R_hip_yaw",
+    "R_knee", "R_ankle_pitch", "R_ankle_roll",
+    "waist_yaw", "waist_roll", "waist_pitch",
+    "L_shoulder_pitch", "L_shoulder_roll",
+    "L_shoulder_yaw", "L_elbow", "L_wrist_roll",
+    "L_wrist_pitch", "L_wrist_yaw",
+    "R_shoulder_pitch", "R_shoulder_roll",
+    "R_shoulder_yaw", "R_elbow", "R_wrist_roll",
+    "R_wrist_pitch", "R_wrist_yaw",
+)
+
 if not (1 <= QUEST_PORT <= 65535):
     raise SystemExit("invalid Quest telemetry UDP port")
 if not (1.0 <= SEND_HZ <= 120.0):
     raise SystemExit("invalid Quest telemetry send rate")
+if DASHBOARD_HOST not in ("127.0.0.1", "localhost"):
+    raise SystemExit(
+        "dashboard robot telemetry must remain loopback-only"
+    )
+if not (1 <= DASHBOARD_PORT <= 65535):
+    raise SystemExit(
+        "invalid dashboard robot telemetry UDP port"
+    )
 
 
 # ============================================================
@@ -52,18 +86,13 @@ if not (1.0 <= SEND_HZ <= 120.0):
 
 lock = threading.Lock()
 
-latest_q = None
-latest_tick = -1
-
-# mode_pr:
-#   0 = PR mode (Pitch/Roll coordinates)
-#   1 = AB mode (parallel A/B coordinates)
-latest_mode_pr = -1
-
-# G1 hardware/model configuration identifier.
-latest_mode_machine = -1
-
-latest_recv = 0.0
+# The DDS callback must remain constant-time. Parsing every high-rate
+# LowState sample here can make the reader fall behind during controller
+# startup. The 30 Hz sender loop parses only the newest retained sample.
+latest_lowstate = None
+latest_recv_monotonic = 0.0
+latest_recv_unix = 0.0
+latest_callback_count = 0
 
 stop_event = threading.Event()
 
@@ -76,36 +105,98 @@ def request_stop(_signum, _frame):
 # DDS CALLBACK
 # ============================================================
 
-def lowstate_callback(msg):
-    global latest_q
-    global latest_tick
-    global latest_mode_pr
-    global latest_mode_machine
-    global latest_recv
-
+def finite_float(value):
     try:
-        q = [
-            float(msg.motor_state[i].q)
-            for i in range(NUM_JOINTS)
-        ]
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
 
-        tick = int(msg.tick)
 
-        mode_pr = int(msg.mode_pr)
-        mode_machine = int(msg.mode_machine)
+def temperature_pair(motor_state):
+    try:
+        values = list(motor_state.temperature)
+    except Exception:
+        return [None, None]
 
-    except Exception as exc:
-        print(
-            f"[WARN] Failed to parse LowState: {exc}"
+    first = (
+        finite_float(values[0])
+        if len(values) >= 1
+        else None
+    )
+    second = (
+        finite_float(values[1])
+        if len(values) >= 2
+        else None
+    )
+    return [first, second]
+
+
+def parse_lowstate(msg):
+    motors = [
+        msg.motor_state[i]
+        for i in range(NUM_JOINTS)
+    ]
+
+    q = [
+        finite_float(motor.q)
+        for motor in motors
+    ]
+    dq = [
+        finite_float(motor.dq)
+        for motor in motors
+    ]
+    tau_est = [
+        finite_float(
+            getattr(motor, "tau_est", None)
         )
-        return
+        for motor in motors
+    ]
+    temperatures = [
+        temperature_pair(motor)
+        for motor in motors
+    ]
+
+    motor_state = []
+    for motor in motors:
+        try:
+            motor_state.append(
+                int(motor.motorstate)
+            )
+        except Exception:
+            motor_state.append(None)
+
+    if any(value is None for value in q):
+        raise ValueError(
+            "one or more joint positions are non-finite"
+        )
+
+    return (
+        q,
+        dq,
+        tau_est,
+        temperatures,
+        motor_state,
+        int(msg.tick),
+        int(msg.mode_pr),
+        int(msg.mode_machine),
+    )
+
+
+def lowstate_callback(msg):
+    global latest_lowstate
+    global latest_recv_monotonic
+    global latest_recv_unix
+    global latest_callback_count
+
+    received_monotonic = time.monotonic()
+    received_unix = time.time()
 
     with lock:
-        latest_q = q
-        latest_tick = tick
-        latest_mode_pr = mode_pr
-        latest_mode_machine = mode_machine
-        latest_recv = time.monotonic()
+        latest_lowstate = msg
+        latest_recv_monotonic = received_monotonic
+        latest_recv_unix = received_unix
+        latest_callback_count += 1
 
 
 # ============================================================
@@ -117,13 +208,18 @@ def main():
     signal.signal(signal.SIGINT, request_stop)
 
     print("==========================================")
-    print(" G1 -> QUEST FULL-BODY TELEMETRY")
+    print(" G1 -> QUEST + DASHBOARD FULL-BODY TELEMETRY")
     print("==========================================")
     print()
 
     print(
         f"Quest destination : "
         f"{QUEST_IP}:{QUEST_PORT}"
+    )
+
+    print(
+        f"Dashboard stream  : "
+        f"{DASHBOARD_HOST}:{DASHBOARD_PORT}"
     )
 
     print(
@@ -162,7 +258,9 @@ def main():
         HgLowState,
     )
 
-    # queueLen = 0 -> latest-data style callback
+    # queueLen = 0 executes the constant-time callback directly on the
+    # DDS reader notification. Heavy snapshot parsing stays in the 30 Hz
+    # sender loop so controller startup cannot build a parsing backlog.
     subscriber.Init(
         lowstate_callback,
         0,
@@ -187,20 +285,43 @@ def main():
             loop_start = time.monotonic()
 
             with lock:
-                if latest_q is None:
-                    q = None
-                else:
-                    q = latest_q.copy()
+                sample = latest_lowstate
+                recv_monotonic = (
+                    latest_recv_monotonic
+                )
+                sample_unix_time = (
+                    latest_recv_unix
+                )
+                callback_count = (
+                    latest_callback_count
+                )
 
-                tick = latest_tick
-                mode_pr = latest_mode_pr
-                mode_machine = latest_mode_machine
-                recv = latest_recv
+            q = None
+
+            if sample is not None:
+                try:
+                    (
+                        q,
+                        dq,
+                        tau_est,
+                        temperatures,
+                        motor_state,
+                        tick,
+                        mode_pr,
+                        mode_machine,
+                    ) = parse_lowstate(sample)
+                except Exception as exc:
+                    print(
+                        "[WARN] Failed to parse "
+                        "LowState snapshot: "
+                        f"{exc}"
+                    )
 
             if q is not None:
                 sample_age = max(
                     0.0,
-                    time.monotonic() - recv,
+                    time.monotonic()
+                    - recv_monotonic,
                 )
 
                 # ------------------------------------------------
@@ -243,6 +364,60 @@ def main():
                         QUEST_PORT,
                     ),
                 )
+
+                dashboard_packet = {
+                    "schema": DASHBOARD_SCHEMA,
+                    "sequence": int(seq),
+                    "unix_time_s": sample_unix_time,
+                    "monotonic_s": time.monotonic(),
+                    "robot": {
+                        "model_family": "Unitree G1",
+                        "joint_count": NUM_JOINTS,
+                        "mode_machine": mode_machine,
+                        "mode_pr": mode_pr,
+                        "tick": tick,
+                        "sample_age_s": sample_age,
+                        "dds_callback_count": callback_count,
+                        "motor_indices": list(
+                            range(NUM_JOINTS)
+                        ),
+                        "joint_names": list(
+                            JOINT_NAMES
+                        ),
+                        "measured_q_rad": q,
+                        "measured_dq_rps": dq,
+                        "tau_est": tau_est,
+                        "temperatures_c":
+                            temperatures,
+                        "motor_state": motor_state,
+                    },
+                }
+
+                try:
+                    encoded = json.dumps(
+                        dashboard_packet,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode("utf-8")
+
+                    sock.sendto(
+                        encoded,
+                        (
+                            DASHBOARD_HOST,
+                            DASHBOARD_PORT,
+                        ),
+                    )
+                except Exception as exc:
+                    if (
+                        seq
+                        % max(1, int(SEND_HZ))
+                        == 0
+                    ):
+                        print(
+                            "[WARN] Dashboard robot "
+                            "telemetry send failed: "
+                            f"{exc}"
+                        )
 
                 # Print once per second.
                 if seq % int(SEND_HZ) == 0:

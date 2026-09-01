@@ -1,5 +1,6 @@
 import { G1Twin } from './g1_model.js';
 import { PointCloud3D } from './pointcloud_view.js';
+import { SlamWorld3D } from './slam_view.js?v=initial-pose-v2-drag-fix';
 
 (()=>{
 'use strict';
@@ -38,11 +39,24 @@ let pointCloudFetchBusy=false;
 let pointCloudPollTimer=null;
 let selectedJointIndex=18;
 
+const slamViewer=SlamWorld3D.init($('slamCanvas'));
+let slamMapLoaded=false;
+let slamMapLoading=false;
+let slamStatusBusy=false;
+let slamCloudBusy=false;
+let slamLastCloudSequence=-1;
+let slamLatestStatus=null;
+let slamInitialSelecting=false;
+let slamInitialDraft=null;
+let slamInitialBusy=false;
+
 function switchView(name){
-  if(!['live','inspect','status'].includes(name)) return;
+  if(!['live','slam','inspect','status'].includes(name)) return;
   currentView=name;
   document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===`view-${name}`));
   document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.view===name));
+  slamViewer.setVisible(name==='slam');
+  if(name==='slam')ensureSlamMap();
 }
 document.querySelectorAll('.tab').forEach(b=>b.addEventListener('click',()=>switchView(b.dataset.view)));
 document.querySelectorAll('[data-view-jump]').forEach(b=>b.addEventListener('click',()=>switchView(b.dataset.viewJump)));
@@ -839,6 +853,11 @@ function renderRobot(t){
 }
 
 G1Twin.init($('robotTwinCanvas'),(i)=>{selectedJointIndex=i;renderSelectedJoint(latestEnv?.telemetry||{});});
+
+const slamRobotModel=G1Twin.createSceneReplica();
+if(slamRobotModel){
+  slamViewer.setRobotModel(slamRobotModel);
+}
 G1Twin.selectJoint(selectedJointIndex);
 $('ghostToggle').addEventListener('change',e=>G1Twin.setGhostVisible(e.target.checked));
 $('jointToggle').addEventListener('change',e=>G1Twin.setJointsVisible(e.target.checked));
@@ -1230,6 +1249,304 @@ $('serviceFilter')?.addEventListener('input',renderServiceList);
 $('serviceStateFilter')?.addEventListener('change',renderServiceList);
 $('servicePolicyFilter')?.addEventListener('change',renderServiceList);
 
+async function ensureSlamMap(){
+  if(slamMapLoaded||slamMapLoading)return;
+  slamMapLoading=true;
+  const overlay=$('slamOverlay');
+  overlay.classList.remove('hidden');
+  overlay.querySelector('strong').textContent='Loading laboratory map…';
+
+  try{
+    const response=await fetch('/api/slam/map',{cache:'no-store'});
+    if(!response.ok)throw new Error(`HTTP ${response.status}`);
+    const result=slamViewer.loadAsciiPcd(await response.text());
+    slamMapLoaded=true;
+    $('slamMapMeta').textContent=
+      `${result.points.toLocaleString()} visible points · ${result.spanX.toFixed(1)} × ${result.spanY.toFixed(1)} m`;
+    overlay.classList.add('hidden');
+  }catch(error){
+    overlay.querySelector('strong').textContent='Laboratory map unavailable';
+    overlay.querySelector('span').textContent=String(error.message||error);
+    $('slamMapMeta').textContent='load failed';
+  }finally{
+    slamMapLoading=false;
+  }
+}
+
+function setSlamInitialResult(message,tone=null){
+  const element=$('slamInitialResult');
+  element.textContent=message||'';
+  setTone(element,tone);
+}
+
+function cancelSlamInitialSelection(){
+  slamInitialSelecting=false;
+  slamInitialDraft=null;
+  slamViewer.clearInitialPoseSelection();
+
+  $('slamInitialSelection').textContent='No position selected';
+  $('slamInitialStartBtn').classList.remove('hidden');
+  $('slamInitialConfirmBtn').classList.add('hidden');
+  $('slamInitialCancelBtn').classList.add('hidden');
+  $('slamInitialConfirmBtn').disabled=true;
+
+  renderSlamInitialization(slamLatestStatus||{});
+}
+
+async function beginSlamInitialSelection(){
+  if(slamInitialBusy)return;
+
+  if(!slamMapLoaded){
+    await ensureSlamMap();
+    if(!slamMapLoaded){
+      setSlamInitialResult(
+        'The saved map must load before selecting a pose.',
+        'bad'
+      );
+      return;
+    }
+  }
+
+  if(slamLatestStatus?.localized){
+    const proceed=window.confirm(
+      'The robot is currently localized. Replace its current '
+      +'localization with a new approximate pose?'
+    );
+    if(!proceed)return;
+  }
+
+  slamInitialSelecting=true;
+  slamInitialDraft=null;
+
+  $('slamInitialStartBtn').classList.add('hidden');
+  $('slamInitialConfirmBtn').classList.remove('hidden');
+  $('slamInitialCancelBtn').classList.remove('hidden');
+  $('slamInitialConfirmBtn').disabled=true;
+  $('slamInitialSelection').textContent='Click and drag on the map';
+  setSlamInitialResult(
+    'Click the robot position, then drag toward its forward direction.',
+    'warn'
+  );
+
+  slamViewer.beginInitialPoseSelection(pose=>{
+    slamInitialDraft=pose;
+    $('slamInitialSelection').textContent=
+      `X ${pose.x.toFixed(2)} m · Y ${pose.y.toFixed(2)} m · `
+      +`heading ${(pose.yaw*180/Math.PI).toFixed(1)}°`;
+    $('slamInitialConfirmBtn').disabled=false;
+  });
+}
+
+async function confirmSlamInitialPose(){
+  if(slamInitialBusy||!slamInitialDraft)return;
+
+  if(!currentManagementKey()){
+    showManagementKeyPrompt(
+      'Enter the management key to initialize the robot pose.',
+      ()=>confirmSlamInitialPose()
+    );
+    return;
+  }
+
+  const pose={...slamInitialDraft};
+  const confirmed=window.confirm(
+    `Initialize the robot at X ${pose.x.toFixed(2)} m, `
+    +`Y ${pose.y.toFixed(2)} m, heading `
+    +`${(pose.yaw*180/Math.PI).toFixed(1)}°?`
+  );
+  if(!confirmed)return;
+
+  slamInitialBusy=true;
+  $('slamInitialConfirmBtn').disabled=true;
+  $('slamInitialCancelBtn').disabled=true;
+  setSlamInitialResult('Sending initial pose…','warn');
+
+  try{
+    await controllerPost('/api/slam/initialize',pose);
+
+    slamInitialSelecting=false;
+    slamViewer.finishInitialPoseSelection(true);
+    $('slamInitialStartBtn').classList.remove('hidden');
+    $('slamInitialConfirmBtn').classList.add('hidden');
+    $('slamInitialCancelBtn').classList.add('hidden');
+    setSlamInitialResult(
+      'Request sent. Waiting for native SLAM confirmation…',
+      'warn'
+    );
+  }catch(error){
+    setSlamInitialResult(
+      `Initialization failed: ${error.message||error}`,
+      'bad'
+    );
+    $('slamInitialConfirmBtn').disabled=false;
+    $('slamInitialCancelBtn').disabled=false;
+  }finally{
+    slamInitialBusy=false;
+  }
+}
+
+function renderSlamInitialization(status){
+  slamLatestStatus=status;
+
+  const initialization=status?.initialization||{};
+  const state=String(initialization.state||'IDLE');
+  const active=state==='PUBLISHED'||state==='ACCEPTED';
+
+  if(!slamInitialSelecting){
+    const start=$('slamInitialStartBtn');
+    start.classList.remove('hidden');
+    start.textContent=status?.localized?
+      'Reset robot position':'Set robot position';
+    start.disabled=(
+      slamInitialBusy
+      || active
+      || !status?.worker_online
+    );
+  }
+
+  if(slamInitialSelecting)return;
+
+  if(state==='PUBLISHED'){
+    setSlamInitialResult(
+      'Initial pose published. Waiting for API 1804…',
+      'warn'
+    );
+  }else if(state==='ACCEPTED'){
+    setSlamInitialResult(
+      'Native SLAM accepted the pose. Waiting for localization…',
+      'warn'
+    );
+  }else if(state==='LOCALIZED'){
+    setSlamInitialResult('Localization confirmed.','good');
+    slamInitialDraft=null;
+    slamViewer.clearInitialPoseSelection();
+  }else if(state==='REJECTED'){
+    setSlamInitialResult(
+      `Initialization rejected: ${initialization.error||'unknown error'}`,
+      'bad'
+    );
+  }else if(state==='TIMEOUT'){
+    setSlamInitialResult(
+      `Initialization timed out: ${initialization.error||'no fresh pose'}`,
+      'bad'
+    );
+  }else if(!status?.worker_online){
+    setSlamInitialResult('SLAM worker is offline.','bad');
+  }else if(!status?.localized){
+    setSlamInitialResult(
+      'Select the robot’s approximate map position and heading.',
+      'warn'
+    );
+  }else{
+    setSlamInitialResult(
+      'Localization is active. Reset only if the displayed pose is wrong.',
+      'good'
+    );
+  }
+}
+
+function renderSlamStatus(status){
+  const state=String(status?.state||'OFFLINE');
+  const tone=state==='LOCALIZED'?'good':
+    state==='UNLOCALIZED'?'warn':'bad';
+
+  setChip($('slamStateChip'),state,tone);
+  $('slamLocalizationState').textContent=state;
+  setTone($('slamLocalizationState'),tone);
+  $('slamWorkerState').textContent=
+    status?.worker_online?`worker ${status.worker_pid||'live'}`:'worker offline';
+
+  const nativeMap=status?.native_map||{};
+  $('slamMapIdentity').textContent=nativeMap.matches?
+    'VERIFIED':'NOT VERIFIED';
+  setTone($('slamMapIdentity'),nativeMap.matches?'good':'bad');
+
+  const pose=nativeMap.matches?status?.pose:null;
+  const localized=Boolean(status?.localized&&pose);
+  $('slamPose').textContent=pose?
+    `X ${n(pose.x,2,' m')} · Y ${n(pose.y,2,' m')}`:'—';
+  $('slamYaw').textContent=pose?
+    n(Number(pose.yaw)*180/Math.PI,1,'°'):'—';
+  $('slamPoseSource').textContent=status?.pose_source||'—';
+
+  slamViewer.setRobotPose(pose,localized);
+  renderSlamInitialization(status);
+
+  const cloud=status?.cloud||{};
+  const cloudText=cloud.online?
+    `${Number(cloud.points||0).toLocaleString()} pts · #${cloud.sequence}`:
+    cloud.sequence?
+      `STALE · ${(Number(cloud.age_s)||0).toFixed(1)} s`:
+      'WAITING';
+  $('slamCloudMeta').textContent=cloudText;
+  setTone($('slamCloudMeta'),cloud.online?'good':cloud.sequence?'warn':null);
+  slamViewer.setLiveFresh(Boolean(cloud.online));
+
+  if(
+    currentView==='slam'
+    && Number(cloud.sequence)>0
+    && Number(cloud.sequence)!==slamLastCloudSequence
+  ){
+    fetchSlamCloud(Number(cloud.sequence));
+  }
+}
+
+async function fetchSlamCloud(sequence){
+  if(slamCloudBusy)return;
+  slamCloudBusy=true;
+  try{
+    const response=await fetch(
+      `/api/slam/cloud?sequence=${encodeURIComponent(sequence)}`,
+      {cache:'no-store'}
+    );
+    if(response.status===204)return;
+    if(!response.ok)throw new Error(`HTTP ${response.status}`);
+    slamViewer.setLiveCloud(await response.arrayBuffer());
+    slamLastCloudSequence=sequence;
+  }catch(error){
+    console.debug('SLAM cloud unavailable',error);
+  }finally{
+    slamCloudBusy=false;
+  }
+}
+
+async function pollSlamStatus(){
+  if(slamStatusBusy)return;
+  slamStatusBusy=true;
+  try{
+    const response=await fetch('/api/slam/status',{cache:'no-store'});
+    if(!response.ok)throw new Error(`HTTP ${response.status}`);
+    renderSlamStatus(await response.json());
+  }catch(error){
+    setChip($('slamStateChip'),'SLAM OFFLINE','bad');
+    $('slamWorkerState').textContent='worker offline';
+    // Preserve the last verified pose during a transient HTTP failure.
+    slamViewer.setLiveFresh(false);
+  }finally{
+    slamStatusBusy=false;
+  }
+}
+
+$('slamResetView').addEventListener('click',()=>slamViewer.resetView());
+$('slamInitialStartBtn').addEventListener(
+  'click',
+  ()=>beginSlamInitialSelection()
+);
+$('slamInitialConfirmBtn').addEventListener(
+  'click',
+  ()=>confirmSlamInitialPose()
+);
+$('slamInitialCancelBtn').addEventListener(
+  'click',
+  ()=>cancelSlamInitialSelection()
+);
+$('slamMapToggle').addEventListener('change',event=>
+  slamViewer.setMapEnabled(event.target.checked));
+$('slamLiveToggle').addEventListener('change',event=>
+  slamViewer.setLiveEnabled(event.target.checked));
+$('slamRobotToggle').addEventListener('change',event=>
+  slamViewer.setRobotEnabled(event.target.checked));
+
 let systemBusy=false;
 async function pollSystem(){
   if(systemBusy)return; systemBusy=true;
@@ -1265,6 +1582,6 @@ async function poll(){
   finally{pollBusy=false;}
 }
 
-pollPose(); poll(); pollSystem(); pollControllerProcess(); pollCameraProcess(); pollServiceControl(); bootstrapManagementKey(); setInterval(poll,250); setInterval(updatePoseHud,250); setInterval(pollSystem,250); setInterval(pollControllerProcess,750); setInterval(pollCameraProcess,750); setInterval(pollServiceControl,2000);
+pollPose(); poll(); pollSystem(); pollControllerProcess(); pollCameraProcess(); pollServiceControl(); pollSlamStatus(); bootstrapManagementKey(); setInterval(poll,250); setInterval(updatePoseHud,250); setInterval(pollSystem,250); setInterval(pollControllerProcess,750); setInterval(pollCameraProcess,750); setInterval(pollSlamStatus,100); setInterval(pollServiceControl,2000);
 
 })();

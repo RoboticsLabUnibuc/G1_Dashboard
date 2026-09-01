@@ -505,3 +505,31 @@ button,a{font:inherit}.topbar{height:var(--top);display:grid;grid-template-colum
 .pointcloud-canvas.dragging{cursor:grabbing}
 .camera-stage.pointcloud-webgl-active video{visibility:hidden}
 .camera-stage.pointcloud-webgl-active .camera-hud{z-index:4}
+
+
+/* SLAM v1 — saved laboratory PCD, live relocation cloud and verified pose. */
+.slam-layout{height:100%;display:grid;grid-template-columns:minmax(0,1fr) 290px;gap:12px}
+.slam-world-panel{display:flex;flex-direction:column;overflow:hidden}
+.slam-head{height:54px;flex:0 0 54px;margin:0;padding:0 12px;border-bottom:1px solid var(--line)}
+.slam-head-actions{display:flex;align-items:center;gap:7px}
+.slam-stage{position:relative;flex:1;min-height:0;overflow:hidden;background:#061019}
+#slamCanvas{position:absolute;inset:0;width:100%;height:100%;display:block;touch-action:none;cursor:grab}
+#slamCanvas.dragging{cursor:grabbing}
+#slamCanvas.selecting-pose,
+#slamCanvas.selecting-pose.dragging{cursor:crosshair}
+.slam-help{position:absolute;left:12px;bottom:10px;padding:5px 8px;border:1px solid #294052;border-radius:6px;background:rgba(5,13,20,.78);color:#71879b;font-size:7px;font-weight:800;letter-spacing:.05em;pointer-events:none}
+.slam-overlay{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;background:rgba(5,12,18,.72);pointer-events:none}
+.slam-overlay.hidden{display:none}.slam-overlay strong{font-size:13px}.slam-overlay span{font-size:9px;color:var(--muted)}
+.slam-sidebar{display:grid;grid-template-rows:auto auto 1fr;gap:12px;min-height:0}
+.slam-status-panel,.slam-layer-panel,.slam-initial-pose-panel{padding:11px}
+.slam-layer-panel{display:flex;flex-direction:column;gap:7px}.slam-layer-panel .panel-head{margin-bottom:2px}
+.slam-layer-legend{display:grid;gap:6px;margin-top:6px;padding-top:8px;border-top:1px solid var(--line);font-size:9px;color:var(--muted)}
+.slam-layer-legend span{display:flex;align-items:center;gap:7px}
+.slam-layer-legend i{width:8px;height:8px;border-radius:50%;display:inline-block}
+.slam-map-dot{width:20px!important;background:linear-gradient(90deg,#7b45f5,#31d8e8,#42dc72,#f3db4d,#f75b64)}.slam-live-dot{background:#ff3bd4;box-shadow:0 0 5px rgba(255,59,212,.65)}.slam-robot-dot{background:#ff5364}
+.slam-initial-pose-panel p{font-size:9px;line-height:1.5;color:var(--muted);margin:0 0 10px}
+.slam-initial-selection{padding:7px 8px;margin-bottom:8px;border:1px solid #26394a;border-radius:7px;background:#0b151e;color:#d4e5f5;font-size:9px;line-height:1.35}
+.slam-initial-actions{display:flex;gap:7px}
+.slam-initial-actions button{flex:1;min-width:0}
+.slam-initial-result{min-height:28px;margin-top:8px;font-size:8px;line-height:1.4;color:var(--muted)}
+@media(max-width:900px){.slam-layout{grid-template-columns:1fr;grid-template-rows:520px auto}.slam-sidebar{grid-template-columns:1fr 1fr;grid-template-rows:auto}.slam-initial-pose-panel{grid-column:span 2}}

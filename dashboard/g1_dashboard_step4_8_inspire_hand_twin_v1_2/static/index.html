@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>G1 Teleop Control Center</title>
   <link rel="icon" href="data:," />
-  <link rel="stylesheet" href="/static/styles.css?v=yolo-camera-v1" />
+  <link rel="stylesheet" href="/static/styles.css?v=slam-view-v1" />
 </head>
 <body>
   <header class="topbar">
@@ -19,6 +19,7 @@
 
     <nav class="tabs" aria-label="Dashboard sections">
       <button class="tab active" data-view="live">Live</button>
+      <button class="tab" data-view="slam">SLAM</button>
       <button class="tab" data-view="inspect">Inspect</button>
       <button class="tab" data-view="status">Status</button>
     </nav>
@@ -288,6 +289,97 @@
       </div>
     </section>
 
+    <!-- SLAM VIEW: saved laboratory PCD + live relocation cloud -->
+    <section id="view-slam" class="view">
+      <div class="slam-layout">
+        <section class="panel slam-world-panel">
+          <div class="panel-head slam-head">
+            <div>
+              <div class="panel-kicker">MID360 · MAP FRAME</div>
+              <div class="panel-title-line">
+                <strong>Laboratory point cloud</strong>
+                <span id="slamMapMeta" class="dim">map not loaded</span>
+              </div>
+            </div>
+            <div class="slam-head-actions">
+              <span id="slamStateChip" class="chip">SLAM —</span>
+              <button id="slamResetView" class="ghost-btn">Reset view</button>
+            </div>
+          </div>
+
+          <div class="slam-stage">
+            <canvas id="slamCanvas" aria-label="Live laboratory SLAM point cloud"></canvas>
+            <div class="slam-help">left drag pan · right drag orbit · WHEEL ZOOM · DOUBLE CLICK RESET</div>
+            <div id="slamOverlay" class="slam-overlay">
+              <strong>Loading laboratory map…</strong>
+              <span>The robot is hidden until localization is verified.</span>
+            </div>
+          </div>
+        </section>
+
+        <aside class="slam-sidebar">
+          <section class="panel slam-status-panel">
+            <div class="panel-head"><strong>Localization</strong><span id="slamWorkerState" class="dim">—</span></div>
+            <div class="kv-list">
+              <div><span>State</span><strong id="slamLocalizationState">—</strong></div>
+              <div><span>Pose</span><strong id="slamPose">—</strong></div>
+              <div><span>Heading</span><strong id="slamYaw">—</strong></div>
+              <div><span>Pose source</span><strong id="slamPoseSource">—</strong></div>
+              <div><span>Map identity</span><strong id="slamMapIdentity">—</strong></div>
+              <div><span>Live cloud</span><strong id="slamCloudMeta">—</strong></div>
+            </div>
+          </section>
+
+          <section class="panel slam-layer-panel">
+            <div class="panel-head"><strong>Layers</strong><span class="dim">local WebGL</span></div>
+            <label class="toggle"><input id="slamMapToggle" type="checkbox" checked><span>Saved lab map</span></label>
+            <label class="toggle"><input id="slamLiveToggle" type="checkbox" checked><span>Live relocation cloud</span></label>
+            <label class="toggle"><input id="slamRobotToggle" type="checkbox" checked><span>Localized robot</span></label>
+            <div class="slam-layer-legend">
+              <span><i class="slam-map-dot"></i>Saved PCD</span>
+              <span><i class="slam-live-dot"></i>Live Mid360</span>
+              <span><i class="slam-robot-dot"></i>G1 + heading</span>
+            </div>
+          </section>
+
+          <section class="panel slam-initial-pose-panel">
+            <div class="panel-head">
+              <strong>Initial pose</strong>
+              <span class="dim">API 1804</span>
+            </div>
+            <p>
+              Select the approximate robot position on the saved map,
+              then drag toward the robot’s forward direction.
+            </p>
+            <div id="slamInitialSelection" class="slam-initial-selection">
+              No position selected
+            </div>
+            <div class="slam-initial-actions">
+              <button id="slamInitialStartBtn" class="primary-btn">
+                Set robot position
+              </button>
+              <button
+                id="slamInitialConfirmBtn"
+                class="primary-btn hidden"
+                disabled
+              >
+                Confirm pose
+              </button>
+              <button
+                id="slamInitialCancelBtn"
+                class="ghost-btn hidden"
+              >
+                Cancel
+              </button>
+            </div>
+            <div id="slamInitialResult" class="slam-initial-result">
+              Waiting for SLAM status…
+            </div>
+          </section>
+        </aside>
+      </div>
+    </section>
+
     <!-- INSPECT VIEW: deeper read-only robot/system diagnostics -->
     <section id="view-inspect" class="view">
       <div class="inspect-health-grid inspect-v45">
@@ -544,6 +636,6 @@
     </section>
   </div>
 
-  <script type="module" src="/static/app.js?v=yolo-camera-v1"></script>
+  <script type="module" src="/static/app.js?v=slam-view-v1"></script>
 </body>
 </html>
