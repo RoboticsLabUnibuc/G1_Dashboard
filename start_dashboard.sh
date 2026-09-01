@@ -57,26 +57,15 @@ cleanup() {
   # Browser closure or an unexpected bridge exit still does NOT become a robot
   # control input. External/manual controller/camera/Inspire processes are never
   # killed; only dashboard-owned state is stopped.
-  if [[ "$REQUEST_STACK_SHUTDOWN" == "1" ]]; then
+  if [[ "$REQUEST_STACK_SHUTDOWN" == "1" ]] && [[ "$PROCESS_ACTIONS" == "1" || "$PROCESS_ACTIONS" == "true" || "$PROCESS_ACTIONS" == "yes" ]]; then
     echo
-
-    if [[ "$PROCESS_ACTIONS" == "1" || "$PROCESS_ACTIONS" == "true" || "$PROCESS_ACTIONS" == "yes" ]]; then
-      echo "Stopping dashboard-managed listener, camera, full-body sender and Inspire dependency..."
-      "$BRIDGE_PY" - <<'PY' || true
+    echo "Stopping dashboard-managed listener, camera and Inspire dependency..."
+    "$BRIDGE_PY" - <<'PY' || true
 from g1_dashboard_process_manager import ControllerProcessManager
 manager = ControllerProcessManager(enabled=True)
 summary = manager.shutdown_dashboard_managed(timeout_s=15.0)
 print("Managed shutdown:", summary)
 PY
-    else
-      echo "Stopping dashboard-managed full-body sender..."
-      "$BRIDGE_PY" - <<'PY' || true
-from g1_dashboard_process_manager import ControllerProcessManager
-manager = ControllerProcessManager(enabled=False)
-summary = manager.fullbody_sender.stop(timeout_s=3.0)
-print("Full-body shutdown:", summary)
-PY
-    fi
   fi
 
   if [[ -n "${SLAM_PID:-}" ]] && kill -0 "$SLAM_PID" 2>/dev/null; then

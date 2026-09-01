@@ -31,8 +31,8 @@ CONTROLLER_BASENAME = (
     "dashboard_telemetry_v1_8.py"
 )
 MANAGER_SCHEMA = "g1_dashboard.controller_process.v1"
-MANAGER_VERSION = "g1_dashboard_process_manager.v1.5.0-quest-fullbody"
-CONTROLLER_SHA256 = "1e5d92c3c460c4f652e22e8de00ae2305d444f3e4a2485dfa8cebbb68c2b8484"
+MANAGER_VERSION = "g1_dashboard_process_manager.v1.7.0-independent-robot-stream"
+CONTROLLER_SHA256 = "6a2ac6c3ec7851082caa4f7c40081bbf66935392f15733ad3c8239410a5c2ac7"
 
 ACTION_REQUEST_SCHEMA = "g1_dashboard.action_request.v1"
 ACTION_RESPONSE_SCHEMA = "g1_dashboard.action_response.v1"
@@ -469,6 +469,10 @@ class ControllerProcessManager:
             "G1_DASHBOARD_CAMERA_POINTCLOUD_FILE",
             f"/tmp/g1_dashboard_camera_pointcloud_{os.getuid()}.bin",
         )).expanduser()
+        self.camera_yolo_request_path = Path(os.environ.get(
+            "G1_DASHBOARD_YOLO_REQUEST_FILE",
+            f"/tmp/g1_dashboard_yolo_request_{os.getuid()}.txt",
+        )).expanduser()
         self.camera_state_path = Path(os.environ.get(
             "G1_DASHBOARD_CAMERA_STATE",
             "/tmp/g1_dashboard_camera_teleimager_state.json",
@@ -490,13 +494,43 @@ class ControllerProcessManager:
         self.fullbody_sender = FullBodySenderManager(
             python_path=self.python_path,
         )
+        self._fullbody_retry_not_before = 0.0
         self._load_state()
         self._load_camera_state()
-        if self._managed is None:
+
+    def ensure_dashboard_fullbody_sender(self) -> dict[str, Any]:
+        """Keep full-body telemetry alive for the dashboard lifetime."""
+        with self._lock:
+            current = self.fullbody_sender.status()
+
+            if current.get("state") != "STOPPED":
+                return current
+
+            now = time.monotonic()
+            if now < self._fullbody_retry_not_before:
+                return current
+
+            self._fullbody_retry_not_before = now + 5.0
+
             try:
-                self.fullbody_sender.stop(timeout_s=2.0)
+                current = self.fullbody_sender.start()
+                self._fullbody_retry_not_before = 0.0
+
+                if (
+                    self._last_error is not None
+                    and self._last_error.startswith(
+                        "dashboard full-body sender startup failed:"
+                    )
+                ):
+                    self._last_error = None
+
+                return current
             except Exception as exc:
-                self._last_error = f"full-body orphan cleanup failed: {exc}"
+                self._last_error = (
+                    "dashboard full-body sender startup failed: "
+                    f"{exc}"
+                )
+                return self.fullbody_sender.status()
 
     # ---------- persisted controller state ----------
     def _load_state(self) -> None:
@@ -769,6 +803,30 @@ class ControllerProcessManager:
         tmp.replace(self.camera_mode_path)
         return normalized
 
+    def _read_camera_yolo_requested(self) -> bool:
+        try:
+            raw = self.camera_yolo_request_path.read_text(
+                encoding="utf-8"
+            ).strip().lower()
+            return raw in {"1", "true", "yes", "on", "enabled"}
+        except Exception:
+            return False
+
+    def _write_camera_yolo(self, enabled: bool) -> bool:
+        value = bool(enabled)
+        self.camera_yolo_request_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+        tmp = self.camera_yolo_request_path.with_suffix(".tmp")
+        tmp.write_text(
+            "1\n" if value else "0\n",
+            encoding="utf-8",
+        )
+        os.chmod(tmp, 0o600)
+        tmp.replace(self.camera_yolo_request_path)
+        return value
+
     def _sanitize_camera_point_view(self, raw: Any) -> dict[str, float]:
         current = dict(POINT_VIEW_DEFAULT)
         if isinstance(raw, dict):
@@ -836,6 +894,46 @@ class ControllerProcessManager:
                 time.sleep(0.03)
             return self.camera_status()
 
+    def set_camera_yolo(self, enabled: bool) -> dict[str, Any]:
+        with self._lock:
+            if not self.enabled:
+                raise PermissionError(
+                    "dashboard process actions are disabled"
+                )
+            if not isinstance(enabled, bool):
+                raise ValueError("enabled must be a boolean")
+
+            status = self.camera_status()
+            if (
+                status.get("state") != "RUNNING"
+                or not status.get("yolo_control")
+            ):
+                raise PermissionError(
+                    "YOLO control requires the dashboard-managed "
+                    "RealSense mode runner"
+                )
+
+            self._write_camera_yolo(enabled)
+
+            deadline = time.monotonic() + 1.2
+            while time.monotonic() < deadline:
+                acknowledgement = self._read_camera_mode_status()
+                yolo = (
+                    acknowledgement.get("yolo")
+                    if isinstance(acknowledgement, dict)
+                    else None
+                )
+                if (
+                    acknowledgement
+                    and acknowledgement.get("online")
+                    and isinstance(yolo, dict)
+                    and bool(yolo.get("requested")) == enabled
+                ):
+                    break
+                time.sleep(0.03)
+
+            return self.camera_status()
+
     def camera_status(self) -> dict[str, Any]:
         with self._lock:
             self._refresh_camera()
@@ -853,6 +951,19 @@ class ControllerProcessManager:
             mode_ack_online = bool(mode_status and mode_status.get("online"))
             point_view_requested = self._read_camera_point_view_requested()
             point_view_actual = mode_status.get("point_view") if mode_status and mode_status.get("online") else None
+            yolo_requested = self._read_camera_yolo_requested()
+            yolo_status = (
+                mode_status.get("yolo")
+                if mode_status and mode_status.get("online")
+                and isinstance(mode_status.get("yolo"), dict)
+                else None
+            )
+            yolo_ack_online = bool(yolo_status is not None)
+            yolo_actual = (
+                bool(yolo_status.get("requested"))
+                if yolo_status is not None
+                else None
+            )
 
             if managed_alive and self._camera_managed is not None:
                 # teleimager uses multiprocessing and normally creates one or
@@ -892,6 +1003,11 @@ class ControllerProcessManager:
                     "mode_actual": mode_actual,
                     "mode_ack_online": mode_ack_online,
                     "mode_control": state == "RUNNING" and not external_groups and managed_mode_runner,
+                    "yolo_control": state == "RUNNING" and not external_groups and managed_mode_runner,
+                    "yolo_requested": yolo_requested,
+                    "yolo_actual": yolo_actual,
+                    "yolo_ack_online": yolo_ack_online,
+                    "yolo_status": yolo_status,
                     "point_view_control": state == "RUNNING" and not external_groups and managed_mode_runner,
                     "point_view_requested": point_view_requested,
                     "point_view_actual": point_view_actual,
@@ -930,6 +1046,11 @@ class ControllerProcessManager:
                     "mode_actual": mode_actual,
                     "mode_ack_online": mode_ack_online,
                     "mode_control": False,
+                    "yolo_control": False,
+                    "yolo_requested": yolo_requested,
+                    "yolo_actual": yolo_actual,
+                    "yolo_ack_online": yolo_ack_online,
+                    "yolo_status": yolo_status,
                     "point_view_control": False,
                     "point_view_requested": point_view_requested,
                     "point_view_actual": point_view_actual,
@@ -965,6 +1086,11 @@ class ControllerProcessManager:
                 "mode_actual": mode_actual,
                 "mode_ack_online": mode_ack_online,
                 "mode_control": False,
+                "yolo_control": False,
+                "yolo_requested": yolo_requested,
+                "yolo_actual": yolo_actual,
+                "yolo_ack_online": yolo_ack_online,
+                "yolo_status": yolo_status,
                 "point_view_control": False,
                 "point_view_requested": point_view_requested,
                 "point_view_actual": point_view_actual,
@@ -1004,10 +1130,14 @@ class ControllerProcessManager:
             env["TELEIMAGER_DISPLAY_STATUS_FILE"] = str(self.camera_mode_status_path)
             env["TELEIMAGER_POINT_VIEW_FILE"] = str(self.camera_point_view_path)
             env["TELEIMAGER_POINTCLOUD_SNAPSHOT_FILE"] = str(self.camera_pointcloud_path)
+            env["G1_DASHBOARD_YOLO_REQUEST_FILE"] = str(
+                self.camera_yolo_request_path
+            )
             # Every camera-server launch returns to the normal RGB operator
             # view. Mode changes are live-session choices, not boot defaults.
             self._write_camera_mode("rgb")
             self._write_camera_point_view(dict(POINT_VIEW_DEFAULT))
+            self._write_camera_yolo(False)
             try:
                 self.camera_mode_status_path.unlink(missing_ok=True)
                 self.camera_pointcloud_path.unlink(missing_ok=True)
@@ -1337,10 +1467,6 @@ class ControllerProcessManager:
         alive, _pid = self._managed_alive()
         if self._managed is not None and not alive:
             finished = self._managed
-            try:
-                self.fullbody_sender.stop(timeout_s=2.0)
-            except Exception as exc:
-                self._last_error = f"controller exited, but full-body sender cleanup failed: {exc}"
             self._managed = None
             self._save_state()
             if finished.get("stop_requested_unix_time_s") and finished.get("inspire_stop_with_controller"):
@@ -1362,6 +1488,7 @@ class ControllerProcessManager:
             external = [pid for pid in matching if pid != managed_pid]
             now = time.time()
             inspire = self._inspire_status()
+            fullbody = self.ensure_dashboard_fullbody_sender()
 
             if managed_alive and self._managed is not None:
                 stop_requested = self._managed.get("stop_requested_unix_time_s")
@@ -1388,7 +1515,10 @@ class ControllerProcessManager:
                     "can_start": False,
                     "can_stop": True,
                     "can_request_action": bool(self._managed.get("action_token")) and not bool(stop_requested),
-                    "dependencies": {"inspire": inspire},
+                    "dependencies": {
+                        "inspire": inspire,
+                        "fullbody": fullbody,
+                    },
                 }
 
             if matching:
@@ -1411,7 +1541,10 @@ class ControllerProcessManager:
                     "can_start": False,
                     "can_stop": False,
                     "can_request_action": False,
-                    "dependencies": {"inspire": inspire},
+                    "dependencies": {
+                        "inspire": inspire,
+                        "fullbody": fullbody,
+                    },
                 }
 
             script_hash = _sha256_file(self.script_path) if self.script_path.is_file() else None
@@ -1450,7 +1583,10 @@ class ControllerProcessManager:
                 "can_start": ready,
                 "can_stop": False,
                 "can_request_action": False,
-                "dependencies": {"inspire": inspire},
+                "dependencies": {
+                    "inspire": inspire,
+                    "fullbody": fullbody,
+                },
             }
 
     def start(self, parameters: Any) -> dict[str, Any]:
@@ -1525,11 +1661,6 @@ class ControllerProcessManager:
                         self._stop_inspire_managed_dependency()
                     except Exception as cleanup_exc:
                         self._last_error = f"controller spawn failed and Inspire rollback also failed: {cleanup_exc}"
-                if fullbody.get("started_now"):
-                    try:
-                        self.fullbody_sender.stop(timeout_s=3.0)
-                    except Exception:
-                        pass
                 raise
             log.close()
             self._popen = proc
@@ -1564,11 +1695,6 @@ class ControllerProcessManager:
                         self._stop_inspire_managed_dependency()
                     except Exception as cleanup_exc:
                         self._last_error = f"controller exited immediately and Inspire rollback failed: {cleanup_exc}"
-                if fullbody.get("started_now"):
-                    try:
-                        self.fullbody_sender.stop(timeout_s=3.0)
-                    except Exception:
-                        pass
                 raise RuntimeError(f"controller exited immediately with code {rc}; inspect {self.log_path}")
             return self.status()
 
@@ -1674,10 +1800,8 @@ class ControllerProcessManager:
                 return self.status()
             if self._managed.get("stop_requested_unix_time_s"):
                 return self.status()
-            try:
-                self.fullbody_sender.stop(timeout_s=3.0)
-            except Exception as exc:
-                self._last_error = f"Quest full-body sender stop failed: {exc}"
+            # Full-body telemetry is dashboard-owned and remains active
+            # when only the teleop controller is stopped.
             # Controller must stop first.  _refresh() stops a helper-managed
             # Inspire service only after the controlled controller process exits.
             ticks = self._managed.get("start_ticks")

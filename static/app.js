@@ -1,6 +1,6 @@
 import { G1Twin } from './g1_model.js';
 import { PointCloud3D } from './pointcloud_view.js';
-import { SlamWorld3D } from './slam_view.js?v=initial-pose-v2-drag-fix';
+import { SlamWorld3D } from './slam_view.js?v=initial-pose-v1';
 
 (()=>{
 'use strict';

@@ -124,6 +124,7 @@ from unitree_sdk2py.idl.unitree_hg.msg.dds_ import (
 from unitree_sdk2py.utils.crc import CRC
 
 from televuer import TeleVuerWrapper
+from g1_unity_televuer_ingress import UnityTeleVuerIngress
 from teleop.robot_control.robot_arm_ik import G1_29_ArmIK
 
 # Reuse only the helpers already validated in the successful arm-only tests.
@@ -1942,21 +1943,8 @@ def build_dashboard_telemetry_snapshot(
     measured_q, measured_dq, tau_est, temperatures, motor_states = (
         _telemetry_motor_arrays(lowstate)
     )
-    (
-        full_measured_q,
-        full_measured_dq,
-        full_tau_est,
-        full_temperatures,
-        full_motor_states,
-    ) = _telemetry_motor_arrays_for_indices(lowstate, FULL_BODY_INDICES)
-
-    mode_machine: Optional[int] = None
     lowstate_tick: Optional[int] = None
     if lowstate is not None:
-        try:
-            mode_machine = int(lowstate.mode_machine)
-        except Exception:
-            mode_machine = None
         try:
             lowstate_tick = int(lowstate.tick)
         except Exception:
@@ -2149,18 +2137,6 @@ def build_dashboard_telemetry_snapshot(
                 "command_left": _telemetry_pose(xr_state.last_left_command),
                 "command_right": _telemetry_pose(xr_state.last_right_command),
             },
-        },
-        "robot": {
-            "model_family": "Unitree G1",
-            "joint_count": 29,
-            "mode_machine": mode_machine,
-            "motor_indices": list(FULL_BODY_INDICES),
-            "joint_names": list(FULL_BODY_JOINT_NAMES),
-            "measured_q_rad": full_measured_q,
-            "measured_dq_rps": full_measured_dq,
-            "tau_est": full_tau_est,
-            "temperatures_c": full_temperatures,
-            "motor_state": full_motor_states,
         },
         "arms": {
             "joint_names": list(ARM_JOINT_NAMES),
@@ -4771,6 +4747,7 @@ def main() -> int:
     lowstate_subscriber: Optional[ChannelSubscriber] = None
     isolated_lowstate_cache: Optional[IsolatedLowStateCache] = None
     tv_wrapper: Optional[TeleVuerWrapper] = None
+    unity_televuer_ingress: Optional[UnityTeleVuerIngress] = None
     arm_ctrl: Optional[SafeArmSdkController] = None
     finger_ctrl: Optional[FingerController] = None
     diagnostics: Optional[SynchronizedDiagnostics] = None
@@ -4996,6 +4973,16 @@ def main() -> int:
             arm_reference_mode="head_yaw",
         )
         LOG.info("TeleVuer server initialized.")
+
+        unity_televuer_ingress = (
+            UnityTeleVuerIngress.from_environment(
+                tv_wrapper.tvuer,
+            )
+        )
+        unity_televuer_ingress.start()
+        LOG.info(
+            "Authenticated Unity TeleVuer ingress initialized."
+        )
 
         # TeleVuer's detached listener has now been created without inheriting
         # the controller's custom termination handlers. From this point onward
@@ -6550,6 +6537,16 @@ def main() -> int:
             stop_listening()
         except Exception:
             pass
+
+        if unity_televuer_ingress is not None:
+            try:
+                unity_televuer_ingress.close()
+            except Exception as exc:
+                LOG.warning(
+                    "Unity TeleVuer ingress close failed: %s",
+                    exc,
+                )
+            unity_televuer_ingress = None
 
         if (
             arm_ctrl is not None

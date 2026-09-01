@@ -10,6 +10,11 @@ from pathlib import Path
 from typing import Literal
 
 
+MOTION_SOURCE_NONE = 0
+MOTION_SOURCE_BROWSER = 1
+MOTION_SOURCE_UNITY = 2
+
+
 class TeleVuer:
     def __init__(self, use_hand_tracking: bool, binocular: bool=True, img_shape: tuple=None, display_fps: float=30.0,
                        display_mode: Literal["immersive", "pass-through", "ego"]="immersive", zmq: bool=False, webrtc: bool=False, webrtc_url: str=None, 
@@ -139,6 +144,11 @@ class TeleVuer:
         self.left_arm_pose_shared = Array('d', 16, lock=True)
         self.right_arm_pose_shared = Array('d', 16, lock=True)
         self.motion_data_ready_shared = Value('b', False, lock=True)
+        self.motion_source_shared = Value(
+            'i',
+            MOTION_SOURCE_NONE,
+            lock=True,
+        )
         if self.use_hand_tracking:
             self.left_hand_position_shared = Array('d', 75, lock=True)
             self.right_hand_position_shared = Array('d', 75, lock=True)
@@ -219,7 +229,37 @@ class TeleVuer:
             except:
                 pass
 
+    def activate_unity_motion_source(self) -> None:
+        with self.motion_source_shared.get_lock():
+            self.motion_source_shared.value = MOTION_SOURCE_UNITY
+
+        with self.motion_data_ready_shared.get_lock():
+            self.motion_data_ready_shared.value = False
+
+    def release_unity_motion_source(self) -> None:
+        released = False
+
+        with self.motion_source_shared.get_lock():
+            if self.motion_source_shared.value == MOTION_SOURCE_UNITY:
+                self.motion_source_shared.value = MOTION_SOURCE_NONE
+                released = True
+
+        if released:
+            with self.motion_data_ready_shared.get_lock():
+                self.motion_data_ready_shared.value = False
+
+    def _browser_motion_allowed(self) -> bool:
+        with self.motion_source_shared.get_lock():
+            if self.motion_source_shared.value == MOTION_SOURCE_UNITY:
+                return False
+
+            self.motion_source_shared.value = MOTION_SOURCE_BROWSER
+            return True
+
     async def on_cam_move(self, event, session, fps=60):
+        if not self._browser_motion_allowed():
+            return
+
         try:
             with self.head_pose_shared.get_lock():
                 self.head_pose_shared[:] = event.value["camera"]["matrix"]
@@ -228,6 +268,9 @@ class TeleVuer:
 
     async def on_controller_move(self, event, session, fps=60):
         """https://docs.vuer.ai/en/latest/examples/20_motion_controllers.html"""
+        if not self._browser_motion_allowed():
+            return
+
         try:
             # ControllerData
             with self.left_arm_pose_shared.get_lock():
@@ -269,6 +312,9 @@ class TeleVuer:
 
     async def on_hand_move(self, event, session, fps=60):
         """https://docs.vuer.ai/en/latest/examples/19_hand_tracking.html"""
+        if not self._browser_motion_allowed():
+            return
+
         try:
             # HandsData
             left_hand_data = event.value["left"]
