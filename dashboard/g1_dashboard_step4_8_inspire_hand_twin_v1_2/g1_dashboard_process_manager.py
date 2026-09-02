@@ -31,7 +31,7 @@ CONTROLLER_BASENAME = (
     "dashboard_telemetry_v1_8.py"
 )
 MANAGER_SCHEMA = "g1_dashboard.controller_process.v1"
-MANAGER_VERSION = "g1_dashboard_process_manager.v1.7.0-independent-robot-stream"
+MANAGER_VERSION = "g1_dashboard_process_manager.v1.8.0-camera-multiview"
 CONTROLLER_SHA256 = "6a2ac6c3ec7851082caa4f7c40081bbf66935392f15733ad3c8239410a5c2ac7"
 
 ACTION_REQUEST_SCHEMA = "g1_dashboard.action_request.v1"
@@ -44,7 +44,23 @@ INSPIRE_SERVICE_BASENAME = "inspire_g1"
 CAMERA_BASENAME = "teleimager-server"
 CAMERA_RUNNER_BASENAME = "g1_dashboard_teleimager_modes_runner.py"
 CAMERA_WEBRTC_PORT = 60001
+CAMERA_EXTERNAL_WEBRTC_PORT = 60004
 CAMERA_DISPLAY_MODES = {"rgb", "depth", "overlay", "near", "disparity", "pointcloud", "topdown"}
+CAMERA_WEB_VIEW_ORDER = (
+    "rgb", "depth", "overlay", "near", "disparity",
+    "pointcloud", "topdown", "lifecam",
+)
+CAMERA_WEB_VIEW_PORTS = {
+    "rgb": CAMERA_WEBRTC_PORT,
+    "depth": 60005,
+    "overlay": 60006,
+    "near": 60007,
+    "disparity": 60008,
+    "topdown": 60009,
+    "lifecam": CAMERA_EXTERNAL_WEBRTC_PORT,
+}
+CAMERA_WEB_VIEW_DEFAULT = ("rgb", "lifecam")
+CAMERA_WEB_VIEW_LIMIT = 9
 POINT_VIEW_DEFAULT = {"yaw_deg": 22.0, "pitch_deg": 14.0, "distance_m": 3.16, "target_z_m": 2.0}
 POINT_VIEW_LIMITS = {
     "yaw_deg": (-180.0, 180.0),
@@ -238,6 +254,78 @@ def _tcp_port_open(host: str, port: int, timeout_s: float = 0.08) -> bool:
         return False
     finally:
         sock.close()
+
+
+def _camera_sources_status() -> list[dict[str, Any]]:
+    return [
+        {
+            "id": "realsense",
+            "label": "Head RealSense",
+            "webrtc_port": CAMERA_WEBRTC_PORT,
+            "port_ready": _tcp_port_open(
+                "127.0.0.1",
+                CAMERA_WEBRTC_PORT,
+            ),
+            "display_modes": sorted(CAMERA_DISPLAY_MODES),
+            "yolo": True,
+        },
+        {
+            "id": "lifecam",
+            "label": "External LifeCam",
+            "webrtc_port": CAMERA_EXTERNAL_WEBRTC_PORT,
+            "port_ready": _tcp_port_open(
+                "127.0.0.1",
+                CAMERA_EXTERNAL_WEBRTC_PORT,
+            ),
+            "display_modes": ["rgb"],
+            "yolo": False,
+        },
+    ]
+
+
+def _camera_views_status(
+    active_views: list[str],
+) -> list[dict[str, Any]]:
+    labels = {
+        "rgb": "RealSense RGB",
+        "depth": "Depth",
+        "overlay": "RGB + depth",
+        "near": "Near-field",
+        "disparity": "Disparity",
+        "pointcloud": "Point cloud",
+        "topdown": "Top-down",
+        "lifecam": "External LifeCam",
+    }
+
+    active = set(active_views)
+    views: list[dict[str, Any]] = []
+
+    for view_id in CAMERA_WEB_VIEW_ORDER:
+        port = CAMERA_WEB_VIEW_PORTS.get(view_id)
+        item: dict[str, Any] = {
+            "id": view_id,
+            "label": labels[view_id],
+            "active": view_id in active,
+            "transport": (
+                "webgl"
+                if view_id == "pointcloud"
+                else "webrtc"
+            ),
+        }
+
+        if view_id == "pointcloud":
+            item["endpoint"] = "/api/camera/pointcloud"
+            item["port_ready"] = None
+        else:
+            item["webrtc_port"] = port
+            item["port_ready"] = _tcp_port_open(
+                "127.0.0.1",
+                int(port),
+            )
+
+        views.append(item)
+
+    return views
 
 
 def default_camera_executable() -> Path:
@@ -456,6 +544,10 @@ class ControllerProcessManager:
         self.camera_mode_path = Path(os.environ.get(
             "G1_DASHBOARD_CAMERA_MODE_FILE",
             f"/tmp/g1_dashboard_camera_mode_{os.getuid()}.txt",
+        )).expanduser()
+        self.camera_web_views_path = Path(os.environ.get(
+            "G1_DASHBOARD_CAMERA_WEB_VIEWS_FILE",
+            f"/tmp/g1_dashboard_camera_web_views_{os.getuid()}.json",
         )).expanduser()
         self.camera_mode_status_path = Path(os.environ.get(
             "G1_DASHBOARD_CAMERA_MODE_STATUS",
@@ -803,6 +895,79 @@ class ControllerProcessManager:
         tmp.replace(self.camera_mode_path)
         return normalized
 
+    def _normalize_camera_web_views(
+        self,
+        raw: Any,
+    ) -> list[str]:
+        if not isinstance(raw, (list, tuple, set)):
+            raise ValueError("views must be an array")
+
+        requested: set[str] = set()
+
+        for value in raw:
+            view_id = str(value or "").strip().lower()
+
+            if view_id not in CAMERA_WEB_VIEW_ORDER:
+                raise ValueError(
+                    f"unknown camera view {view_id!r}; "
+                    f"expected one of {list(CAMERA_WEB_VIEW_ORDER)}"
+                )
+
+            requested.add(view_id)
+
+        ordered = [
+            view_id
+            for view_id in CAMERA_WEB_VIEW_ORDER
+            if view_id in requested
+        ]
+
+        if not ordered:
+            raise ValueError(
+                "at least one camera view must remain active"
+            )
+
+        if len(ordered) > CAMERA_WEB_VIEW_LIMIT:
+            raise ValueError(
+                f"at most {CAMERA_WEB_VIEW_LIMIT} "
+                "camera views may be active"
+            )
+
+        return ordered
+
+    def _read_camera_web_views_requested(self) -> list[str]:
+        try:
+            raw = json.loads(
+                self.camera_web_views_path.read_text(
+                    encoding="utf-8"
+                )
+            )
+            return self._normalize_camera_web_views(raw)
+        except Exception:
+            return list(CAMERA_WEB_VIEW_DEFAULT)
+
+    def _write_camera_web_views(
+        self,
+        views: Any,
+    ) -> list[str]:
+        normalized = self._normalize_camera_web_views(views)
+
+        self.camera_web_views_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        tmp = self.camera_web_views_path.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps(
+                normalized,
+                separators=(",", ":"),
+            ) + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(tmp, 0o600)
+        tmp.replace(self.camera_web_views_path)
+        return normalized
+
     def _read_camera_yolo_requested(self) -> bool:
         try:
             raw = self.camera_yolo_request_path.read_text(
@@ -894,6 +1059,51 @@ class ControllerProcessManager:
                 time.sleep(0.03)
             return self.camera_status()
 
+    def set_camera_web_views(
+        self,
+        views: Any,
+    ) -> dict[str, Any]:
+        with self._lock:
+            if not self.enabled:
+                raise PermissionError(
+                    "dashboard process actions are disabled"
+                )
+
+            status = self.camera_status()
+
+            if (
+                status.get("state") != "RUNNING"
+                or not status.get("web_views_control")
+            ):
+                raise PermissionError(
+                    "camera multiview requires the "
+                    "dashboard-managed RealSense mode runner"
+                )
+
+            requested = self._write_camera_web_views(views)
+            deadline = time.monotonic() + 1.2
+
+            while time.monotonic() < deadline:
+                acknowledgement = (
+                    self._read_camera_mode_status()
+                )
+                actual = (
+                    acknowledgement.get("web_views")
+                    if isinstance(acknowledgement, dict)
+                    else None
+                )
+
+                if (
+                    acknowledgement
+                    and acknowledgement.get("online")
+                    and actual == requested
+                ):
+                    break
+
+                time.sleep(0.03)
+
+            return self.camera_status()
+
     def set_camera_yolo(self, enabled: bool) -> dict[str, Any]:
         with self._lock:
             if not self.enabled:
@@ -945,10 +1155,32 @@ class ControllerProcessManager:
             executable_ok = self.camera_executable.is_file() and os.access(self.camera_executable, os.X_OK)
             cwd_ok = self.camera_cwd.is_dir()
             port_ready = _tcp_port_open("127.0.0.1", CAMERA_WEBRTC_PORT)
+            camera_sources = _camera_sources_status()
+            web_views_requested = (
+                self._read_camera_web_views_requested()
+            )
+            camera_views = _camera_views_status(
+                web_views_requested
+            )
             mode_requested = self._read_camera_mode_requested()
             mode_status = self._read_camera_mode_status()
             mode_actual = mode_status.get("mode") if mode_status and mode_status.get("online") else None
-            mode_ack_online = bool(mode_status and mode_status.get("online"))
+            mode_ack_online = bool(
+                mode_status and mode_status.get("online")
+            )
+            web_views_actual = (
+                mode_status.get("web_views")
+                if mode_status
+                and mode_status.get("online")
+                and isinstance(
+                    mode_status.get("web_views"),
+                    list,
+                )
+                else None
+            )
+            web_views_ack_online = bool(
+                web_views_actual is not None
+            )
             point_view_requested = self._read_camera_point_view_requested()
             point_view_actual = mode_status.get("point_view") if mode_status and mode_status.get("online") else None
             yolo_requested = self._read_camera_yolo_requested()
@@ -998,11 +1230,17 @@ class ControllerProcessManager:
                     "log_path": str(self.camera_log_path),
                     "port": CAMERA_WEBRTC_PORT,
                     "port_ready": port_ready,
+                    "camera_sources": camera_sources,
+                    "camera_views": camera_views,
+                    "web_views_requested": web_views_requested,
+                    "web_views_actual": web_views_actual,
+                    "web_views_ack_online": web_views_ack_online,
                     "display_modes": sorted(CAMERA_DISPLAY_MODES),
                     "mode_requested": mode_requested,
                     "mode_actual": mode_actual,
                     "mode_ack_online": mode_ack_online,
                     "mode_control": state == "RUNNING" and not external_groups and managed_mode_runner,
+                    "web_views_control": state == "RUNNING" and not external_groups and managed_mode_runner,
                     "yolo_control": state == "RUNNING" and not external_groups and managed_mode_runner,
                     "yolo_requested": yolo_requested,
                     "yolo_actual": yolo_actual,
@@ -1041,11 +1279,17 @@ class ControllerProcessManager:
                     "log_path": str(self.camera_log_path),
                     "port": CAMERA_WEBRTC_PORT,
                     "port_ready": port_ready,
+                    "camera_sources": camera_sources,
+                    "camera_views": camera_views,
+                    "web_views_requested": web_views_requested,
+                    "web_views_actual": web_views_actual,
+                    "web_views_ack_online": web_views_ack_online,
                     "display_modes": sorted(CAMERA_DISPLAY_MODES),
                     "mode_requested": mode_requested,
                     "mode_actual": mode_actual,
                     "mode_ack_online": mode_ack_online,
                     "mode_control": False,
+                    "web_views_control": False,
                     "yolo_control": False,
                     "yolo_requested": yolo_requested,
                     "yolo_actual": yolo_actual,
@@ -1081,11 +1325,17 @@ class ControllerProcessManager:
                 "log_path": str(self.camera_log_path),
                 "port": CAMERA_WEBRTC_PORT,
                 "port_ready": port_ready,
+                "camera_sources": camera_sources,
+                "camera_views": camera_views,
+                "web_views_requested": web_views_requested,
+                "web_views_actual": web_views_actual,
+                "web_views_ack_online": web_views_ack_online,
                 "display_modes": sorted(CAMERA_DISPLAY_MODES),
                 "mode_requested": mode_requested,
                 "mode_actual": mode_actual,
                 "mode_ack_online": mode_ack_online,
                 "mode_control": False,
+                "web_views_control": False,
                 "yolo_control": False,
                 "yolo_requested": yolo_requested,
                 "yolo_actual": yolo_actual,
@@ -1127,6 +1377,9 @@ class ControllerProcessManager:
             env = _camera_environment(self.camera_executable)
             env["G1_DASHBOARD_CAMERA_CONFIG"] = str(self.camera_config)
             env["TELEIMAGER_DISPLAY_MODE_FILE"] = str(self.camera_mode_path)
+            env["TELEIMAGER_WEB_VIEWS_FILE"] = str(
+                self.camera_web_views_path
+            )
             env["TELEIMAGER_DISPLAY_STATUS_FILE"] = str(self.camera_mode_status_path)
             env["TELEIMAGER_POINT_VIEW_FILE"] = str(self.camera_point_view_path)
             env["TELEIMAGER_POINTCLOUD_SNAPSHOT_FILE"] = str(self.camera_pointcloud_path)
@@ -1136,6 +1389,9 @@ class ControllerProcessManager:
             # Every camera-server launch returns to the normal RGB operator
             # view. Mode changes are live-session choices, not boot defaults.
             self._write_camera_mode("rgb")
+            self._write_camera_web_views(
+                list(CAMERA_WEB_VIEW_DEFAULT)
+            )
             self._write_camera_point_view(dict(POINT_VIEW_DEFAULT))
             self._write_camera_yolo(False)
             try:

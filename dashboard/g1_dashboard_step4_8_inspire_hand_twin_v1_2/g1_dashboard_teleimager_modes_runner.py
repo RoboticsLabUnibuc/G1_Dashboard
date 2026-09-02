@@ -73,6 +73,36 @@ ALLOWED_MODES = {
     "topdown",
 }
 MODE_FILE = Path(os.environ.get("TELEIMAGER_DISPLAY_MODE_FILE", "/tmp/g1_dashboard_camera_mode.txt"))
+WEB_VIEWS_FILE = Path(
+    os.environ.get(
+        "TELEIMAGER_WEB_VIEWS_FILE",
+        f"/tmp/g1_dashboard_camera_web_views_{os.getuid()}.json",
+    )
+)
+WEB_VIEW_ORDER = (
+    "rgb", "depth", "overlay", "near", "disparity",
+    "pointcloud", "topdown", "lifecam",
+)
+WEB_VIEW_DEFAULT = ("rgb", "lifecam")
+WEB_VIEW_PORTS = {
+    "depth": 60005,
+    "overlay": 60006,
+    "near": 60007,
+    "disparity": 60008,
+    "topdown": 60009,
+}
+WEB_DERIVED_FPS = max(
+    2.0,
+    min(
+        30.0,
+        float(
+            os.environ.get(
+                "G1_DASHBOARD_WEB_DERIVED_FPS",
+                "30",
+            )
+        ),
+    ),
+)
 STATUS_FILE = Path(os.environ.get("TELEIMAGER_DISPLAY_STATUS_FILE", "/tmp/g1_dashboard_camera_mode_status.json"))
 POINT_VIEW_FILE = Path(os.environ.get("TELEIMAGER_POINT_VIEW_FILE", "/tmp/g1_dashboard_point_view.json"))
 POINTCLOUD_FILE = Path(os.environ.get("TELEIMAGER_POINTCLOUD_SNAPSHOT_FILE", "/tmp/g1_dashboard_camera_pointcloud.bin"))
@@ -122,7 +152,7 @@ TOPDOWN_MAX_FORWARD_M = float(os.environ.get("G1_DASHBOARD_TOPDOWN_MAX_FORWARD_M
 TOPDOWN_MIN_Y_M = float(os.environ.get("G1_DASHBOARD_TOPDOWN_MIN_Y_M", "-0.65"))
 TOPDOWN_MAX_Y_M = float(os.environ.get("G1_DASHBOARD_TOPDOWN_MAX_Y_M", "0.70"))
 TOPDOWN_CELL_M = float(os.environ.get("G1_DASHBOARD_TOPDOWN_CELL_M", "0.10"))
-POINTCLOUD_EXPORT_HZ = max(2.0, min(20.0, float(os.environ.get("G1_DASHBOARD_POINTCLOUD_EXPORT_HZ", "15"))))
+POINTCLOUD_EXPORT_HZ = max(2.0, min(30.0, float(os.environ.get("G1_DASHBOARD_POINTCLOUD_EXPORT_HZ", "30"))))
 POINTCLOUD_EXPORT_STEP = max(3, int(os.environ.get("G1_DASHBOARD_POINTCLOUD_EXPORT_STEP", str(POINT_SAMPLE_STEP))))
 
 if not (0.05 <= DEPTH_NEAR_M < DEPTH_FAR_M <= 20.0):
@@ -158,6 +188,76 @@ def _read_requested_mode(camera) -> str:
         mode = getattr(camera, "_g1_display_mode", "rgb")
     camera._g1_display_mode = mode
     return mode
+
+
+def _read_web_views(camera) -> tuple[str, ...]:
+    now = time.monotonic()
+
+    if now < getattr(
+        camera,
+        "_g1_next_web_views_poll",
+        0.0,
+    ):
+        return tuple(
+            getattr(
+                camera,
+                "_g1_web_views",
+                WEB_VIEW_DEFAULT,
+            )
+        )
+
+    camera._g1_next_web_views_poll = now + 0.10
+    views = tuple(
+        getattr(
+            camera,
+            "_g1_web_views",
+            WEB_VIEW_DEFAULT,
+        )
+    )
+
+    try:
+        raw = json.loads(
+            WEB_VIEWS_FILE.read_text(encoding="utf-8")
+        )
+
+        if not isinstance(raw, list):
+            raise ValueError(
+                "web views file must contain a JSON array"
+            )
+
+        requested = {
+            str(value or "").strip().lower()
+            for value in raw
+        }
+        unknown = requested.difference(WEB_VIEW_ORDER)
+
+        if unknown:
+            raise ValueError(
+                f"unknown web view(s): {sorted(unknown)}"
+            )
+
+        ordered = tuple(
+            view_id
+            for view_id in WEB_VIEW_ORDER
+            if view_id in requested
+        )
+
+        if not ordered:
+            raise ValueError(
+                "at least one web view must remain active"
+            )
+
+        views = ordered
+    except FileNotFoundError:
+        views = WEB_VIEW_DEFAULT
+    except Exception as exc:
+        image_server.logger_mp.warning(
+            f"[G1 camera multiview] "
+            f"views file read failed: {exc}"
+        )
+
+    camera._g1_web_views = views
+    return views
 
 
 def _read_yolo_requested(camera) -> bool:
@@ -226,8 +326,23 @@ def _read_point_view(camera) -> dict[str, float]:
 def _write_status(camera, mode: str, depth_ready: bool) -> None:
     now_mono = time.monotonic()
     point_view = _read_point_view(camera)
+    web_views = list(_read_web_views(camera))
     yolo_requested = bool(
         getattr(camera, "_g1_yolo_requested", False)
+    )
+    dashboard_yolo_requested = bool(
+        getattr(
+            camera,
+            "_g1_yolo_dashboard_requested",
+            yolo_requested,
+        )
+    )
+    quest_yolo_requested = bool(
+        getattr(
+            camera,
+            "_g1_yolo_quest_requested",
+            False,
+        )
     )
     yolo_client = getattr(camera, "_g1_yolo_client", None)
     if yolo_client is None:
@@ -246,7 +361,11 @@ def _write_status(camera, mode: str, depth_ready: bool) -> None:
                 "last_error": str(exc),
             }
 
-    yolo_status["requested"] = yolo_requested
+    # Keep `requested` as the dashboard-file acknowledgement so the
+    # browser checkbox remains independent from the Quest checkbox.
+    yolo_status["requested"] = dashboard_yolo_requested
+    yolo_status["quest_requested"] = quest_yolo_requested
+    yolo_status["combined_requested"] = yolo_requested
     yolo_status["active"] = bool(
         yolo_requested
         and yolo_client is not None
@@ -255,7 +374,10 @@ def _write_status(camera, mode: str, depth_ready: bool) -> None:
 
     fingerprint = (
         mode,
+        tuple(web_views),
         yolo_requested,
+        dashboard_yolo_requested,
+        quest_yolo_requested,
         round(point_view["yaw_deg"], 2),
         round(point_view["pitch_deg"], 2),
         round(point_view["distance_m"], 3),
@@ -269,6 +391,9 @@ def _write_status(camera, mode: str, depth_ready: bool) -> None:
     payload = {
         "schema": "g1_dashboard.camera_display_status.v1.3",
         "mode": mode,
+        "web_views": web_views,
+        "web_view_ports": dict(WEB_VIEW_PORTS),
+        "web_derived_fps": float(WEB_DERIVED_FPS),
         "depth_ready": bool(depth_ready),
         "width": int(camera._img_shape[1]),
         "height": int(camera._img_shape[0]),
@@ -509,17 +634,6 @@ def _pointcloud_view(
             h,
         )
 
-    cv2.putText(canvas, "POINT CLOUD | DRAG TO ORBIT / WHEEL TO ZOOM", (16, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (205, 220, 235), 1, cv2.LINE_AA)
-    cv2.putText(
-        canvas,
-        f"yaw {view['yaw_deg']:+.0f}  pitch {view['pitch_deg']:+.0f}  distance {view['distance_m']:.1f}m",
-        (16, h - 16),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.42,
-        (145, 165, 185),
-        1,
-        cv2.LINE_AA,
-    )
     return canvas
 
 def _topdown_view(camera, depth_m: np.ndarray, valid: np.ndarray) -> np.ndarray:
@@ -674,6 +788,57 @@ def _render_mode(
     rendered[mode] = output
     return output
 
+def _publish_dashboard_views(
+    camera,
+    bgr: np.ndarray,
+    depth_z16: np.ndarray | None,
+    depth_scale: float,
+    web_views: tuple[str, ...],
+    frame_cache: dict,
+) -> None:
+    now = time.monotonic()
+
+    if now < getattr(
+        camera,
+        "_g1_next_web_publish",
+        0.0,
+    ):
+        return
+
+    camera._g1_next_web_publish = (
+        now + (1.0 / WEB_DERIVED_FPS)
+    )
+
+    publisher = (
+        image_server.WebRTC_PublisherManager
+        .get_instance()
+    )
+
+    for mode in web_views:
+        port = WEB_VIEW_PORTS.get(mode)
+
+        # RGB uses Teleimager's original port 60001,
+        # LifeCam uses its configured port 60004, and
+        # point cloud remains browser-local WebGL.
+        if port is None:
+            continue
+
+        output = _render_mode(
+            camera,
+            bgr,
+            depth_z16,
+            depth_scale,
+            mode,
+            frame_cache,
+        )
+
+        publisher.publish(
+            output,
+            port,
+            codec_pref="h264",
+        )
+
+
 _original_rs_init = image_server.RealSenseCamera.__init__
 
 
@@ -690,12 +855,32 @@ def _patched_rs_init(
     webrtc_codec=None,
     enable_depth=False,
 ):
-    # The dashboard's head-camera config is RealSense-only. Force depth for the
-    # head camera while retaining the upstream constructor and acquisition path.
-    _original_rs_init(
+    # Keep the RGB/output canvas at the configured size, but acquire depth at a
+    # lower native resolution. The D435i and LifeCam share a USB 2 bus, so
+    # 640x480 color + 640x480 Z16 depth leaves too little transport headroom.
+    rs = _g1_pyrealsense2
+    force_depth = bool(
+        str(cam_topic) == "head_camera"
+        or enable_depth
+    )
+    depth_width = max(
+        1,
+        int(os.environ.get(
+            "G1_DASHBOARD_DEPTH_WIDTH",
+            "480",
+        )),
+    )
+    depth_height = max(
+        1,
+        int(os.environ.get(
+            "G1_DASHBOARD_DEPTH_HEIGHT",
+            "270",
+        )),
+    )
+
+    image_server.BaseCamera.__init__(
         self,
         cam_topic,
-        serial_number,
         img_shape,
         fps,
         enable_zmq,
@@ -703,10 +888,99 @@ def _patched_rs_init(
         enable_webrtc,
         webrtc_port,
         webrtc_codec,
-        enable_depth=(True if str(cam_topic) == "head_camera" else enable_depth),
     )
+    self._serial_number = serial_number
+    self._enable_depth = force_depth
+    self._latest_depth = None
+    self.pipeline = rs.pipeline()
+
+    try:
+        config = rs.config()
+        config.enable_device(self._serial_number)
+        config.enable_stream(
+            rs.stream.color,
+            self._img_shape[1],
+            self._img_shape[0],
+            rs.format.bgr8,
+            self._fps,
+        )
+        if self._enable_depth:
+            config.enable_stream(
+                rs.stream.depth,
+                depth_width,
+                depth_height,
+                rs.format.z16,
+                self._fps,
+            )
+
+        profile = self.pipeline.start(config)
+        self._device = profile.get_device()
+        if self._device is None:
+            raise RuntimeError(
+                "pipeline profile returned no device"
+            )
+
+        # Always discard stale sensor frames.
+        for sensor in self._device.query_sensors():
+            try:
+                if sensor.supports(
+                    rs.option.frames_queue_size
+                ):
+                    sensor.set_option(
+                        rs.option.frames_queue_size,
+                        1.0,
+                    )
+            except Exception as exc:
+                image_server.logger_mp.warning(
+                    "[G1 camera modes] unable to set "
+                    "frames_queue_size=1: %s",
+                    exc,
+                )
+
+        self.align = rs.align(rs.stream.color)
+
+        if self._enable_depth:
+            depth_sensor = self._device.first_depth_sensor()
+            self.g_depth_scale = (
+                depth_sensor.get_depth_scale()
+            )
+
+        self.intrinsics = (
+            profile.get_stream(rs.stream.color)
+            .as_video_stream_profile()
+            .get_intrinsics()
+        )
+        self._g1_depth_capture_shape = (
+            depth_height,
+            depth_width,
+        )
+
+        image_server.logger_mp.info(
+            "[G1 camera modes] RealSense capture: "
+            "RGB=%dx%d@%d depth=%dx%d@%d "
+            "sensor_queue=1",
+            self._img_shape[1],
+            self._img_shape[0],
+            self._fps,
+            depth_width,
+            depth_height,
+            self._fps,
+        )
+    except Exception as exc:
+        try:
+            self.pipeline.stop()
+        except Exception:
+            pass
+
+        raise RuntimeError(
+            f"[G1 camera modes] failed to initialize "
+            f"RealSense {self._serial_number}: {exc}"
+        ) from exc
     self._g1_display_mode = "rgb"
     self._g1_next_mode_poll = 0.0
+    self._g1_web_views = WEB_VIEW_DEFAULT
+    self._g1_next_web_views_poll = 0.0
+    self._g1_next_web_publish = 0.0
     self._g1_next_status_write = 0.0
     self._g1_status_fingerprint = None
     self._g1_point_view = dict(POINT_VIEW_DEFAULT)
@@ -717,6 +991,8 @@ def _patched_rs_init(
     self._g1_quest_udp_sender_initialized = False
     self._g1_quest_udp_sender = None
     self._g1_yolo_requested = False
+    self._g1_yolo_dashboard_requested = False
+    self._g1_yolo_quest_requested = False
     self._g1_next_yolo_request_poll = 0.0
     self._g1_yolo_client_initialized = False
     self._g1_yolo_client = None
@@ -740,7 +1016,30 @@ def _patched_rs_update_frame(self):
 
     bgr_numpy = np.asanyarray(color_frame.get_data())
     mode = _read_requested_mode(self)
+    web_views = _read_web_views(self)
     depth_scale = getattr(self, "g_depth_scale", 0.001)
+
+    if not getattr(self, "_g1_quest_udp_sender_initialized", False):
+        self._g1_quest_udp_sender_initialized = True
+        if getattr(self, "_g1_cam_topic", "") == "head_camera":
+            self._g1_quest_udp_sender = create_quest_udp_sender(
+                image_server.logger_mp
+            )
+
+    quest_sender = getattr(
+        self,
+        "_g1_quest_udp_sender",
+        None,
+    )
+    quest_modes = (
+        quest_sender.requested_modes()
+        if quest_sender is not None
+        else ()
+    )
+    quest_yolo_requested = bool(
+        quest_sender is not None
+        and quest_sender.yolo_requested()
+    )
 
     if not getattr(self, "_g1_yolo_client_initialized", False):
         self._g1_yolo_client_initialized = True
@@ -756,8 +1055,22 @@ def _patched_rs_update_frame(self):
                 )
                 self._g1_yolo_client = None
 
+    dashboard_yolo_requested = _read_yolo_requested(
+        self
+    )
+    yolo_requested = bool(
+        dashboard_yolo_requested
+        or quest_yolo_requested
+    )
+    self._g1_yolo_dashboard_requested = bool(
+        dashboard_yolo_requested
+    )
+    self._g1_yolo_quest_requested = bool(
+        quest_yolo_requested
+    )
+    self._g1_yolo_requested = yolo_requested
+
     yolo_detections = ()
-    yolo_requested = _read_yolo_requested(self)
     yolo_client = getattr(self, "_g1_yolo_client", None)
     if yolo_requested and yolo_client is not None:
         try:
@@ -775,31 +1088,41 @@ def _patched_rs_update_frame(self):
                 exc,
             )
 
-    if not getattr(self, "_g1_quest_udp_sender_initialized", False):
-        self._g1_quest_udp_sender_initialized = True
-        if getattr(self, "_g1_cam_topic", "") == "head_camera":
-            self._g1_quest_udp_sender = create_quest_udp_sender(image_server.logger_mp)
-
-    quest_sender = getattr(self, "_g1_quest_udp_sender", None)
-    quest_modes = quest_sender.requested_modes() if quest_sender is not None else ()
-
     frame_cache = {
         "yolo_detections": yolo_detections,
     }
+    # Port 60001 now has one stable meaning: RealSense RGB.
     output = _render_mode(
         self,
         bgr_numpy,
         depth_numpy,
         depth_scale,
-        mode,
+        "rgb",
         frame_cache,
     )
 
-    if mode == "pointcloud" and depth_numpy is not None:
+    if (
+        (
+            mode == "pointcloud"
+            or "pointcloud" in web_views
+        )
+        and depth_numpy is not None
+    ):
         products = frame_cache.get("depth_products")
-        if products is not None:
-            _heat, depth_m, valid = products
-            _publish_pointcloud_snapshot(self, bgr_numpy, depth_m, valid)
+        if products is None:
+            products = _depth_products(
+                depth_numpy,
+                depth_scale,
+            )
+            frame_cache["depth_products"] = products
+
+        _heat, depth_m, valid = products
+        _publish_pointcloud_snapshot(
+            self,
+            bgr_numpy,
+            depth_m,
+            valid,
+        )
 
     if quest_sender is not None:
         quest_outputs = {
@@ -814,6 +1137,16 @@ def _patched_rs_update_frame(self):
             for quest_mode in quest_modes
         }
         quest_sender.submit_views(quest_outputs)
+
+    _publish_dashboard_views(
+        self,
+        bgr_numpy,
+        depth_numpy,
+        depth_scale,
+        web_views,
+        frame_cache,
+    )
+
     if self._enable_webrtc:
         self._webrtc_buffer.write(output)
 
@@ -837,9 +1170,10 @@ if "--rs" not in sys.argv:
     sys.argv.append("--rs")
 
 image_server.logger_mp.info(
-    "[G1 camera modes] wrapper enabled: config=%s mode_file=%s point_view_file=%s pointcloud_file=%s status_file=%s modes=%s",
+    "[G1 camera modes] wrapper enabled: config=%s mode_file=%s web_views_file=%s point_view_file=%s pointcloud_file=%s status_file=%s modes=%s",
     CONFIG_FILE,
     MODE_FILE,
+    WEB_VIEWS_FILE,
     POINT_VIEW_FILE,
     POINTCLOUD_FILE,
     STATUS_FILE,

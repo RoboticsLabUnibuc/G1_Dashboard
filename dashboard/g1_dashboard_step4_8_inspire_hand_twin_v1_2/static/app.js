@@ -23,15 +23,116 @@ let latestEnv=null;
 let pollBusy=false;
 let currentView='live';
 let cameraPc=null;
-let cameraFallback=false;
 let cameraUrl=null;
-let cameraFrameWatch=null;
 let cameraConnecting=false;
 let cameraProcessStatus=null;
 let cameraProcessPollBusy=false;
 let cameraProcessActionBusy=false;
-let cameraModeActionBusy=false;
+let cameraViewsActionBusy=false;
 let cameraYoloActionBusy=false;
+
+const CAMERA_VIEW_ORDER=Object.freeze([
+  'rgb',
+  'depth',
+  'overlay',
+  'near',
+  'disparity',
+  'pointcloud',
+  'topdown',
+  'lifecam',
+]);
+
+const CAMERA_VIEWS=Object.freeze({
+  rgb:Object.freeze({
+    id:'rgb',
+    label:'RealSense RGB',
+    shortLabel:'RGB',
+    transport:'webrtc',
+    port:60001,
+  }),
+  depth:Object.freeze({
+    id:'depth',
+    label:'Depth',
+    shortLabel:'DEPTH',
+    transport:'webrtc',
+    port:60005,
+  }),
+  overlay:Object.freeze({
+    id:'overlay',
+    label:'RGB + depth',
+    shortLabel:'OVERLAY',
+    transport:'webrtc',
+    port:60006,
+  }),
+  near:Object.freeze({
+    id:'near',
+    label:'Near-field',
+    shortLabel:'NEAR',
+    transport:'webrtc',
+    port:60007,
+  }),
+  disparity:Object.freeze({
+    id:'disparity',
+    label:'Disparity',
+    shortLabel:'DISP',
+    transport:'webrtc',
+    port:60008,
+  }),
+  pointcloud:Object.freeze({
+    id:'pointcloud',
+    label:'Point cloud',
+    shortLabel:'POINT',
+    transport:'webgl',
+    endpoint:'/api/camera/pointcloud',
+  }),
+  topdown:Object.freeze({
+    id:'topdown',
+    label:'Top-down',
+    shortLabel:'TOP',
+    transport:'webrtc',
+    port:60009,
+  }),
+  lifecam:Object.freeze({
+    id:'lifecam',
+    label:'External LifeCam',
+    shortLabel:'LIFECAM',
+    transport:'webrtc',
+    port:60004,
+  }),
+});
+
+let activeCameraViews=['rgb','lifecam'];
+const cameraPeers=new Map();
+const cameraPeerConnecting=new Set();
+
+function currentCameraSource(){
+  // Compatibility for the surrounding telemetry renderer.
+  return {id:'realsense'};
+}
+
+function normalizeCameraViews(raw){
+  const requested=new Set(
+    Array.isArray(raw)
+      ?raw.map(value=>String(value||'').toLowerCase())
+      :[]
+  );
+  const ordered=CAMERA_VIEW_ORDER.filter(id=>requested.has(id));
+  return ordered.length?ordered:['rgb','lifecam'];
+}
+
+function activeWebRtcViews(){
+  return activeCameraViews.filter(
+    id=>CAMERA_VIEWS[id]?.transport==='webrtc'
+  );
+}
+
+function cameraViewProcessStatus(id,st=cameraProcessStatus){
+  const views=Array.isArray(st?.camera_views)
+    ?st.camera_views
+    :[];
+  return views.find(view=>view.id===id)||null;
+}
+
 let pointViewSendBusy=false;
 let pointViewLocal=null;
 let pointViewInitialized=false;
@@ -395,240 +496,861 @@ $('xrActionBtn').addEventListener('click',async()=>{
 });
 document.addEventListener('keydown',(e)=>{if(e.key==='Escape'&&!$('controllerModal').classList.contains('hidden'))closeControllerModal();});
 
-/* ---------- Camera / teleimager process + WebRTC ---------- */
-function fallbackCameraOffer(){
+/* ---------- Camera multiview + teleimager ---------- */
+function cameraModeLabel(mode){
+  return CAMERA_VIEWS[mode]?.label
+    || String(mode||'—').toUpperCase();
+}
+
+function fallbackCameraOffer(viewId){
+  const view=CAMERA_VIEWS[viewId];
   const host=window.location.hostname;
-  return host ? `https://${host}:60001/offer` : null;
+  if(!host||!view||view.transport!=='webrtc')return null;
+  return `https://${host}:${view.port}/offer`;
 }
-function cameraBaseFromTelemetry(t){
-  const offer=val(t,['camera','webrtc_offer_url']) || fallbackCameraOffer();
-  if(!offer) return null;
-  try{ const u=new URL(offer); u.pathname='/'; u.search=''; u.hash=''; return u.toString().replace(/\/$/,''); }catch{return null;}
+
+function cameraBaseForView(viewId){
+  const offer=fallbackCameraOffer(viewId);
+  if(!offer)return null;
+  try{
+    const url=new URL(offer);
+    url.pathname='/';
+    url.search='';
+    url.hash='';
+    return url.toString().replace(/\/$/,'');
+  }catch{
+    return null;
+  }
 }
-function cameraOfferFromTelemetry(t){ return val(t,['camera','webrtc_offer_url']) || fallbackCameraOffer(); }
+
+function ensureCameraTiles(){
+  const stage=$('cameraStage');
+  if(!stage||stage.dataset.initialized==='true')return;
+
+  stage.dataset.initialized='true';
+  stage.innerHTML=CAMERA_VIEW_ORDER.map(id=>{
+    const view=CAMERA_VIEWS[id];
+    const media=view.transport==='webgl'
+      ?'<canvas id="pointCloudCanvas" class="pointcloud-canvas" aria-label="Interactive camera-relative 3-D point cloud"></canvas>'
+      :`<video data-camera-video="${id}" autoplay playsinline muted></video>`;
+
+    const trust=view.transport==='webrtc'
+      ?`<a class="camera-tile-trust" data-camera-trust="${id}" target="_blank" rel="noreferrer">CERT</a>`
+      :'';
+
+    return `
+      <article class="camera-tile hidden" data-camera-view-tile="${id}">
+        <div class="camera-tile-head">
+          <strong>${view.label}</strong>
+          <div>
+            <span class="camera-tile-state" data-camera-state="${id}">OFFLINE</span>
+            ${trust}
+          </div>
+        </div>
+        <div class="camera-tile-body">
+          ${media}
+          <div class="camera-tile-overlay" data-camera-overlay="${id}">
+            <div class="camera-overlay-icon">◉</div>
+            <strong data-camera-overlay-title="${id}">Not connected</strong>
+            <span data-camera-overlay-text="${id}">Waiting for camera connection.</span>
+          </div>
+        </div>
+      </article>`;
+  }).join('');
+}
+
+ensureCameraTiles();
+
+function cameraTileElement(id){
+  return document.querySelector(
+    `[data-camera-view-tile="${id}"]`
+  );
+}
+
+function cameraVideoElement(id){
+  return document.querySelector(
+    `[data-camera-video="${id}"]`
+  );
+}
+
+function setCameraTileState(
+  id,
+  state,
+  detail='',
+  tone=null,
+){
+  const tile=cameraTileElement(id);
+  if(!tile)return;
+
+  const stateElement=tile.querySelector(
+    `[data-camera-state="${id}"]`
+  );
+  const overlay=tile.querySelector(
+    `[data-camera-overlay="${id}"]`
+  );
+  const title=tile.querySelector(
+    `[data-camera-overlay-title="${id}"]`
+  );
+  const text=tile.querySelector(
+    `[data-camera-overlay-text="${id}"]`
+  );
+
+  if(stateElement){
+    stateElement.textContent=state;
+    stateElement.className=
+      `camera-tile-state${tone?` ${tone}`:''}`;
+  }
+
+  if(title)title.textContent=state;
+  if(text&&detail)text.textContent=detail;
+  if(overlay)overlay.classList.toggle('hidden',state==='LIVE');
+}
+
+function pointCloudActive(){
+  return (
+    activeCameraViews.includes('pointcloud')
+    && cameraProcessStatus?.state==='RUNNING'
+  );
+}
+
+function syncCameraConnectionState(){
+  const first=Array.from(cameraPeers.values())
+    .find(entry=>entry?.pc);
+
+  cameraPc=first?.pc
+    || (
+      pointCloudActive()
+        ?{connectionState:'connected'}
+        :null
+    );
+
+  cameraConnecting=cameraPeerConnecting.size>0;
+}
+
+function closeCameraPeer(id,{resetState=true}={}){
+  const entry=cameraPeers.get(id);
+
+  if(entry){
+    if(entry.frameWatch)clearTimeout(entry.frameWatch);
+    try{entry.pc?.close();}catch{}
+
+    const video=cameraVideoElement(id);
+    if(video){
+      try{
+        if(video.srcObject){
+          video.srcObject.getTracks().forEach(
+            track=>track.stop()
+          );
+        }
+      }catch{}
+      video.srcObject=null;
+    }
+
+    cameraPeers.delete(id);
+  }
+
+  cameraPeerConnecting.delete(id);
+
+  if(resetState&&activeCameraViews.includes(id)){
+    setCameraTileState(
+      id,
+      'READY',
+      'Press Connect views.',
+    );
+  }
+
+  syncCameraConnectionState();
+}
+
 function cameraProcessTone(state){
   if(state==='RUNNING'||state==='RUNNING_EXTERNAL')return 'good';
   if(state==='STOPPING')return 'warn';
   if(state==='CONFLICT'||state==='UNAVAILABLE')return 'bad';
   return null;
 }
+
+function allActiveVideoViewsConnected(){
+  const ids=activeWebRtcViews();
+  if(!ids.length)return true;
+
+  return ids.every(id=>{
+    const entry=cameraPeers.get(id);
+    return entry?.pc?.connectionState==='connected';
+  });
+}
+
+function renderCameraGrid(){
+  ensureCameraTiles();
+
+  const stage=$('cameraStage');
+  if(!stage)return;
+
+  const activeSet=new Set(activeCameraViews);
+  stage.dataset.count=String(
+    Math.max(1,Math.min(9,activeCameraViews.length))
+  );
+
+  for(const id of CAMERA_VIEW_ORDER){
+    const tile=cameraTileElement(id);
+    if(!tile)continue;
+
+    const active=activeSet.has(id);
+    tile.classList.toggle('hidden',!active);
+
+    const trust=tile.querySelector(
+      `[data-camera-trust="${id}"]`
+    );
+    if(trust){
+      const base=cameraBaseForView(id);
+      if(base){
+        trust.href=base;
+        trust.classList.remove('hidden');
+      }else{
+        trust.removeAttribute('href');
+        trust.classList.add('hidden');
+      }
+    }
+
+    if(!active)continue;
+
+    if(id==='pointcloud'){
+      if(pointCloudActive()){
+        const stats=PointCloud3D.getStats?.()||{};
+        if(!stats.points){
+          setCameraTileState(
+            id,
+            'WAITING',
+            'Waiting for a point-cloud snapshot.',
+            'warn',
+          );
+        }
+      }else{
+        setCameraTileState(
+          id,
+          'OFFLINE',
+          'Start the managed camera server.',
+        );
+      }
+      continue;
+    }
+
+    const entry=cameraPeers.get(id);
+    if(entry?.pc?.connectionState==='connected'){
+      setCameraTileState(id,'LIVE','', 'good');
+      continue;
+    }
+
+    if(cameraPeerConnecting.has(id)){
+      setCameraTileState(
+        id,
+        'CONNECTING',
+        `Negotiating ${cameraModeLabel(id)} WebRTC.`,
+        'warn',
+      );
+      continue;
+    }
+
+    const viewStatus=cameraViewProcessStatus(id);
+    if(
+      cameraProcessStatus?.state==='RUNNING'
+      && viewStatus?.port_ready
+    ){
+      setCameraTileState(
+        id,
+        'READY',
+        'Press Connect views.',
+      );
+    }else if(cameraProcessStatus?.state==='RUNNING'){
+      setCameraTileState(
+        id,
+        'STARTING',
+        'The selected publisher is starting.',
+        'warn',
+      );
+    }else{
+      setCameraTileState(
+        id,
+        'OFFLINE',
+        'Start the managed camera server.',
+      );
+    }
+  }
+}
+
 function renderCameraProcess(st){
   cameraProcessStatus=st||{};
+
+  if(Array.isArray(cameraProcessStatus.web_views_requested)){
+    activeCameraViews=normalizeCameraViews(
+      cameraProcessStatus.web_views_requested
+    );
+  }
+
+  for(const id of Array.from(cameraPeers.keys())){
+    if(!activeCameraViews.includes(id)){
+      closeCameraPeer(id,{resetState:false});
+    }
+  }
+
   const state=cameraProcessStatus.state||'UNAVAILABLE';
   const badge=$('cameraProcessState');
-  const text=state==='RUNNING'?'SERVER ON':state==='RUNNING_EXTERNAL'?'SERVER EXT':state==='STOPPED'?'SERVER OFF':state==='STOPPING'?'SERVER STOPPING':state==='CONFLICT'?'SERVER CONFLICT':'SERVER SETUP';
-  badge.textContent=text;badge.className=`camera-process-state${cameraProcessTone(state)?` ${cameraProcessTone(state)}`:''}`;
-  const connected=!!cameraPc && ['connected','connecting','new'].includes(cameraPc.connectionState||'new');
+  const text=
+    state==='RUNNING'?'SERVER ON':
+    state==='RUNNING_EXTERNAL'?'SERVER EXT':
+    state==='STOPPED'?'SERVER OFF':
+    state==='STOPPING'?'SERVER STOPPING':
+    state==='CONFLICT'?'SERVER CONFLICT':
+    'SERVER SETUP';
+
+  badge.textContent=text;
+  badge.className=
+    `camera-process-state${
+      cameraProcessTone(state)
+        ?` ${cameraProcessTone(state)}`
+        :''
+    }`;
+
+  const connect=$('cameraConnectBtn');
+  const stop=$('cameraStopBtn');
+
+  connect.textContent=
+    state==='STOPPED'
+      ?'Start & connect'
+      :'Connect views';
+
+  connect.classList.toggle(
+    'hidden',
+    state==='RUNNING'&&allActiveVideoViewsConnected()
+  );
+
   if(state==='RUNNING'){
-    $('cameraStopBtn').textContent='Stop camera';
-    if(!connected)$('cameraStopBtn').classList.remove('hidden');
+    stop.textContent='Stop camera';
+    stop.classList.remove('hidden');
   }else if(state==='RUNNING_EXTERNAL'){
-    $('cameraStopBtn').textContent='Disconnect';
-    if(!connected)$('cameraStopBtn').classList.add('hidden');
-  }else if(!connected){
-    $('cameraStopBtn').classList.add('hidden');
+    stop.textContent='Disconnect';
+    stop.classList.toggle('hidden',cameraPeers.size===0);
+  }else{
+    stop.classList.add('hidden');
   }
-  if(state==='STOPPED')$('cameraConnectBtn').textContent='Start & connect';
-  else $('cameraConnectBtn').textContent='Connect camera';
+
   renderCameraModes();
   updateCameraButtons(latestEnv?.telemetry||{});
+  syncCameraConnectionState();
 }
+
 async function pollCameraProcess(){
   if(cameraProcessPollBusy)return cameraProcessStatus;
   cameraProcessPollBusy=true;
+
   try{
-    const r=await fetch('/api/camera',{cache:'no-store'});
-    if(!r.ok)throw new Error(`HTTP ${r.status}`);
-    const st=await r.json();renderCameraProcess(st);return st;
-  }catch(err){
-    cameraProcessStatus={state:'UNAVAILABLE',can_start:false,can_stop:false,last_error:String(err)};
+    const response=await fetch(
+      '/api/camera',
+      {cache:'no-store'}
+    );
+
+    if(!response.ok){
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const status=await response.json();
+    renderCameraProcess(status);
+    return status;
+  }catch(error){
+    cameraProcessStatus={
+      state:'UNAVAILABLE',
+      can_start:false,
+      can_stop:false,
+      last_error:String(error),
+    };
     renderCameraProcess(cameraProcessStatus);
-    console.debug('camera process endpoint unavailable',err);
+    console.debug(
+      'camera process endpoint unavailable',
+      error,
+    );
     return cameraProcessStatus;
-  }finally{cameraProcessPollBusy=false;}
+  }finally{
+    cameraProcessPollBusy=false;
+  }
 }
+
 async function cameraProcessPost(path,payload={}){
   const key=currentManagementKey();
-  if(!key)throw new Error('Enter the management key first.');
-  const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-G1-Management-Key':key},body:JSON.stringify(payload||{})});
-  let body={};try{body=await r.json();}catch{}
-  if(r.status===401){storeManagementKey('');showManagementKeyPrompt('Management key rejected. Enter the key printed by the currently running ./start_dashboard.sh.');}
-  if(!r.ok)throw new Error(body.error||`HTTP ${r.status}`);
+
+  if(!key){
+    throw new Error('Enter the management key first.');
+  }
+
+  const response=await fetch(path,{
+    method:'POST',
+    headers:{
+      'Content-Type':'application/json',
+      'X-G1-Management-Key':key,
+    },
+    body:JSON.stringify(payload||{}),
+  });
+
+  let body={};
+  try{body=await response.json();}catch{}
+
+  if(response.status===401){
+    storeManagementKey('');
+    showManagementKeyPrompt(
+      'Management key rejected. Enter the key printed by the currently running ./start_dashboard.sh.'
+    );
+  }
+
+  if(!response.ok){
+    throw new Error(body.error||`HTTP ${response.status}`);
+  }
+
   if(body.camera)renderCameraProcess(body.camera);
   return body.camera||cameraProcessStatus;
 }
-function cameraModeLabel(mode){
-  return ({rgb:'RGB',depth:'DEPTH',overlay:'OVERLAY',near:'NEAR',disparity:'DISPARITY',pointcloud:'POINT CLOUD',topdown:'TOP-DOWN'})[mode]||String(mode||'—').toUpperCase();
-}
+
 function renderCameraModes(){
-  const st=cameraProcessStatus||{};
-  const requested=st.mode_requested||'rgb';
-  const actual=st.mode_actual||null;
-  const controllable=!!st.mode_control && st.state==='RUNNING';
-  document.querySelectorAll('[data-camera-mode]').forEach(btn=>{
-    const mode=btn.dataset.cameraMode;
-    btn.classList.toggle('active',mode===requested);
-    btn.disabled=!controllable || cameraModeActionBusy;
-    btn.title=controllable?'Switch the shared Teleimager WebRTC output without reconnecting.':'Mode switching requires the dashboard-managed RealSense camera server.';
+  const status=cameraProcessStatus||{};
+  const requested=normalizeCameraViews(
+    status.web_views_requested||activeCameraViews
+  );
+  const actual=Array.isArray(status.web_views_actual)
+    ?normalizeCameraViews(status.web_views_actual)
+    :null;
+  const controllable=(
+    status.state==='RUNNING'
+    && status.web_views_control
+  );
+
+  activeCameraViews=requested;
+  const activeSet=new Set(requested);
+
+  document.querySelectorAll(
+    '[data-camera-mode]'
+  ).forEach(button=>{
+    const id=button.dataset.cameraMode;
+    const active=activeSet.has(id);
+
+    button.classList.toggle('active',active);
+    button.setAttribute(
+      'aria-pressed',
+      active?'true':'false',
+    );
+    button.disabled=(
+      !controllable
+      || cameraViewsActionBusy
+    );
+    button.title=controllable
+      ?`${active?'Hide':'Show'} ${cameraModeLabel(id)}.`
+      :'Start the dashboard-managed camera server first.';
   });
 
+  const waiting=(
+    controllable
+    && (
+      !actual
+      || actual.join('|')!==requested.join('|')
+    )
+  );
+
   const badge=$('cameraModeState');
-  if(badge){
-    const waiting=controllable && actual!==requested;
-    badge.textContent=waiting?`MODE ${cameraModeLabel(requested)}…`:`MODE ${cameraModeLabel(actual||requested)}`;
-    badge.className=`camera-mode-state${waiting?' warn':actual?' good':''}`;
-  }
+  badge.textContent=cameraViewsActionBusy||waiting
+    ?`VIEWS ${requested.length}…`
+    :`VIEWS ${requested.length}`;
+  badge.className=
+    `camera-mode-state${waiting?' warn':' good'}`;
 
   const yoloToggle=$('cameraYoloToggle');
   const yoloControl=$('cameraYoloControl');
   const yoloBadge=$('cameraYoloState');
-  const yoloRequested=!!st.yolo_requested;
-  const yoloControllable=!!st.yolo_control && st.state==='RUNNING';
-  const yoloWaiting=yoloControllable && (
-    !st.yolo_ack_online ||
-    st.yolo_actual!==yoloRequested
+  const yoloRequested=!!status.yolo_requested;
+  const yoloControllable=(
+    status.state==='RUNNING'
+    && status.yolo_control
+  );
+  const yoloWaiting=(
+    yoloControllable
+    && (
+      !status.yolo_ack_online
+      || status.yolo_actual!==yoloRequested
+    )
+  );
+
+  yoloControl?.classList.toggle(
+    'active',
+    yoloRequested,
+  );
+  yoloControl?.classList.toggle(
+    'busy',
+    cameraYoloActionBusy||yoloWaiting,
   );
 
   if(yoloToggle){
     yoloToggle.checked=yoloRequested;
     yoloToggle.indeterminate=yoloWaiting;
-    yoloToggle.disabled=!yoloControllable || cameraYoloActionBusy;
-  }
-
-  if(yoloControl){
-    yoloControl.classList.toggle('active',yoloRequested);
-    yoloControl.classList.toggle(
-      'busy',
-      cameraYoloActionBusy || yoloWaiting
+    yoloToggle.disabled=(
+      !yoloControllable
+      || cameraYoloActionBusy
     );
-    yoloControl.title=yoloControllable
-      ?'Run one YOLO inference pipeline on RGB and reuse detections across aligned camera views.'
-      :'YOLO control requires the dashboard-managed RealSense camera server.';
   }
 
   if(yoloBadge){
     yoloBadge.textContent=yoloWaiting
       ?`YOLO ${yoloRequested?'ON':'OFF'}…`
       :`YOLO ${yoloRequested?'ON':'OFF'}`;
-    yoloBadge.className=`camera-yolo-state${yoloWaiting?' warn':yoloRequested?' good':''}`;
+    yoloBadge.className=
+      `camera-yolo-state${
+        yoloWaiting
+          ?' warn'
+          :yoloRequested
+            ?' good'
+            :''
+      }`;
   }
 
+  renderCameraGrid();
   renderPointViewControls();
+  renderCameraSourceMetadata(latestEnv?.telemetry||{});
 }
 
-const POINT_VIEW_DEFAULT={yaw_deg:22,pitch_deg:14,distance_m:3.16,target_z_m:2.0};
-function pointClamp(x,lo,hi){return Math.max(lo,Math.min(hi,Number(x)));}
+async function toggleCameraView(id){
+  id=String(id||'').toLowerCase();
+  if(!CAMERA_VIEWS[id]||cameraViewsActionBusy)return;
+
+  if(!currentManagementKey()){
+    showManagementKeyPrompt(
+      'Enter the management key to change active camera views.',
+      ()=>toggleCameraView(id),
+    );
+    return;
+  }
+
+  if(
+    cameraProcessStatus?.state!=='RUNNING'
+    || !cameraProcessStatus?.web_views_control
+  ){
+    window.alert(
+      'Start the dashboard-managed camera server before changing views.'
+    );
+    return;
+  }
+
+  const wasActive=activeCameraViews.includes(id);
+  let next=wasActive
+    ?activeCameraViews.filter(value=>value!==id)
+    :[...activeCameraViews,id];
+
+  next=normalizeCameraViews(next);
+
+  if(wasActive&&activeCameraViews.length===1){
+    window.alert(
+      'At least one camera view must remain active.'
+    );
+    return;
+  }
+
+  const reconnect=(
+    cameraPeers.size>0
+    || pointCloudActive()
+  );
+
+  cameraViewsActionBusy=true;
+  renderCameraModes();
+
+  try{
+    const status=await cameraProcessPost(
+      '/api/camera/views',
+      {views:next},
+    );
+
+    if(status)renderCameraProcess(status);
+
+    if(wasActive){
+      closeCameraPeer(id,{resetState:false});
+    }else if(
+      reconnect
+      && CAMERA_VIEWS[id].transport==='webrtc'
+    ){
+      await waitCameraViewReady(id);
+      await connectCameraView(id);
+    }
+
+    if(id==='pointcloud'){
+      renderPointViewControls();
+    }
+  }catch(error){
+    window.alert(
+      `Camera view update failed: ${
+        error.message||error
+      }`
+    );
+  }finally{
+    cameraViewsActionBusy=false;
+    await pollCameraProcess();
+    renderCameraModes();
+  }
+}
+
+const POINT_VIEW_DEFAULT={
+  yaw_deg:22,
+  pitch_deg:14,
+  distance_m:3.16,
+  target_z_m:2.0,
+};
+
+function pointClamp(value,minimum,maximum){
+  return Math.max(
+    minimum,
+    Math.min(maximum,Number(value)),
+  );
+}
+
 function normalizePointView(raw={}){
   return {
-    yaw_deg:pointClamp(finite(raw.yaw_deg)?raw.yaw_deg:POINT_VIEW_DEFAULT.yaw_deg,-180,180),
-    pitch_deg:pointClamp(finite(raw.pitch_deg)?raw.pitch_deg:POINT_VIEW_DEFAULT.pitch_deg,-82,82),
-    distance_m:pointClamp(finite(raw.distance_m)?raw.distance_m:POINT_VIEW_DEFAULT.distance_m,1,8),
-    target_z_m:pointClamp(finite(raw.target_z_m)?raw.target_z_m:POINT_VIEW_DEFAULT.target_z_m,.5,5),
+    yaw_deg:pointClamp(
+      finite(raw.yaw_deg)
+        ?raw.yaw_deg
+        :POINT_VIEW_DEFAULT.yaw_deg,
+      -180,
+      180,
+    ),
+    pitch_deg:pointClamp(
+      finite(raw.pitch_deg)
+        ?raw.pitch_deg
+        :POINT_VIEW_DEFAULT.pitch_deg,
+      -82,
+      82,
+    ),
+    distance_m:pointClamp(
+      finite(raw.distance_m)
+        ?raw.distance_m
+        :POINT_VIEW_DEFAULT.distance_m,
+      1,
+      8,
+    ),
+    target_z_m:pointClamp(
+      finite(raw.target_z_m)
+        ?raw.target_z_m
+        :POINT_VIEW_DEFAULT.target_z_m,
+      .5,
+      5,
+    ),
   };
 }
-function pointCloudActive(){return (cameraProcessStatus?.mode_requested||'rgb')==='pointcloud'&&cameraProcessStatus?.state==='RUNNING';}
-function currentPointView(){return normalizePointView(PointCloud3D.getView?.()||pointViewLocal||POINT_VIEW_DEFAULT);}
+
+function currentPointView(){
+  return normalizePointView(
+    PointCloud3D.getView?.()
+    || pointViewLocal
+    || POINT_VIEW_DEFAULT
+  );
+}
 
 async function syncPointViewToCamera(view){
-  // Local WebGL orbit never requires authentication. If management access is
-  // unlocked, sync only the final viewpoint to the server-rendered WebRTC
-  // point cloud so the headset roughly follows without making drag latency
-  // depend on HTTP/H.264 round trips.
-  if(pointViewSendBusy||!currentManagementKey()||cameraProcessStatus?.state!=='RUNNING'||!cameraProcessStatus?.point_view_control)return;
+  if(
+    pointViewSendBusy
+    || !currentManagementKey()
+    || cameraProcessStatus?.state!=='RUNNING'
+    || !cameraProcessStatus?.point_view_control
+  )return;
+
   pointViewSendBusy=true;
+
   try{
-    const st=await cameraProcessPost('/api/camera/view',{view:normalizePointView(view)});
-    if(st)cameraProcessStatus=st;
-  }catch(err){console.warn('headset point-view sync failed',err);}
-  finally{pointViewSendBusy=false;renderPointViewControls();}
+    const status=await cameraProcessPost(
+      '/api/camera/view',
+      {view:normalizePointView(view)},
+    );
+    if(status)cameraProcessStatus=status;
+  }catch(error){
+    console.warn(
+      'point-view synchronization failed',
+      error,
+    );
+  }finally{
+    pointViewSendBusy=false;
+    renderPointViewControls();
+  }
 }
 
-const pointCloudViewer=PointCloud3D.init($('pointCloudCanvas'),(view,final)=>{
-  pointViewLocal=normalizePointView(view);
-  renderPointViewControls();
-  if(final)syncPointViewToCamera(pointViewLocal);
-});
-PointCloud3D.setView(POINT_VIEW_DEFAULT,false);
+const pointCloudViewer=PointCloud3D.init(
+  $('pointCloudCanvas'),
+  (view,final)=>{
+    pointViewLocal=normalizePointView(view);
+    renderPointViewControls();
+
+    if(final){
+      syncPointViewToCamera(pointViewLocal);
+    }
+  },
+);
+
+PointCloud3D.setView(
+  POINT_VIEW_DEFAULT,
+  false,
+);
 
 function updatePointCloudReadout(){
-  const readout=$('pointViewReadout');if(!readout)return;
-  const v=currentPointView(),st=PointCloud3D.getStats();
-  const points=st.points?`${(st.points/1000).toFixed(st.points>=10000?0:1)}k pts`:'waiting';
-  const hz=st.dataHz>0?`${st.dataHz.toFixed(0)} Hz`:'— Hz';
-  readout.textContent=`Y ${v.yaw_deg>=0?'+':''}${v.yaw_deg.toFixed(0)}° · P ${v.pitch_deg>=0?'+':''}${v.pitch_deg.toFixed(0)}° · ${v.distance_m.toFixed(1)}m · ${points} · ${hz}`;
+  const readout=$('pointViewReadout');
+  if(!readout)return;
+
+  const view=currentPointView();
+  const stats=PointCloud3D.getStats();
+  const points=stats.points
+    ?`${(stats.points/1000).toFixed(
+      stats.points>=10000?0:1
+    )}k pts`
+    :'waiting';
+  const hz=stats.dataHz>0
+    ?`${stats.dataHz.toFixed(0)} Hz`
+    :'— Hz';
+
+  readout.textContent=
+    `Y ${view.yaw_deg>=0?'+':''}${view.yaw_deg.toFixed(0)}° · `
+    +`P ${view.pitch_deg>=0?'+':''}${view.pitch_deg.toFixed(0)}° · `
+    +`${view.distance_m.toFixed(1)}m · ${points} · ${hz}`;
 }
+
 function renderPointViewControls(){
-  const strip=$('pointViewStrip');if(!strip)return;
-  const show=(cameraProcessStatus?.mode_requested||'rgb')==='pointcloud'&&cameraProcessStatus?.state==='RUNNING';
+  const strip=$('pointViewStrip');
+  if(!strip)return;
+
+  const show=pointCloudActive();
   strip.classList.toggle('hidden',!show);
-  strip.querySelectorAll('[data-point-view-preset]').forEach(b=>b.disabled=!show);
-  const stage=$('cameraStage');
-  if(stage)stage.classList.toggle('pointcloud-webgl-active',show);
+
+  strip.querySelectorAll(
+    '[data-point-view-preset]'
+  ).forEach(button=>{
+    button.disabled=!show;
+  });
+
   PointCloud3D.setVisible(show);
+
   if(show&&!pointViewInitialized){
-    const initial=normalizePointView(cameraProcessStatus?.point_view_actual||cameraProcessStatus?.point_view_requested||POINT_VIEW_DEFAULT);
-    PointCloud3D.setView(initial,false);pointViewInitialized=true;
+    const initial=normalizePointView(
+      cameraProcessStatus?.point_view_actual
+      || cameraProcessStatus?.point_view_requested
+      || POINT_VIEW_DEFAULT
+    );
+    PointCloud3D.setView(initial,false);
+    pointViewInitialized=true;
   }
+
+  if(!show){
+    pointViewInitialized=false;
+    if(pointCloudPollTimer){
+      clearTimeout(pointCloudPollTimer);
+      pointCloudPollTimer=null;
+    }
+  }
+
   updatePointCloudReadout();
+
   if(show)ensurePointCloudPoll();
+  syncCameraConnectionState();
 }
+
 async function pollPointCloud(){
   pointCloudPollTimer=null;
+
   if(!pointCloudActive())return;
-  if(pointCloudFetchBusy){ensurePointCloudPoll();return;}
+
+  if(pointCloudFetchBusy){
+    ensurePointCloudPoll();
+    return;
+  }
+
   pointCloudFetchBusy=true;
+
   try{
-    const r=await fetch('/api/camera/pointcloud',{cache:'no-store'});
-    if(r.ok&&r.status!==204){
-      const b=await r.arrayBuffer();
-      PointCloud3D.setSnapshot(b);
+    const response=await fetch(
+      '/api/camera/pointcloud',
+      {cache:'no-store'},
+    );
+
+    if(response.ok&&response.status!==204){
+      const snapshot=await response.arrayBuffer();
+      PointCloud3D.setSnapshot(snapshot);
       updatePointCloudReadout();
+      setCameraTileState(
+        'pointcloud',
+        'LIVE',
+        '',
+        'good',
+      );
+      cameraState('LIVE','good');
     }
-  }catch(err){console.debug('point-cloud snapshot unavailable',err);}
-  finally{pointCloudFetchBusy=false;if(pointCloudActive())pointCloudPollTimer=setTimeout(pollPointCloud,65);}
+  }catch(error){
+    console.debug(
+      'point-cloud snapshot unavailable',
+      error,
+    );
+    setCameraTileState(
+      'pointcloud',
+      'WAITING',
+      'Point-cloud snapshot unavailable.',
+      'warn',
+    );
+  }finally{
+    pointCloudFetchBusy=false;
+
+    if(pointCloudActive()){
+      pointCloudPollTimer=setTimeout(
+        pollPointCloud,
+        34,
+      );
+    }
+  }
 }
+
 function ensurePointCloudPoll(){
-  if(!pointCloudActive()||pointCloudPollTimer||pointCloudFetchBusy)return;
-  pointCloudPollTimer=setTimeout(pollPointCloud,0);
+  if(
+    !pointCloudActive()
+    || pointCloudPollTimer
+    || pointCloudFetchBusy
+  )return;
+
+  pointCloudPollTimer=setTimeout(
+    pollPointCloud,
+    0,
+  );
 }
+
 const POINT_VIEW_PRESETS={
-  front:{yaw_deg:0,pitch_deg:0,distance_m:3.0,target_z_m:2.0},
-  left:{yaw_deg:-70,pitch_deg:12,distance_m:3.35,target_z_m:2.0},
-  right:{yaw_deg:70,pitch_deg:12,distance_m:3.35,target_z_m:2.0},
-  above:{yaw_deg:0,pitch_deg:78,distance_m:3.8,target_z_m:2.0},
+  front:{
+    yaw_deg:0,
+    pitch_deg:0,
+    distance_m:3,
+    target_z_m:2,
+  },
+  left:{
+    yaw_deg:-70,
+    pitch_deg:12,
+    distance_m:3.35,
+    target_z_m:2,
+  },
+  right:{
+    yaw_deg:70,
+    pitch_deg:12,
+    distance_m:3.35,
+    target_z_m:2,
+  },
+  above:{
+    yaw_deg:0,
+    pitch_deg:78,
+    distance_m:3.8,
+    target_z_m:2,
+  },
   reset:POINT_VIEW_DEFAULT,
 };
+
 function applyPointViewPreset(name){
-  const preset=POINT_VIEW_PRESETS[name];if(!preset)return;
+  const preset=POINT_VIEW_PRESETS[name];
+  if(!preset)return;
+
   pointViewLocal=normalizePointView(preset);
   PointCloud3D.setView(pointViewLocal,true);
   updatePointCloudReadout();
 }
 
-async function setCameraMode(mode){
-  mode=String(mode||'').toLowerCase();
-  if(!['rgb','depth','overlay','near','disparity','pointcloud','topdown'].includes(mode)||cameraModeActionBusy)return;
-  if(!currentManagementKey()){
-    showManagementKeyPrompt('Enter the management key to switch the shared camera view.',()=>setCameraMode(mode));
-    return;
-  }
-  if(cameraProcessStatus?.state!=='RUNNING'||!cameraProcessStatus?.mode_control){
-    window.alert('Camera modes are available only while the dashboard-managed RealSense camera server is running.');
-    return;
-  }
-  cameraModeActionBusy=true;
-  renderCameraModes();
-  try{
-    const st=await cameraProcessPost('/api/camera/mode',{mode});
-    if(st)renderCameraProcess(st);
-  }catch(err){
-    window.alert(`Camera mode switch failed: ${err.message||err}`);
-  }finally{
-    cameraModeActionBusy=false;
-    await pollCameraProcess();
-    renderCameraModes();
-  }
-}
 async function setCameraYolo(enabled){
   enabled=!!enabled;
   if(cameraYoloActionBusy)return;
@@ -637,18 +1359,18 @@ async function setCameraYolo(enabled){
     renderCameraModes();
     showManagementKeyPrompt(
       'Enter the management key to enable or disable YOLO.',
-      ()=>setCameraYolo(enabled)
+      ()=>setCameraYolo(enabled),
     );
     return;
   }
 
   if(
-    cameraProcessStatus?.state!=='RUNNING' ||
-    !cameraProcessStatus?.yolo_control
+    cameraProcessStatus?.state!=='RUNNING'
+    || !cameraProcessStatus?.yolo_control
   ){
     renderCameraModes();
     window.alert(
-      'YOLO control is available only while the dashboard-managed RealSense camera server is running.'
+      'YOLO is available only while the managed camera server is running.'
     );
     return;
   }
@@ -657,13 +1379,15 @@ async function setCameraYolo(enabled){
   renderCameraModes();
 
   try{
-    const st=await cameraProcessPost(
+    const status=await cameraProcessPost(
       '/api/camera/yolo',
-      {enabled}
+      {enabled},
     );
-    if(st)renderCameraProcess(st);
-  }catch(err){
-    window.alert(`YOLO switch failed: ${err.message||err}`);
+    if(status)renderCameraProcess(status);
+  }catch(error){
+    window.alert(
+      `YOLO switch failed: ${error.message||error}`
+    );
   }finally{
     cameraYoloActionBusy=false;
     await pollCameraProcess();
@@ -671,134 +1395,433 @@ async function setCameraYolo(enabled){
   }
 }
 
-document.querySelectorAll('[data-camera-mode]').forEach(btn=>btn.addEventListener('click',()=>setCameraMode(btn.dataset.cameraMode)));
-$('cameraYoloToggle')?.addEventListener('change',event=>setCameraYolo(event.target.checked));
-document.querySelectorAll('[data-point-view-preset]').forEach(btn=>btn.addEventListener('click',()=>applyPointViewPreset(btn.dataset.pointViewPreset)));
+document.querySelectorAll(
+  '[data-camera-mode]'
+).forEach(button=>{
+  button.addEventListener(
+    'click',
+    ()=>toggleCameraView(button.dataset.cameraMode),
+  );
+});
+
+$('cameraYoloToggle')?.addEventListener(
+  'change',
+  event=>setCameraYolo(event.target.checked),
+);
+
+document.querySelectorAll(
+  '[data-point-view-preset]'
+).forEach(button=>{
+  button.addEventListener(
+    'click',
+    ()=>applyPointViewPreset(
+      button.dataset.pointViewPreset
+    ),
+  );
+});
+
+function renderCameraSourceMetadata(t={}){
+  const count=activeCameraViews.length;
+  const columns=count<=1?1:count<=6?2:3;
+  const rows=Math.ceil(count/columns);
+  const camera=t?.camera||{};
+  const fps=finite(
+    cameraProcessStatus?.mode_status?.web_derived_fps
+  )
+    ?Number(
+      cameraProcessStatus.mode_status.web_derived_fps
+    )
+    :30;
+
+  $('cameraMeta').textContent=
+    `${count} active · ${columns}×${rows} · ${fps.toFixed(0)} fps target`;
+
+  $('statusCamera').textContent=
+    `${count} camera view${count===1?'':'s'} active`;
+}
 
 function updateCameraButtons(t){
-  const base=cameraBaseFromTelemetry(t);
-  cameraUrl=cameraOfferFromTelemetry(t);
+  renderCameraSourceMetadata(t);
+
+  cameraUrl=fallbackCameraOffer('rgb');
+
   const link=$('cameraTrustLink');
-  if(base){ link.href=base; link.classList.remove('hidden'); } else { link.removeAttribute('href'); link.classList.add('hidden'); }
-  const configured=val(t,['camera','webrtc_enabled'], cameraUrl?true:false);
+  const base=cameraBaseForView('rgb');
+
+  if(base){
+    link.href=base;
+    link.classList.remove('hidden');
+  }else{
+    link.removeAttribute('href');
+    link.classList.add('hidden');
+  }
+
   const state=cameraProcessStatus?.state||'UNAVAILABLE';
-  const serverActionable=state==='RUNNING'||state==='RUNNING_EXTERNAL'||(state==='STOPPED'&&cameraProcessStatus?.can_start);
-  $('cameraConnectBtn').disabled=!configured || !cameraUrl || cameraConnecting || cameraProcessActionBusy || !serverActionable;
+  const actionable=(
+    state==='RUNNING'
+    || state==='RUNNING_EXTERNAL'
+    || (
+      state==='STOPPED'
+      && cameraProcessStatus?.can_start
+    )
+  );
+
+  $('cameraConnectBtn').disabled=(
+    !cameraUrl
+    || cameraConnecting
+    || cameraProcessActionBusy
+    || !actionable
+  );
 }
+
 function cameraState(text,tone,detail){
-  $('cameraStateText').textContent=text;
-  $('cameraStateDot').className=`dot${tone?` ${tone}`:''}`;
-  setChip($('cameraChip'),`CAMERA ${text}`, tone==='good'?'good':tone==='warn'?'warn':tone==='bad'?'bad':null);
-  if(detail) $('cameraOverlayText').textContent=detail;
+  setChip(
+    $('cameraChip'),
+    `CAMERA ${text}`,
+    tone==='good'
+      ?'good'
+      :tone==='warn'
+        ?'warn'
+        :tone==='bad'
+          ?'bad'
+          :null,
+  );
 }
-function stopCamera({silent=false}={}){
-  if(cameraFrameWatch){ clearTimeout(cameraFrameWatch); cameraFrameWatch=null; }
-  if(cameraPc){ try{cameraPc.close();}catch{} cameraPc=null; }
-  const v=$('cameraVideo'); try{ if(v.srcObject) v.srcObject.getTracks().forEach(t=>t.stop()); }catch{} v.srcObject=null;
-  cameraConnecting=false; cameraFallback=false;
-  $('cameraOverlay').classList.remove('hidden');
-  $('cameraOverlayTitle').textContent='Camera not connected';
-  $('cameraOverlayText').textContent=cameraProcessStatus?.state==='RUNNING'?'teleimager is running; connect when ready.':'Click Start & connect to launch teleimager.';
-  $('cameraConnectBtn').classList.remove('hidden');
-  if(cameraProcessStatus?.state==='RUNNING'){$('cameraStopBtn').textContent='Stop camera';$('cameraStopBtn').classList.remove('hidden');}
-  else $('cameraStopBtn').classList.add('hidden');
-  if(!silent) cameraState('OFFLINE',null);
-}
+
 async function waitIceComplete(pc,timeoutMs=3500){
-  if(pc.iceGatheringState==='complete') return;
-  await new Promise((resolve)=>{
-    const done=()=>{pc.removeEventListener('icegatheringstatechange',onChange);clearTimeout(timer);resolve();};
-    const onChange=()=>{if(pc.iceGatheringState==='complete')done();};
-    const timer=setTimeout(done,timeoutMs); pc.addEventListener('icegatheringstatechange',onChange);
+  if(pc.iceGatheringState==='complete')return;
+
+  await new Promise(resolve=>{
+    const done=()=>{
+      pc.removeEventListener(
+        'icegatheringstatechange',
+        onChange,
+      );
+      clearTimeout(timer);
+      resolve();
+    };
+
+    const onChange=()=>{
+      if(pc.iceGatheringState==='complete')done();
+    };
+
+    const timer=setTimeout(done,timeoutMs);
+    pc.addEventListener(
+      'icegatheringstatechange',
+      onChange,
+    );
   });
 }
-async function connectCamera(codec=null){
-  if(cameraConnecting) return;
-  const t=latestEnv?.telemetry;
-  const offerUrl=cameraOfferFromTelemetry(t||{});
-  if(!offerUrl){cameraState('NO CONFIG','warn','No WebRTC offer URL in telemetry.');return;}
-  stopCamera({silent:true});
-  cameraConnecting=true; cameraFallback=codec==='vp8';
-  $('cameraConnectBtn').disabled=true;
-  $('cameraOverlay').classList.remove('hidden');
-  $('cameraOverlayTitle').textContent='Connecting camera…';
-  $('cameraOverlayText').textContent='Negotiating WebRTC with teleimager.';
-  cameraState('CONNECTING','warn');
-  try{
-    const pc=new RTCPeerConnection({sdpSemantics:'unified-plan'}); cameraPc=pc;
-    pc.addTransceiver('video',{direction:'recvonly'});
-    pc.addEventListener('connectionstatechange',()=>{
-      if(pc!==cameraPc)return;
-      if(pc.connectionState==='connected') cameraState('LIVE','good');
-      else if(['failed','disconnected'].includes(pc.connectionState)) cameraState('LOST','bad');
-    });
-    pc.addEventListener('track',(evt)=>{
-      if(pc!==cameraPc || evt.track.kind!=='video') return;
-      const v=$('cameraVideo'); v.srcObject=evt.streams[0]; v.play().catch(()=>{});
-      $('cameraOverlay').classList.add('hidden');
-      $('cameraConnectBtn').classList.add('hidden'); $('cameraStopBtn').classList.remove('hidden');
-      $('cameraStopBtn').textContent=cameraProcessStatus?.state==='RUNNING'?'Stop camera':'Disconnect';
-      cameraState('LIVE','good');
-      const t0=v.currentTime;
-      cameraFrameWatch=setTimeout(()=>{
-        if(pc===cameraPc && v.currentTime===t0 && !cameraFallback){ stopCamera({silent:true}); connectCamera('vp8'); }
-      },5000);
-    });
-    const offer=await pc.createOffer(); await pc.setLocalDescription(offer); await waitIceComplete(pc);
-    const response=await fetch(offerUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sdp:pc.localDescription.sdp,type:pc.localDescription.type,codec:codec||null})});
-    if(!response.ok) throw new Error(`teleimager /offer HTTP ${response.status}`);
-    const answer=await response.json(); if(answer.error) throw new Error(answer.error); await pc.setRemoteDescription(answer);
-  }catch(err){
-    console.error('camera connection failed',err); stopCamera({silent:true});
-    $('cameraOverlayTitle').textContent='Camera connection failed';
-    $('cameraOverlayText').textContent='teleimager may still be starting, the camera may be occupied, or its certificate may need trust.';
-    cameraState('ERROR','bad');
-  }finally{ cameraConnecting=false; updateCameraButtons(latestEnv?.telemetry||{}); }
-}
-async function startAndConnectCamera(){
-  if(cameraProcessActionBusy||cameraConnecting)return;
-  let st=await pollCameraProcess();
-  if(st?.state==='STOPPED'){
-    if(!currentManagementKey()){showManagementKeyPrompt('Enter the management key to start the camera server.',()=>startAndConnectCamera());return;}
-    cameraProcessActionBusy=true;updateCameraButtons(latestEnv?.telemetry||{});
-    $('cameraOverlayTitle').textContent='Starting camera server…';
-    $('cameraOverlayText').textContent='Launching the dashboard-managed RealSense Teleimager stream on PC2.';
-    cameraState('STARTING','warn');
-    try{st=await cameraProcessPost('/api/camera/start');}
-    catch(err){cameraState('ERROR','bad',err.message||String(err));window.alert(`Camera server start failed: ${err.message||err}`);return;}
-    finally{cameraProcessActionBusy=false;}
+
+async function waitCameraViewReady(id){
+  if(CAMERA_VIEWS[id]?.transport!=='webrtc'){
+    return true;
   }
-  if(st?.state==='CONFLICT'||st?.state==='UNAVAILABLE'||st?.state==='STOPPING'){
-    cameraState('ERROR','bad',st?.last_error||`Camera process state: ${st?.state||'unknown'}`);return;
-  }
-  // teleimager process starts before its HTTPS/WebRTC socket. Give it a bounded
-  // readiness window, then attempt the normal WebRTC negotiation.
-  for(let i=0;i<24;i++){
-    st=await pollCameraProcess();
-    if(st?.port_ready)break;
-    if(!['RUNNING','RUNNING_EXTERNAL'].includes(st?.state))break;
+
+  for(let attempt=0;attempt<24;attempt++){
+    const status=await pollCameraProcess();
+    const view=cameraViewProcessStatus(id,status);
+
+    if(view?.port_ready)return true;
+    if(
+      !['RUNNING','RUNNING_EXTERNAL'].includes(
+        status?.state
+      )
+    )break;
+
     await new Promise(resolve=>setTimeout(resolve,250));
   }
-  await connectCamera();
+
+  return false;
 }
-async function stopCameraButton(){
-  if(cameraProcessActionBusy)return;
-  const st=await pollCameraProcess();
-  if(st?.state==='RUNNING'){
-    if(!currentManagementKey()){showManagementKeyPrompt('Enter the management key to stop the camera server.',()=>stopCameraButton());return;}
-    if(!window.confirm('Stop the dashboard-managed camera server? The browser video connection will close first.'))return;
-    stopCamera({silent:true});
-    cameraProcessActionBusy=true;updateCameraButtons(latestEnv?.telemetry||{});
-    try{await cameraProcessPost('/api/camera/stop');cameraState('OFFLINE',null,'teleimager stop requested.');}
-    catch(err){window.alert(`Camera stop failed: ${err.message||err}`);}
-    finally{cameraProcessActionBusy=false;await pollCameraProcess();}
+
+async function connectCameraView(id,codec=null){
+  const view=CAMERA_VIEWS[id];
+
+  if(
+    !view
+    || view.transport!=='webrtc'
+    || !activeCameraViews.includes(id)
+    || cameraPeerConnecting.has(id)
+  )return;
+
+  closeCameraPeer(id,{resetState:false});
+  cameraPeerConnecting.add(id);
+  syncCameraConnectionState();
+
+  setCameraTileState(
+    id,
+    'CONNECTING',
+    `Negotiating ${view.label} WebRTC.`,
+    'warn',
+  );
+
+  try{
+    const offerUrl=fallbackCameraOffer(id);
+    if(!offerUrl){
+      throw new Error('No WebRTC offer URL.');
+    }
+
+    const pc=new RTCPeerConnection({
+      sdpSemantics:'unified-plan',
+    });
+
+    const entry={
+      pc,
+      fallback:codec==='vp8',
+      frameWatch:null,
+    };
+
+    cameraPeers.set(id,entry);
+    pc.addTransceiver('video',{direction:'recvonly'});
+
+    pc.addEventListener(
+      'connectionstatechange',
+      ()=>{
+        if(cameraPeers.get(id)?.pc!==pc)return;
+
+        if(pc.connectionState==='connected'){
+          setCameraTileState(id,'LIVE','', 'good');
+          cameraState('LIVE','good');
+        }else if(
+          ['failed','disconnected'].includes(
+            pc.connectionState
+          )
+        ){
+          setCameraTileState(
+            id,
+            'LOST',
+            `${view.label} connection was lost.`,
+            'bad',
+          );
+          cameraState('DEGRADED','warn');
+        }
+
+        syncCameraConnectionState();
+        updateCameraButtons(latestEnv?.telemetry||{});
+      },
+    );
+
+    pc.addEventListener('track',event=>{
+      if(
+        cameraPeers.get(id)?.pc!==pc
+        || event.track.kind!=='video'
+      )return;
+
+      const video=cameraVideoElement(id);
+      if(!video)return;
+
+      video.srcObject=event.streams[0];
+      video.play().catch(()=>{});
+      setCameraTileState(id,'LIVE','', 'good');
+      cameraState('LIVE','good');
+
+      const startTime=video.currentTime;
+      entry.frameWatch=setTimeout(()=>{
+        if(
+          cameraPeers.get(id)?.pc===pc
+          && video.currentTime===startTime
+          && !entry.fallback
+        ){
+          closeCameraPeer(id,{resetState:false});
+          connectCameraView(id,'vp8');
+        }
+      },5000);
+    });
+
+    const offer=await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await waitIceComplete(pc);
+
+    const response=await fetch(offerUrl,{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        sdp:pc.localDescription.sdp,
+        type:pc.localDescription.type,
+        codec:codec||null,
+      }),
+    });
+
+    if(!response.ok){
+      throw new Error(
+        `teleimager /offer HTTP ${response.status}`
+      );
+    }
+
+    const answer=await response.json();
+    if(answer.error)throw new Error(answer.error);
+
+    await pc.setRemoteDescription(answer);
+  }catch(error){
+    console.error(
+      `${view.label} connection failed`,
+      error,
+    );
+    closeCameraPeer(id,{resetState:false});
+    setCameraTileState(
+      id,
+      'ERROR',
+      'Open CERT, accept the certificate, then press Connect views.',
+      'bad',
+    );
+  }finally{
+    cameraPeerConnecting.delete(id);
+    syncCameraConnectionState();
+    renderCameraGrid();
+    updateCameraButtons(latestEnv?.telemetry||{});
+  }
+}
+
+async function connectCamera(){
+  if(cameraConnecting)return;
+
+  const ids=activeWebRtcViews();
+
+  if(!ids.length){
+    renderPointViewControls();
+    cameraState('LIVE','good');
     return;
   }
-  // Never stop an externally-owned camera server from the dashboard.
+
+  cameraState('CONNECTING','warn');
+
+  await Promise.allSettled(
+    ids.map(async id=>{
+      await waitCameraViewReady(id);
+      return connectCameraView(id);
+    })
+  );
+
+  syncCameraConnectionState();
+
+  if(allActiveVideoViewsConnected()){
+    cameraState('LIVE','good');
+  }else if(cameraPeers.size){
+    cameraState('DEGRADED','warn');
+  }else{
+    cameraState('ERROR','bad');
+  }
+
+  renderCameraProcess(cameraProcessStatus);
+}
+
+function stopCamera({silent=false}={}){
+  for(const id of Array.from(cameraPeers.keys())){
+    closeCameraPeer(id,{resetState:true});
+  }
+
+  cameraPeerConnecting.clear();
+  syncCameraConnectionState();
+
+  if(!silent){
+    cameraState('OFFLINE',null);
+  }
+
+  renderCameraGrid();
+}
+
+async function startAndConnectCamera(){
+  if(cameraProcessActionBusy||cameraConnecting)return;
+
+  let status=await pollCameraProcess();
+
+  if(status?.state==='STOPPED'){
+    if(!currentManagementKey()){
+      showManagementKeyPrompt(
+        'Enter the management key to start the camera server.',
+        ()=>startAndConnectCamera(),
+      );
+      return;
+    }
+
+    cameraProcessActionBusy=true;
+    updateCameraButtons(latestEnv?.telemetry||{});
+    cameraState('STARTING','warn');
+
+    try{
+      status=await cameraProcessPost(
+        '/api/camera/start'
+      );
+    }catch(error){
+      cameraState('ERROR','bad');
+      window.alert(
+        `Camera server start failed: ${
+          error.message||error
+        }`
+      );
+      return;
+    }finally{
+      cameraProcessActionBusy=false;
+    }
+  }
+
+  if(
+    status?.state==='CONFLICT'
+    || status?.state==='UNAVAILABLE'
+    || status?.state==='STOPPING'
+  ){
+    cameraState('ERROR','bad');
+    window.alert(
+      status?.last_error
+      || `Camera process state: ${
+        status?.state||'unknown'
+      }`
+    );
+    return;
+  }
+
+  await connectCamera();
+}
+
+async function stopCameraButton(){
+  if(cameraProcessActionBusy)return;
+
+  const status=await pollCameraProcess();
+
+  if(status?.state==='RUNNING'){
+    if(!currentManagementKey()){
+      showManagementKeyPrompt(
+        'Enter the management key to stop the camera server.',
+        ()=>stopCameraButton(),
+      );
+      return;
+    }
+
+    if(!window.confirm(
+      'Stop the dashboard-managed camera server?'
+    ))return;
+
+    stopCamera({silent:true});
+    cameraProcessActionBusy=true;
+
+    try{
+      await cameraProcessPost('/api/camera/stop');
+      cameraState('OFFLINE',null);
+    }catch(error){
+      window.alert(
+        `Camera stop failed: ${error.message||error}`
+      );
+    }finally{
+      cameraProcessActionBusy=false;
+      await pollCameraProcess();
+    }
+
+    return;
+  }
+
   stopCamera();
 }
-$('cameraConnectBtn').addEventListener('click',()=>startAndConnectCamera());
-$('cameraStopBtn').addEventListener('click',()=>stopCameraButton());
+
+$('cameraConnectBtn').addEventListener(
+  'click',
+  ()=>startAndConnectCamera(),
+);
+
+$('cameraStopBtn').addEventListener(
+  'click',
+  ()=>stopCameraButton(),
+);
 
 /* ---------- Robot twin ---------- */
 function jointGroup(i){
@@ -1007,7 +2030,16 @@ function render(env){
   $('handFeedbackDetail').textContent=handFbFault?`STALE ${n(handFbAge,2,'s')}`:handFbValid?`${n(handFbAge,2,'s')}`:'INVALID RANGE';
   setTone($('handFeedbackDetail'),handFbFault||!handFbValid?'warn':'good');
   $('handRetargets').textContent=val(t,['hands','retarget_count'],'—'); $('handReacquire').textContent=val(t,['hands','reacquire_ready'])?'READY':`${val(t,['hands','reacquire_count'],0)}/${val(t,['hands','reacquire_required_frames'],'—')}`; $('thumbStatus').textContent=val(t,['controller','symmetric_thumb_rotation'])===false?'NO':'YES';
-  const c=t.camera||{}; const res=c.width&&c.height?`${c.width}×${c.height}`:'—'; const sharedMode=cameraProcessStatus?.mode_actual||cameraProcessStatus?.mode_requested||'rgb'; $('cameraMeta').textContent=`${res} · ${n(c.display_fps,0,' fps')} · ${cameraModeLabel(sharedMode)}`; $('cameraHudInfo').textContent=`${res} · ${n(c.display_fps,0,' fps')} · ${cameraModeLabel(sharedMode)} · shared with headset`; $('statusCamera').textContent=c.webrtc_enabled?`WebRTC ${res}`:'disabled'; updateCameraButtons(t); if(!cameraPc&&!cameraConnecting)setChip($('cameraChip'),c.webrtc_enabled?'CAMERA OFFLINE':'CAMERA OFF',c.webrtc_enabled?'warn':null);
+  const c=t.camera||{};
+  updateCameraButtons(t);
+  if(!cameraPc&&!cameraConnecting){
+    const configured=currentCameraSource().id==='lifecam'||c.webrtc_enabled;
+    setChip(
+      $('cameraChip'),
+      configured?'CAMERA OFFLINE':'CAMERA OFF',
+      configured?'warn':null
+    );
+  }
   updateFaultBanner(env,t); renderEvents(env);
 }
 

@@ -37,7 +37,7 @@ from g1_dashboard_service_client import ServiceActionClient
 from g1_dashboard_service_policy import classify_service, load_policy, public_policy
 
 SCHEMA = "g1_dashboard.telemetry.v1"
-BRIDGE_VERSION = "g1_dashboard_bridge.v1.10.0-independent-robot-stream"
+BRIDGE_VERSION = "g1_dashboard_bridge.v1.11.0-camera-multiview"
 SYSTEM_SCHEMA = "g1_dashboard.system.v1"
 ROBOT_SCHEMA = "g1_dashboard.robot_telemetry.v1"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -1432,13 +1432,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "/api/camera/start",
             "/api/camera/stop",
             "/api/camera/mode",
+            "/api/camera/views",
             "/api/camera/yolo",
             "/api/camera/view",
             "/api/services/set",
             "/api/slam/initialize",
         ):
             self._send_json(HTTPStatus.METHOD_NOT_ALLOWED, {
-                "error": "unsupported POST; authenticated endpoints are controller auth/start/stop/action, camera start/stop/mode/yolo/view, and allowlisted service set"
+                "error": "unsupported POST; authenticated endpoints are controller auth/start/stop/action, camera start/stop/mode/views/yolo/view, and allowlisted service set"
             })
             return
         if not self._require_process_action_auth():
@@ -1508,6 +1509,35 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json(
                     HTTPStatus.OK if acknowledged else HTTPStatus.ACCEPTED,
                     {"ok": True, "acknowledged": acknowledged, "camera": status},
+                )
+            elif path == "/api/camera/views":
+                views = payload.get("views")
+
+                if not isinstance(views, list):
+                    raise ValueError(
+                        "views must be an array"
+                    )
+
+                status = manager.set_camera_web_views(
+                    views
+                )
+                acknowledged = bool(
+                    status.get("web_views_ack_online")
+                    and status.get("web_views_actual")
+                    == status.get("web_views_requested")
+                )
+
+                self._send_json(
+                    (
+                        HTTPStatus.OK
+                        if acknowledged
+                        else HTTPStatus.ACCEPTED
+                    ),
+                    {
+                        "ok": True,
+                        "acknowledged": acknowledged,
+                        "camera": status,
+                    },
                 )
             elif path == "/api/camera/yolo":
                 enabled = payload.get("enabled")

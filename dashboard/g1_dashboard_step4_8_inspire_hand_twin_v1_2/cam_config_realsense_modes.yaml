@@ -21,6 +21,22 @@ head_camera:
   serial_number: "243722070255"
   physical_path: null
 
+external_camera:
+  enable_zmq: false
+  zmq_port: 55558
+  enable_webrtc: true
+  webrtc_port: 60004
+  webrtc_codec: h264
+  type: opencv
+  image_shape:
+    - 480
+    - 640
+  binocular: false
+  fps: 30
+  video_id: null
+  serial_number: null
+  physical_path: "/sys/devices/platform/bus@0/3610000.usb/usb1/1-2/1-2.3/1-2.3.1/1-2.3.1:1.0"
+
 # Keep the wrist-camera entries disabled exactly as in the current PC2 config.
 # They are retained here so Teleimager's configuration responder still exposes
 # the same camera topics if another component inspects the config.

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>G1 Teleop Control Center</title>
   <link rel="icon" href="data:," />
-  <link rel="stylesheet" href="/static/styles.css?v=slam-view-v1" />
+  <link rel="stylesheet" href="/static/styles.css?v=camera-multiview-v1" />
 </head>
 <body>
   <header class="topbar">
@@ -49,34 +49,40 @@
         <section class="panel camera-panel">
           <div class="panel-head compact-head">
             <div>
-              <div class="panel-kicker">HEAD CAMERA</div>
-              <div class="panel-title-line"><strong>Live view</strong><span id="cameraMeta" class="dim">—</span></div>
+              <div class="panel-kicker">CAMERA · MULTIVIEW</div>
+              <div class="panel-title-line">
+                <strong>Live views</strong>
+                <span id="cameraMeta" class="dim">—</span>
+              </div>
             </div>
+
             <div class="camera-actions">
               <span id="cameraProcessState" class="camera-process-state">SERVER —</span>
               <button id="cameraConnectBtn" class="primary-btn">Start &amp; connect</button>
               <button id="cameraStopBtn" class="ghost-btn hidden">Stop camera</button>
-              <a id="cameraTrustLink" class="ghost-link" target="_blank" rel="noreferrer">Trust cert</a>
+              <a id="cameraTrustLink" class="ghost-link" target="_blank" rel="noreferrer">Trust RGB cert</a>
             </div>
           </div>
 
-          <div class="camera-mode-strip" aria-label="Shared head-camera display mode">
+          <div class="camera-mode-strip" aria-label="Active camera views">
             <div class="camera-mode-buttons">
-              <button class="camera-mode-btn active" data-camera-mode="rgb" title="Normal RGB camera">RGB</button>
-              <button class="camera-mode-btn" data-camera-mode="depth" title="Metric Z16 depth heatmap">DEPTH</button>
-              <button class="camera-mode-btn" data-camera-mode="overlay" title="RGB with valid-depth heatmap overlay">OVERLAY</button>
-              <button class="camera-mode-btn" data-camera-mode="near" title="Near-field proximity bands">NEAR</button>
-              <button class="camera-mode-btn" data-camera-mode="disparity" title="Stereo disparity-proportional inverse-depth view">DISP</button>
-              <button class="camera-mode-btn" data-camera-mode="pointcloud" title="Orbitable RGB-textured 3-D point cloud">POINT</button>
-              <button class="camera-mode-btn" data-camera-mode="topdown" title="Orthographic X/Z 2-D occupancy projection">TOP</button>
+              <button class="camera-mode-btn active" data-camera-mode="rgb" aria-pressed="true">RGB</button>
+              <button class="camera-mode-btn" data-camera-mode="depth" aria-pressed="false">DEPTH</button>
+              <button class="camera-mode-btn" data-camera-mode="overlay" aria-pressed="false">OVERLAY</button>
+              <button class="camera-mode-btn" data-camera-mode="near" aria-pressed="false">NEAR</button>
+              <button class="camera-mode-btn" data-camera-mode="disparity" aria-pressed="false">DISP</button>
+              <button class="camera-mode-btn" data-camera-mode="pointcloud" aria-pressed="false">POINT</button>
+              <button class="camera-mode-btn" data-camera-mode="topdown" aria-pressed="false">TOP</button>
+              <button class="camera-mode-btn active" data-camera-mode="lifecam" aria-pressed="true">LIFECAM</button>
             </div>
+
             <div class="camera-mode-options">
-              <label id="cameraYoloControl" class="toggle camera-yolo-toggle" title="Run one YOLO inference pipeline on RGB and reuse detections across aligned camera views">
+              <label id="cameraYoloControl" class="toggle camera-yolo-toggle" title="Run one YOLO inference pipeline and reuse detections across aligned RealSense views">
                 <input id="cameraYoloToggle" type="checkbox" />
                 <span>YOLO</span>
               </label>
               <span id="cameraYoloState" class="camera-yolo-state">YOLO OFF</span>
-              <span id="cameraModeState" class="camera-mode-state">MODE RGB</span>
+              <span id="cameraModeState" class="camera-mode-state">VIEWS 2</span>
             </div>
           </div>
 
@@ -91,20 +97,7 @@
             <span class="point-view-hint">LOCAL WEBGL · drag orbit · wheel zoom</span>
           </div>
 
-          <div id="cameraStage" class="camera-stage">
-            <video id="cameraVideo" autoplay playsinline muted></video>
-            <canvas id="pointCloudCanvas" class="pointcloud-canvas hidden" aria-label="Interactive camera-relative 3-D point cloud"></canvas>
-            <div id="cameraOverlay" class="camera-overlay">
-              <div class="camera-overlay-icon">◉</div>
-              <strong id="cameraOverlayTitle">Camera not connected</strong>
-              <span id="cameraOverlayText">Click Start & connect to launch teleimager.</span>
-            </div>
-            <div class="camera-hud top-left">
-              <span id="cameraStateDot" class="dot"></span>
-              <span id="cameraStateText">OFFLINE</span>
-            </div>
-            <div class="camera-hud bottom-left" id="cameraHudInfo">—</div>
-          </div>
+          <div id="cameraStage" class="camera-stage camera-grid" data-count="2"></div>
         </section>
 
         <section class="panel twin-panel">
@@ -636,6 +629,6 @@
     </section>
   </div>
 
-  <script type="module" src="/static/app.js?v=slam-view-v1"></script>
+  <script type="module" src="/static/app.js?v=camera-multiview-v1"></script>
 </body>
 </html>
