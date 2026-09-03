@@ -876,9 +876,20 @@ _DERIVED_VIEW_IDS = frozenset({
 class _LatestDerivedFrameWorker:
     """Render depth-derived views without blocking camera capture."""
 
-    def __init__(self, camera, quest_sender):
+    def __init__(
+        self,
+        camera,
+        quest_sender,
+        pointcloud_only: bool = False,
+    ):
         self._camera = camera
         self._quest_sender = quest_sender
+        self._pointcloud_only = bool(pointcloud_only)
+        self._worker_kind = (
+            "quest point cloud"
+            if self._pointcloud_only
+            else "derived"
+        )
         self._condition = threading.Condition()
         self._pending = None
         self._stopping = False
@@ -888,7 +899,11 @@ class _LatestDerivedFrameWorker:
 
         self._thread = threading.Thread(
             target=self._run,
-            name="g1-camera-derived-latest",
+            name=(
+                "g1-quest-pointcloud-latest"
+                if self._pointcloud_only
+                else "g1-camera-derived-latest"
+            ),
             daemon=True,
         )
         self._thread.start()
@@ -906,22 +921,34 @@ class _LatestDerivedFrameWorker:
         if depth_z16 is None:
             return
 
-        web_derived = tuple(
-            view
-            for view in web_views
-            if view in _DERIVED_VIEW_IDS
-        )
+        if self._pointcloud_only:
+            web_derived = ()
+            quest_derived = (
+                ("pointcloud",)
+                if "pointcloud" in quest_modes
+                else ()
+            )
+            export_pointcloud = False
+        else:
+            web_derived = tuple(
+                view
+                for view in web_views
+                if view in _DERIVED_VIEW_IDS
+            )
 
-        quest_derived = tuple(
-            view
-            for view in quest_modes
-            if view in _DERIVED_VIEW_IDS
-        )
+            quest_derived = tuple(
+                view
+                for view in quest_modes
+                if (
+                    view in _DERIVED_VIEW_IDS
+                    and view != "pointcloud"
+                )
+            )
 
-        export_pointcloud = bool(
-            mode == "pointcloud"
-            or "pointcloud" in web_derived
-        )
+            export_pointcloud = bool(
+                mode == "pointcloud"
+                or "pointcloud" in web_derived
+            )
 
         if (
             not web_derived
@@ -984,7 +1011,8 @@ class _LatestDerivedFrameWorker:
                 self._process(*payload)
             except Exception as exc:
                 image_server.logger_mp.warning(
-                    "[G1 camera derived] frame failed: %s",
+                    "[G1 camera %s] frame failed: %s",
+                    self._worker_kind,
                     exc,
                 )
 
@@ -997,8 +1025,9 @@ class _LatestDerivedFrameWorker:
                     self._replaced = 0
 
                 image_server.logger_mp.info(
-                    "[G1 camera derived] processed=%d "
+                    "[G1 camera %s] processed=%d "
                     "replaced_pending=%d",
+                    self._worker_kind,
                     self._processed,
                     replaced,
                 )
@@ -1214,6 +1243,7 @@ def _patched_rs_init(
     self._g1_quest_udp_sender_initialized = False
     self._g1_quest_udp_sender = None
     self._g1_derived_worker = None
+    self._g1_quest_pointcloud_worker = None
     self._g1_yolo_requested = False
     self._g1_yolo_dashboard_requested = False
     self._g1_yolo_quest_requested = False
@@ -1273,6 +1303,26 @@ def _patched_rs_update_frame(self):
             quest_sender,
         )
         self._g1_derived_worker = derived_worker
+
+    pointcloud_worker = getattr(
+        self,
+        "_g1_quest_pointcloud_worker",
+        None,
+    )
+
+    if (
+        pointcloud_worker is None
+        and quest_sender is not None
+    ):
+        pointcloud_worker = _LatestDerivedFrameWorker(
+            self,
+            quest_sender,
+            pointcloud_only=True,
+        )
+        self._g1_quest_pointcloud_worker = (
+            pointcloud_worker
+        )
+
     quest_yolo_requested = bool(
         quest_sender is not None
         and quest_sender.yolo_requested()
@@ -1362,6 +1412,17 @@ def _patched_rs_update_frame(self):
         ),
         tuple(yolo_detections),
     )
+
+    if pointcloud_worker is not None:
+        pointcloud_worker.submit(
+            bgr_numpy,
+            depth_numpy,
+            depth_scale,
+            mode,
+            (),
+            quest_modes,
+            tuple(yolo_detections),
+        )
 
     if self._enable_webrtc:
         self._webrtc_buffer.write(output)
