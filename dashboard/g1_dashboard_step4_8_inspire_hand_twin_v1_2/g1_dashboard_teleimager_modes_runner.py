@@ -28,6 +28,7 @@ import json
 import os
 import struct
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -67,10 +68,8 @@ ALLOWED_MODES = {
     "rgb",
     "depth",
     "overlay",
-    "near",
     "disparity",
     "pointcloud",
-    "topdown",
 }
 MODE_FILE = Path(os.environ.get("TELEIMAGER_DISPLAY_MODE_FILE", "/tmp/g1_dashboard_camera_mode.txt"))
 WEB_VIEWS_FILE = Path(
@@ -80,16 +79,14 @@ WEB_VIEWS_FILE = Path(
     )
 )
 WEB_VIEW_ORDER = (
-    "rgb", "depth", "overlay", "near", "disparity",
-    "pointcloud", "topdown", "lifecam",
+    "rgb", "depth", "overlay", "disparity",
+    "pointcloud", "lifecam",
 )
 WEB_VIEW_DEFAULT = ("rgb", "lifecam")
 WEB_VIEW_PORTS = {
     "depth": 60005,
     "overlay": 60006,
-    "near": 60007,
     "disparity": 60008,
-    "topdown": 60009,
 }
 WEB_DERIVED_FPS = max(
     2.0,
@@ -399,11 +396,9 @@ def _write_status(camera, mode: str, depth_ready: bool) -> None:
         "height": int(camera._img_shape[0]),
         "fps": float(camera._fps),
         "depth_scale_m_per_unit": float(getattr(camera, "g_depth_scale", 0.0)),
-        "derived_modes": ["disparity", "pointcloud", "topdown"],
+        "derived_modes": ["disparity", "pointcloud"],
         "point_view": point_view,
         "yolo": yolo_status,
-        "topdown_projection": "orthographic_xz_occupancy_grid",
-        "topdown_cell_m": float(TOPDOWN_CELL_M),
         "pointcloud_browser_webgl": True,
         "pointcloud_export_hz": float(POINTCLOUD_EXPORT_HZ),
         "pointcloud_left_right_corrected": True,
@@ -506,9 +501,28 @@ def _publish_pointcloud_snapshot(camera, bgr: np.ndarray, depth_m: np.ndarray, v
     no longer require a round-trip or H.264 frame regeneration.
     """
     now = time.monotonic()
-    if now < getattr(camera, "_g1_next_pointcloud_export", 0.0):
+    period = 1.0 / POINTCLOUD_EXPORT_HZ
+    deadline = getattr(
+        camera,
+        "_g1_next_pointcloud_export",
+        0.0,
+    )
+    tolerance = min(0.005, period * 0.25)
+
+    if deadline > 0.0 and now + tolerance < deadline:
         return
-    camera._g1_next_pointcloud_export = now + 1.0 / POINTCLOUD_EXPORT_HZ
+
+    if deadline <= 0.0:
+        deadline = now + period
+    else:
+        deadline += period
+
+        if deadline <= now:
+            deadline += (
+                int((now - deadline) / period) + 1
+            ) * period
+
+    camera._g1_next_pointcloud_export = deadline
 
     points, pixels = _sample_xyz(camera, depth_m, valid, POINTCLOUD_EXPORT_STEP)
     if points.size == 0:
@@ -797,17 +811,28 @@ def _publish_dashboard_views(
     frame_cache: dict,
 ) -> None:
     now = time.monotonic()
-
-    if now < getattr(
+    period = 1.0 / WEB_DERIVED_FPS
+    deadline = getattr(
         camera,
         "_g1_next_web_publish",
         0.0,
-    ):
+    )
+    tolerance = min(0.005, period * 0.25)
+
+    if deadline > 0.0 and now + tolerance < deadline:
         return
 
-    camera._g1_next_web_publish = (
-        now + (1.0 / WEB_DERIVED_FPS)
-    )
+    if deadline <= 0.0:
+        deadline = now + period
+    else:
+        deadline += period
+
+        if deadline <= now:
+            deadline += (
+                int((now - deadline) / period) + 1
+            ) * period
+
+    camera._g1_next_web_publish = deadline
 
     publisher = (
         image_server.WebRTC_PublisherManager
@@ -837,6 +862,204 @@ def _publish_dashboard_views(
             port,
             codec_pref="h264",
         )
+
+
+
+_DERIVED_VIEW_IDS = frozenset({
+    "depth",
+    "overlay",
+    "disparity",
+    "pointcloud",
+})
+
+
+class _LatestDerivedFrameWorker:
+    """Render depth-derived views without blocking camera capture."""
+
+    def __init__(self, camera, quest_sender):
+        self._camera = camera
+        self._quest_sender = quest_sender
+        self._condition = threading.Condition()
+        self._pending = None
+        self._stopping = False
+        self._replaced = 0
+        self._processed = 0
+        self._next_stats_time = time.monotonic() + 5.0
+
+        self._thread = threading.Thread(
+            target=self._run,
+            name="g1-camera-derived-latest",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def submit(
+        self,
+        bgr: np.ndarray,
+        depth_z16: np.ndarray | None,
+        depth_scale: float,
+        mode: str,
+        web_views: tuple[str, ...],
+        quest_modes: tuple[str, ...],
+        detections: tuple,
+    ) -> None:
+        if depth_z16 is None:
+            return
+
+        web_derived = tuple(
+            view
+            for view in web_views
+            if view in _DERIVED_VIEW_IDS
+        )
+
+        quest_derived = tuple(
+            view
+            for view in quest_modes
+            if view in _DERIVED_VIEW_IDS
+        )
+
+        export_pointcloud = bool(
+            mode == "pointcloud"
+            or "pointcloud" in web_derived
+        )
+
+        if (
+            not web_derived
+            and not quest_derived
+            and not export_pointcloud
+        ):
+            return
+
+        payload = (
+            np.array(
+                bgr,
+                dtype=np.uint8,
+                copy=True,
+                order="C",
+            ),
+            np.array(
+                depth_z16,
+                copy=True,
+                order="C",
+            ),
+            float(depth_scale),
+            web_derived,
+            quest_derived,
+            tuple(detections),
+            export_pointcloud,
+        )
+
+        with self._condition:
+            if self._stopping:
+                return
+
+            if self._pending is not None:
+                self._replaced += 1
+
+            self._pending = payload
+            self._condition.notify()
+
+    def close(self) -> None:
+        with self._condition:
+            self._stopping = True
+            self._pending = None
+            self._condition.notify_all()
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                while (
+                    self._pending is None
+                    and not self._stopping
+                ):
+                    self._condition.wait()
+
+                if self._stopping:
+                    return
+
+                payload = self._pending
+                self._pending = None
+
+            try:
+                self._process(*payload)
+            except Exception as exc:
+                image_server.logger_mp.warning(
+                    "[G1 camera derived] frame failed: %s",
+                    exc,
+                )
+
+            self._processed += 1
+            now = time.monotonic()
+
+            if now >= self._next_stats_time:
+                with self._condition:
+                    replaced = self._replaced
+                    self._replaced = 0
+
+                image_server.logger_mp.info(
+                    "[G1 camera derived] processed=%d "
+                    "replaced_pending=%d",
+                    self._processed,
+                    replaced,
+                )
+                self._next_stats_time = now + 5.0
+
+    def _process(
+        self,
+        bgr: np.ndarray,
+        depth_z16: np.ndarray,
+        depth_scale: float,
+        web_views: tuple[str, ...],
+        quest_modes: tuple[str, ...],
+        detections: tuple,
+        export_pointcloud: bool,
+    ) -> None:
+        frame_cache = {
+            "yolo_detections": detections,
+        }
+
+        if export_pointcloud:
+            products = _depth_products(
+                depth_z16,
+                depth_scale,
+            )
+            frame_cache["depth_products"] = products
+
+            _heat, depth_m, valid = products
+
+            _publish_pointcloud_snapshot(
+                self._camera,
+                bgr,
+                depth_m,
+                valid,
+            )
+
+        _publish_dashboard_views(
+            self._camera,
+            bgr,
+            depth_z16,
+            depth_scale,
+            web_views,
+            frame_cache,
+        )
+
+        if (
+            self._quest_sender is not None
+            and quest_modes
+        ):
+            outputs = {
+                view: _render_mode(
+                    self._camera,
+                    bgr,
+                    depth_z16,
+                    depth_scale,
+                    view,
+                    frame_cache,
+                )
+                for view in quest_modes
+            }
+
+            self._quest_sender.submit_views(outputs)
 
 
 _original_rs_init = image_server.RealSenseCamera.__init__
@@ -990,6 +1213,7 @@ def _patched_rs_init(
     self._g1_cam_topic = str(cam_topic)
     self._g1_quest_udp_sender_initialized = False
     self._g1_quest_udp_sender = None
+    self._g1_derived_worker = None
     self._g1_yolo_requested = False
     self._g1_yolo_dashboard_requested = False
     self._g1_yolo_quest_requested = False
@@ -1032,10 +1256,23 @@ def _patched_rs_update_frame(self):
         None,
     )
     quest_modes = (
-        quest_sender.requested_modes()
+        quest_sender.requested_modes_due()
         if quest_sender is not None
         else ()
     )
+
+    derived_worker = getattr(
+        self,
+        "_g1_derived_worker",
+        None,
+    )
+
+    if derived_worker is None:
+        derived_worker = _LatestDerivedFrameWorker(
+            self,
+            quest_sender,
+        )
+        self._g1_derived_worker = derived_worker
     quest_yolo_requested = bool(
         quest_sender is not None
         and quest_sender.yolo_requested()
@@ -1101,50 +1338,29 @@ def _patched_rs_update_frame(self):
         frame_cache,
     )
 
+    # RGB stays on the short capture path.
     if (
-        (
-            mode == "pointcloud"
-            or "pointcloud" in web_views
-        )
-        and depth_numpy is not None
+        quest_sender is not None
+        and "rgb" in quest_modes
     ):
-        products = frame_cache.get("depth_products")
-        if products is None:
-            products = _depth_products(
-                depth_numpy,
-                depth_scale,
-            )
-            frame_cache["depth_products"] = products
-
-        _heat, depth_m, valid = products
-        _publish_pointcloud_snapshot(
-            self,
-            bgr_numpy,
-            depth_m,
-            valid,
+        quest_sender.submit_views(
+            {"rgb": output}
         )
 
-    if quest_sender is not None:
-        quest_outputs = {
-            quest_mode: _render_mode(
-                self,
-                bgr_numpy,
-                depth_numpy,
-                depth_scale,
-                quest_mode,
-                frame_cache,
-            )
-            for quest_mode in quest_modes
-        }
-        quest_sender.submit_views(quest_outputs)
-
-    _publish_dashboard_views(
-        self,
+    # Depth-derived work uses one latest-only background slot.
+    # Slow work therefore replaces stale input instead of delaying RGB.
+    derived_worker.submit(
         bgr_numpy,
         depth_numpy,
         depth_scale,
+        mode,
         web_views,
-        frame_cache,
+        tuple(
+            view
+            for view in quest_modes
+            if view != "rgb"
+        ),
+        tuple(yolo_detections),
     )
 
     if self._enable_webrtc:
@@ -1160,8 +1376,72 @@ def _patched_rs_update_frame(self):
         self._ready.set()
 
 
+def _patched_opencv_update_frame(self):
+    if self.cap is None:
+        return
+
+    ret, bgr_numpy = self.cap.read()
+
+    if not ret:
+        raise RuntimeError(
+            f"OpenCV camera {self._cam_topic} "
+            "failed to read a frame"
+        )
+
+    if not getattr(
+        self,
+        "_g1_lifecam_quest_sender_initialized",
+        False,
+    ):
+        self._g1_lifecam_quest_sender_initialized = True
+        self._g1_lifecam_quest_sender = None
+
+        if str(self._cam_topic) == "external_camera":
+            self._g1_lifecam_quest_sender = (
+                create_quest_udp_sender(
+                    image_server.logger_mp,
+                    "lifecam",
+                )
+            )
+
+    quest_sender = getattr(
+        self,
+        "_g1_lifecam_quest_sender",
+        None,
+    )
+
+    if (
+        quest_sender is not None
+        and "lifecam"
+        in quest_sender.requested_modes()
+    ):
+        quest_sender.submit_views(
+            {"lifecam": bgr_numpy}
+        )
+
+    if self._enable_webrtc:
+        self._webrtc_buffer.write(bgr_numpy)
+
+    if self._enable_zmq:
+        ok, buf = cv2.imencode(
+            ".jpg",
+            bgr_numpy,
+        )
+
+        if ok:
+            self._zmq_buffer.write(
+                buf.tobytes()
+            )
+
+    if not self._ready.is_set():
+        self._ready.set()
+
+
 image_server.RealSenseCamera.__init__ = _patched_rs_init
 image_server.RealSenseCamera._update_frame = _patched_rs_update_frame
+image_server.OpenCVCamera._update_frame = (
+    _patched_opencv_update_frame
+)
 image_server.CONFIG_PATH = str(CONFIG_FILE)
 
 # The official Teleimager CLI requires --rs to allow RealSense construction.

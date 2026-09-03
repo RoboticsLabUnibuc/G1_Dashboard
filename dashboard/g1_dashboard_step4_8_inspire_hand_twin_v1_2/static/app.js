@@ -35,10 +35,8 @@ const CAMERA_VIEW_ORDER=Object.freeze([
   'rgb',
   'depth',
   'overlay',
-  'near',
   'disparity',
   'pointcloud',
-  'topdown',
   'lifecam',
 ]);
 
@@ -64,13 +62,6 @@ const CAMERA_VIEWS=Object.freeze({
     transport:'webrtc',
     port:60006,
   }),
-  near:Object.freeze({
-    id:'near',
-    label:'Near-field',
-    shortLabel:'NEAR',
-    transport:'webrtc',
-    port:60007,
-  }),
   disparity:Object.freeze({
     id:'disparity',
     label:'Disparity',
@@ -84,13 +75,6 @@ const CAMERA_VIEWS=Object.freeze({
     shortLabel:'POINT',
     transport:'webgl',
     endpoint:'/api/camera/pointcloud',
-  }),
-  topdown:Object.freeze({
-    id:'topdown',
-    label:'Top-down',
-    shortLabel:'TOP',
-    transport:'webrtc',
-    port:60009,
   }),
   lifecam:Object.freeze({
     id:'lifecam',

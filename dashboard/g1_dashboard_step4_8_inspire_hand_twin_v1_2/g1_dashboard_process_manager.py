@@ -45,22 +45,20 @@ CAMERA_BASENAME = "teleimager-server"
 CAMERA_RUNNER_BASENAME = "g1_dashboard_teleimager_modes_runner.py"
 CAMERA_WEBRTC_PORT = 60001
 CAMERA_EXTERNAL_WEBRTC_PORT = 60004
-CAMERA_DISPLAY_MODES = {"rgb", "depth", "overlay", "near", "disparity", "pointcloud", "topdown"}
+CAMERA_DISPLAY_MODES = {"rgb", "depth", "overlay", "disparity", "pointcloud"}
 CAMERA_WEB_VIEW_ORDER = (
-    "rgb", "depth", "overlay", "near", "disparity",
-    "pointcloud", "topdown", "lifecam",
+    "rgb", "depth", "overlay", "disparity",
+    "pointcloud", "lifecam",
 )
 CAMERA_WEB_VIEW_PORTS = {
     "rgb": CAMERA_WEBRTC_PORT,
     "depth": 60005,
     "overlay": 60006,
-    "near": 60007,
     "disparity": 60008,
-    "topdown": 60009,
     "lifecam": CAMERA_EXTERNAL_WEBRTC_PORT,
 }
 CAMERA_WEB_VIEW_DEFAULT = ("rgb", "lifecam")
-CAMERA_WEB_VIEW_LIMIT = 9
+CAMERA_WEB_VIEW_LIMIT = 6
 POINT_VIEW_DEFAULT = {"yaw_deg": 22.0, "pitch_deg": 14.0, "distance_m": 3.16, "target_z_m": 2.0}
 POINT_VIEW_LIMITS = {
     "yaw_deg": (-180.0, 180.0),
@@ -290,10 +288,8 @@ def _camera_views_status(
         "rgb": "RealSense RGB",
         "depth": "Depth",
         "overlay": "RGB + depth",
-        "near": "Near-field",
         "disparity": "Disparity",
         "pointcloud": "Point cloud",
-        "topdown": "Top-down",
         "lifecam": "External LifeCam",
     }
 

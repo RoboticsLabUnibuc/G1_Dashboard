@@ -1384,14 +1384,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "inspire_dependency_lifecycle": "root-owned fixed helper; controller first on stop",
                     "camera_process_actions": bool(self.server.process_actions_enabled),
                     "camera_process_actions_authenticated": True,
-                    "camera_display_modes": ["rgb", "depth", "overlay", "near", "disparity", "pointcloud", "topdown"],
+                    "camera_display_modes": ["rgb", "depth", "overlay", "disparity", "pointcloud"],
                     "camera_mode_switch_preserves_webrtc": True,
                     "camera_yolo_live_toggle": True,
                     "camera_yolo_inference_source": "single aligned RGB frame",
                     "camera_point_view_orbit_control": True,
                     "camera_pointcloud_browser_webgl": True,
                     "camera_pointcloud_transport": "latest-only binary G1PC over same-origin HTTP",
-                    "camera_topdown_projection": "orthographic X/Z occupancy grid",
                     "slam_worker_isolated": True,
                     "slam_worker_control": (
                         "authenticated local-file relay; API 1804 only"
