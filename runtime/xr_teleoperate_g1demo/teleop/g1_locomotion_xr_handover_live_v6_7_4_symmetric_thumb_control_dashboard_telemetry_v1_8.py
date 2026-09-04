@@ -122,9 +122,11 @@ from unitree_sdk2py.idl.unitree_hg.msg.dds_ import (
     LowState_ as HgLowState,
 )
 from unitree_sdk2py.utils.crc import CRC
+from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
 
 from televuer import TeleVuerWrapper
 from g1_unity_televuer_ingress import UnityTeleVuerIngress
+from g1_quest_locomotion_ingress import QuestLocomotionIngress
 from teleop.robot_control.robot_arm_ik import G1_29_ArmIK
 
 # Reuse only the helpers already validated in the successful arm-only tests.
@@ -161,6 +163,14 @@ INSPIRE_COMMAND_TOPIC = "rt/inspire/cmd"
 INSPIRE_STATE_TOPIC = "rt/inspire/state"
 INSPIRE_RIGHT_IDS = tuple(range(0, 6))
 INSPIRE_LEFT_IDS = tuple(range(6, 12))
+
+QUEST_LOCOMOTION_DEADZONE = 0.18
+QUEST_LOCOMOTION_MAX_LINEAR_MPS = 0.50
+QUEST_LOCOMOTION_MAX_YAW_RPS = 0.60
+QUEST_LOCOMOTION_NEUTRAL_ARM_S = 0.30
+QUEST_LOCOMOTION_COMMAND_DURATION_S = 0.25
+QUEST_LOCOMOTION_COMMAND_HZ = 20.0
+QUEST_LOCOMOTION_STOP_REPEATS = 3
 
 ARM_JOINT_NAMES = (
     "L_shoulder_pitch",
@@ -272,6 +282,27 @@ class RemoteState:
         if not np.isfinite(axes).all():
             return math.nan
         return float(np.max(np.abs(axes)))
+
+
+def apply_radial_deadzone(
+    x: float,
+    y: float,
+    deadzone: float,
+) -> tuple[float, float]:
+    x_value = float(x)
+    y_value = float(y)
+    magnitude = math.hypot(x_value, y_value)
+
+    if magnitude <= deadzone or magnitude <= 1e-9:
+        return 0.0, 0.0
+
+    limited = min(1.0, magnitude)
+    scaled = (limited - deadzone) / (1.0 - deadzone)
+
+    return (
+        (x_value / magnitude) * scaled,
+        (y_value / magnitude) * scaled,
+    )
 
 
 @dataclass
@@ -4468,6 +4499,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--enable-quest-locomotion",
+        action="store_true",
+        help=(
+            "Enable authenticated Quest joystick locomotion. Without this "
+            "flag, Quest input remains logging-only."
+        ),
+    )
+    parser.add_argument(
         "--allow-locomotion-during-xr",
         action="store_true",
         help=(
@@ -4748,6 +4787,9 @@ def main() -> int:
     isolated_lowstate_cache: Optional[IsolatedLowStateCache] = None
     tv_wrapper: Optional[TeleVuerWrapper] = None
     unity_televuer_ingress: Optional[UnityTeleVuerIngress] = None
+    quest_locomotion_ingress: Optional[QuestLocomotionIngress] = None
+    quest_loco_client: Optional[LocoClient] = None
+    quest_locomotion_active = False
     arm_ctrl: Optional[SafeArmSdkController] = None
     finger_ctrl: Optional[FingerController] = None
     diagnostics: Optional[SynchronizedDiagnostics] = None
@@ -4806,6 +4848,28 @@ def main() -> int:
             LOG.info(
                 "Dashboard XR action channel disabled: %s is not present/valid.",
                 DASHBOARD_ACTION_TOKEN_ENV,
+            )
+
+        quest_locomotion_ingress = (
+            QuestLocomotionIngress.from_environment()
+        )
+        quest_locomotion_ingress.start()
+
+        if args.enable_quest_locomotion:
+            quest_loco_client = LocoClient()
+            quest_loco_client.SetTimeout(0.05)
+            quest_loco_client.Init()
+            LOG.warning(
+                "QUEST LOCOMOTION LIVE: max %.2f m/s, %.2f rad/s; "
+                "command lease %.2f s.",
+                QUEST_LOCOMOTION_MAX_LINEAR_MPS,
+                QUEST_LOCOMOTION_MAX_YAW_RPS,
+                QUEST_LOCOMOTION_COMMAND_DURATION_S,
+            )
+        else:
+            LOG.warning(
+                "Quest locomotion DRY RUN on UDP 5059. "
+                "Enable it explicitly in dashboard configuration."
             )
 
         managed_mode = os.environ.get("G1_DASHBOARD_MANAGED", "").strip() == "1"
@@ -5118,6 +5182,11 @@ def main() -> int:
         last_alignment_status = 0.0
         finger_worker_fault_reported = False
         last_guard_state = False
+        last_quest_locomotion_status = 0.0
+        last_quest_locomotion_command = 0.0
+        last_quest_locomotion_error = 0.0
+        quest_neutral_since: Optional[float] = None
+        quest_deadman_latched = False
 
         LOG.info(
             "STATE LOCOMOTION_READY. Arm ownership=0. "
@@ -5138,6 +5207,204 @@ def main() -> int:
                 lowstate_age,
                 args.lowstate_fresh_s,
             )
+
+            quest_input = quest_locomotion_ingress.snapshot()
+            quest_left_raw = quest_input["left"]
+            quest_right_raw = quest_input["right"]
+
+            quest_left_x, quest_left_y = apply_radial_deadzone(
+                float(quest_left_raw[0]),
+                float(quest_left_raw[1]),
+                QUEST_LOCOMOTION_DEADZONE,
+            )
+            quest_right_x, quest_right_y = apply_radial_deadzone(
+                float(quest_right_raw[0]),
+                float(quest_right_raw[1]),
+                QUEST_LOCOMOTION_DEADZONE,
+            )
+            quest_stick_max = max(
+                abs(quest_left_x), abs(quest_left_y),
+                abs(quest_right_x), abs(quest_right_y),
+            )
+
+            quest_permitted = False
+            reset_quest_latch = False
+
+            if not bool(quest_input["valid"]):
+                quest_reason = "packet stale/unavailable"
+                reset_quest_latch = True
+            elif state != State.LOCOMOTION_READY:
+                quest_reason = f"state={state.name}"
+                reset_quest_latch = True
+            elif (
+                lowstate is None
+                or not math.isfinite(lowstate_age)
+                or lowstate_age > args.lowstate_fresh_s
+            ):
+                quest_reason = "LowState stale/unavailable"
+                reset_quest_latch = True
+            elif (
+                not metrics.valid
+                or metrics.remote is None
+                or not metrics.remote.valid
+            ):
+                quest_reason = "R3 status unavailable"
+                reset_quest_latch = True
+            elif metrics.remote.max_abs_axis > args.r3_deadband:
+                quest_reason = "physical R3 has priority"
+                reset_quest_latch = True
+            elif not bool(quest_input["armed"]):
+                quest_reason = "deadman released"
+                reset_quest_latch = True
+            elif not quest_deadman_latched:
+                if quest_stick_max > 0.0:
+                    quest_neutral_since = None
+                    quest_reason = "center sticks before arming"
+                else:
+                    if quest_neutral_since is None:
+                        quest_neutral_since = now
+
+                    neutral_time = now - quest_neutral_since
+
+                    if (
+                        neutral_time
+                        >= QUEST_LOCOMOTION_NEUTRAL_ARM_S
+                    ):
+                        quest_deadman_latched = True
+                        quest_permitted = True
+                        quest_reason = "ready"
+                    else:
+                        quest_reason = (
+                            "arming with centered sticks"
+                        )
+            else:
+                quest_permitted = True
+                quest_reason = "ready"
+
+            if reset_quest_latch:
+                quest_deadman_latched = False
+                quest_neutral_since = None
+
+            if quest_permitted:
+                quest_vx = (
+                    quest_left_y
+                    * QUEST_LOCOMOTION_MAX_LINEAR_MPS
+                )
+                quest_vy = (
+                    -quest_left_x
+                    * QUEST_LOCOMOTION_MAX_LINEAR_MPS
+                )
+                quest_vyaw = (
+                    -quest_right_x
+                    * QUEST_LOCOMOTION_MAX_YAW_RPS
+                )
+            else:
+                quest_vx = quest_vy = quest_vyaw = 0.0
+
+            if (
+                args.enable_quest_locomotion
+                and quest_loco_client is not None
+            ):
+                if (
+                    quest_permitted
+                    and now - last_quest_locomotion_command
+                    >= 1.0 / QUEST_LOCOMOTION_COMMAND_HZ
+                ):
+                    quest_locomotion_active = True
+
+                    try:
+                        code = quest_loco_client.SetVelocity(
+                            quest_vx,
+                            quest_vy,
+                            quest_vyaw,
+                            QUEST_LOCOMOTION_COMMAND_DURATION_S,
+                        )
+
+                        if code not in (None, 0):
+                            raise RuntimeError(
+                                f"SetVelocity returned code {code}"
+                            )
+
+                        last_quest_locomotion_command = now
+                    except Exception as exc:
+                        if (
+                            now - last_quest_locomotion_error
+                            >= 1.0
+                        ):
+                            LOG.error(
+                                "Quest locomotion command failed: %s",
+                                exc,
+                            )
+                            last_quest_locomotion_error = now
+
+                        try:
+                            quest_loco_client.StopMove()
+                        except Exception:
+                            pass
+
+                        quest_locomotion_active = False
+                        quest_deadman_latched = False
+                        quest_neutral_since = None
+                        quest_permitted = False
+                        quest_reason = "command failure"
+                        quest_vx = quest_vy = quest_vyaw = 0.0
+
+                elif (
+                    not quest_permitted
+                    and quest_locomotion_active
+                ):
+                    LOG.warning(
+                        "Quest locomotion STOP: %s",
+                        quest_reason,
+                    )
+
+                    for _ in range(
+                        QUEST_LOCOMOTION_STOP_REPEATS
+                    ):
+                        try:
+                            quest_loco_client.StopMove()
+                        except Exception as exc:
+                            LOG.error(
+                                "Quest StopMove failed: %s",
+                                exc,
+                            )
+
+                    quest_locomotion_active = False
+
+            if now - last_quest_locomotion_status >= 0.25:
+                quest_age = quest_input["age_s"]
+                quest_age_text = (
+                    f"{float(quest_age) * 1000.0:.0f}ms"
+                    if quest_age is not None
+                    else "none"
+                )
+                quest_mode = (
+                    "LIVE"
+                    if args.enable_quest_locomotion
+                    else "DRY RUN"
+                )
+
+                LOG.info(
+                    "Quest locomotion %s | permit=%s latched=%s "
+                    "active=%s reason=%s age=%s deadman=%.2f | "
+                    "raw L=(%+.2f,%+.2f) R=(%+.2f,%+.2f) | "
+                    "target vx=%+.3f vy=%+.3f vyaw=%+.3f",
+                    quest_mode,
+                    quest_permitted,
+                    quest_deadman_latched,
+                    quest_locomotion_active,
+                    quest_reason,
+                    quest_age_text,
+                    float(quest_input["deadman"]),
+                    float(quest_left_raw[0]),
+                    float(quest_left_raw[1]),
+                    float(quest_right_raw[0]),
+                    float(quest_right_raw[1]),
+                    quest_vx,
+                    quest_vy,
+                    quest_vyaw,
+                )
+                last_quest_locomotion_status = now
 
             gate_instant = stop_gate_instant(metrics, args)
             if gate_instant:
@@ -6537,6 +6804,36 @@ def main() -> int:
             stop_listening()
         except Exception:
             pass
+
+        if (
+            quest_loco_client is not None
+            and quest_locomotion_active
+        ):
+            LOG.warning(
+                "Stopping active Quest locomotion during shutdown."
+            )
+
+            for _ in range(QUEST_LOCOMOTION_STOP_REPEATS):
+                try:
+                    quest_loco_client.StopMove()
+                except Exception as exc:
+                    LOG.error(
+                        "Shutdown StopMove failed: %s",
+                        exc,
+                    )
+
+            quest_locomotion_active = False
+
+        if quest_locomotion_ingress is not None:
+            try:
+                quest_locomotion_ingress.close()
+                LOG.info("Quest locomotion ingress stopped.")
+            except Exception as exc:
+                LOG.warning(
+                    "Quest locomotion ingress close failed: %s",
+                    exc,
+                )
+            quest_locomotion_ingress = None
 
         if unity_televuer_ingress is not None:
             try:

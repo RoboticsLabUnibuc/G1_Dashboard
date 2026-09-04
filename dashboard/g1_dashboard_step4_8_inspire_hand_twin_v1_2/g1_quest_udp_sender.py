@@ -230,8 +230,11 @@ class QuestUdpJpegSender:
                 and self._quest_yolo_requested
             )
 
-    def submit_views(self, frames: dict[str, np.ndarray]) -> None:
-        """Merge frames into independent latest-only view slots."""
+    def submit_views(
+        self,
+        frames: dict[str, np.ndarray | bytes],
+    ) -> None:
+        """Merge image arrays or encoded binary payloads into latest-only slots."""
         if not frames:
             return
 
@@ -267,12 +270,18 @@ class QuestUdpJpegSender:
                     ):
                         continue
 
-                    copied = np.array(
+                    if isinstance(
                         frame,
-                        dtype=np.uint8,
-                        copy=True,
-                        order="C",
-                    )
+                        (bytes, bytearray, memoryview),
+                    ):
+                        copied = bytes(frame)
+                    else:
+                        copied = np.array(
+                            frame,
+                            dtype=np.uint8,
+                            copy=True,
+                            order="C",
+                        )
 
                     if name in self._pending_frames:
                         self._replaced_frames += 1
@@ -439,24 +448,51 @@ class QuestUdpJpegSender:
         )
         self._next_stats_time = now + 5.0
 
-    def _send_frame(self, name: str, frame: np.ndarray, frame_id: int) -> None:
-        ok, encoded = cv2.imencode(
-            ".jpg", frame,
-            [int(cv2.IMWRITE_JPEG_QUALITY), self._jpeg_quality],
-        )
-        if not ok:
-            self._warn(f"OpenCV JPEG encoding failed for {name}")
-            return
-        jpeg = encoded.tobytes()
-        jpeg_size = len(jpeg)
-        if jpeg_size == 0 or jpeg_size > self._max_jpeg_bytes:
+    def _send_frame(
+        self,
+        name: str,
+        frame: np.ndarray | bytes,
+        frame_id: int,
+    ) -> None:
+        if (
+            name == "pointcloud"
+            and isinstance(
+                frame,
+                (bytes, bytearray, memoryview),
+            )
+        ):
+            encoded_bytes = bytes(frame)
+            payload_kind = "G1PC"
+        else:
+            ok, encoded = cv2.imencode(
+                ".jpg",
+                frame,
+                [
+                    int(cv2.IMWRITE_JPEG_QUALITY),
+                    self._jpeg_quality,
+                ],
+            )
+            if not ok:
+                self._warn(
+                    f"OpenCV JPEG encoding failed for {name}"
+                )
+                return
+            encoded_bytes = encoded.tobytes()
+            payload_kind = "JPEG"
+
+        encoded_size = len(encoded_bytes)
+        if (
+            encoded_size == 0
+            or encoded_size > self._max_jpeg_bytes
+        ):
             self._warn(
-                f"discarding {name} JPEG of {jpeg_size} bytes; "
+                f"discarding {name} {payload_kind} of "
+                f"{encoded_size} bytes; "
                 f"limit is {self._max_jpeg_bytes}"
             )
             return
         chunk_count = (
-            jpeg_size + self._payload_bytes - 1
+            encoded_size + self._payload_bytes - 1
         ) // self._payload_bytes
         if chunk_count > 0xFFFF:
             self._warn(f"{name} JPEG requires too many chunks: {chunk_count}")
@@ -465,12 +501,14 @@ class QuestUdpJpegSender:
         view_id = VIEW_IDS[name]
         for chunk_index in range(chunk_count):
             start = chunk_index * self._payload_bytes
-            payload = jpeg[start:start + self._payload_bytes]
+            payload = encoded_bytes[
+                start:start + self._payload_bytes
+            ]
             final_flag = 1 if chunk_index == chunk_count - 1 else 0
             flags = final_flag | (view_id << 1)
             header = _PACKET_HEADER.pack(
                 _PACKET_MAGIC, _PACKET_VERSION, flags, frame_id,
-                chunk_index, chunk_count, len(payload), jpeg_size,
+                chunk_index, chunk_count, len(payload), encoded_size,
             )
             try:
                 self._socket.sendto(header + payload, self._target)
@@ -478,7 +516,7 @@ class QuestUdpJpegSender:
                 self._warn(f"UDP send failed for {name}: {exc}")
                 return
         self._frames_sent[name] += 1
-        self._last_sizes[name] = (jpeg_size, chunk_count)
+        self._last_sizes[name] = (encoded_size, chunk_count)
 
     def _warn(self, message: str) -> None:
         now = time.monotonic()

@@ -489,17 +489,101 @@ def _look_at_basis(eye: np.ndarray, target: np.ndarray) -> tuple[np.ndarray, np.
     return right, up, forward
 
 
-def _publish_pointcloud_snapshot(camera, bgr: np.ndarray, depth_m: np.ndarray, valid: np.ndarray) -> None:
-    """Publish a latest-only compact XYZ+RGB packet for browser WebGL.
+def _build_pointcloud_packet(
+    camera,
+    bgr: np.ndarray,
+    depth_m: np.ndarray,
+    valid: np.ndarray,
+) -> bytes | None:
+    """Build one compact G1PC v1 XYZ/RGB payload."""
+    points, pixels = _sample_xyz(
+        camera,
+        depth_m,
+        valid,
+        POINTCLOUD_EXPORT_STEP,
+    )
+    if points.size == 0:
+        return None
 
-    Format G1PC v1, little endian:
-      32-byte header <4sHHIIdII>
-      N packed records <hhhBBB> (millimetres + RGB).
+    world = points.copy()
+    world[:, 1] *= -1.0
+    world[:, 2] *= -1.0
 
-    RealSense coordinates are converted to renderer coordinates (+X right,
-    +Y up, +Z forward). The browser owns orbit rendering, so viewpoint changes
-    no longer require a round-trip or H.264 frame regeneration.
-    """
+    finite = np.all(np.isfinite(world), axis=1)
+    world, pixels = world[finite], pixels[finite]
+    if world.size == 0:
+        return None
+
+    xyz_mm = np.rint(world * 1000.0)
+    in_range = np.all(
+        (xyz_mm >= -32768.0)
+        & (xyz_mm <= 32767.0),
+        axis=1,
+    )
+    xyz_mm, pixels = xyz_mm[in_range], pixels[in_range]
+    if xyz_mm.size == 0:
+        return None
+
+    xyz_mm = xyz_mm.astype(np.int16, copy=False)
+    colors_bgr = bgr[pixels[:, 1], pixels[:, 0]]
+    colors_rgb = colors_bgr[:, ::-1].astype(
+        np.uint8,
+        copy=False,
+    )
+
+    count = min(int(xyz_mm.shape[0]), 65535)
+    xyz_mm = xyz_mm[:count]
+    colors_rgb = colors_rgb[:count]
+
+    records = np.empty(
+        count,
+        dtype=np.dtype(
+            [
+                ("x", "<i2"),
+                ("y", "<i2"),
+                ("z", "<i2"),
+                ("r", "u1"),
+                ("g", "u1"),
+                ("b", "u1"),
+            ],
+            align=False,
+        ),
+    )
+    records["x"] = xyz_mm[:, 0]
+    records["y"] = xyz_mm[:, 1]
+    records["z"] = xyz_mm[:, 2]
+    records["r"] = colors_rgb[:, 0]
+    records["g"] = colors_rgb[:, 1]
+    records["b"] = colors_rgb[:, 2]
+
+    seq = (
+        int(getattr(camera, "_g1_pointcloud_seq", 0))
+        + 1
+    ) & 0xFFFFFFFF
+    camera._g1_pointcloud_seq = seq
+
+    header = struct.pack(
+        "<4sHHIIdII",
+        b"G1PC",
+        1,
+        9,
+        count,
+        seq,
+        time.time(),
+        1,
+        0,
+    )
+
+    return header + records.tobytes(order="C")
+
+
+def _publish_pointcloud_snapshot(
+    camera,
+    bgr: np.ndarray,
+    depth_m: np.ndarray,
+    valid: np.ndarray,
+) -> None:
+    """Publish a latest-only compact XYZ/RGB packet for browser WebGL."""
     now = time.monotonic()
     period = 1.0 / POINTCLOUD_EXPORT_HZ
     deadline = getattr(
@@ -524,55 +608,32 @@ def _publish_pointcloud_snapshot(camera, bgr: np.ndarray, depth_m: np.ndarray, v
 
     camera._g1_next_pointcloud_export = deadline
 
-    points, pixels = _sample_xyz(camera, depth_m, valid, POINTCLOUD_EXPORT_STEP)
-    if points.size == 0:
-        return
-    world = points.copy()
-    world[:, 1] *= -1.0  # RealSense +Y down -> WebGL +Y up.
-    world[:, 2] *= -1.0  # RealSense +Z forward -> Three.js conventional -Z forward.
-    finite = np.all(np.isfinite(world), axis=1)
-    world, pixels = world[finite], pixels[finite]
-    if world.size == 0:
-        return
-
-    xyz_mm = np.rint(world * 1000.0)
-    in_range = np.all((xyz_mm >= -32768.0) & (xyz_mm <= 32767.0), axis=1)
-    xyz_mm, pixels = xyz_mm[in_range], pixels[in_range]
-    if xyz_mm.size == 0:
-        return
-    xyz_mm = xyz_mm.astype(np.int16, copy=False)
-    colors_bgr = bgr[pixels[:, 1], pixels[:, 0]]
-    colors_rgb = colors_bgr[:, ::-1].astype(np.uint8, copy=False)
-
-    count = min(int(xyz_mm.shape[0]), 65535)
-    xyz_mm = xyz_mm[:count]
-    colors_rgb = colors_rgb[:count]
-    records = np.empty(
-        count,
-        dtype=np.dtype([
-            ("x", "<i2"), ("y", "<i2"), ("z", "<i2"),
-            ("r", "u1"), ("g", "u1"), ("b", "u1"),
-        ], align=False),
+    packet = _build_pointcloud_packet(
+        camera,
+        bgr,
+        depth_m,
+        valid,
     )
-    records["x"], records["y"], records["z"] = xyz_mm[:, 0], xyz_mm[:, 1], xyz_mm[:, 2]
-    records["r"], records["g"], records["b"] = colors_rgb[:, 0], colors_rgb[:, 1], colors_rgb[:, 2]
+    if packet is None:
+        return
 
-    seq = (int(getattr(camera, "_g1_pointcloud_seq", 0)) + 1) & 0xFFFFFFFF
-    camera._g1_pointcloud_seq = seq
-    header = struct.pack(
-        "<4sHHIIdII",
-        b"G1PC", 1, 9, count, seq, time.time(), 1, 0,
-    )
     try:
-        POINTCLOUD_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = POINTCLOUD_FILE.with_suffix(POINTCLOUD_FILE.suffix + ".tmp")
-        with open(tmp, "wb") as f:
-            f.write(header)
-            f.write(records.tobytes(order="C"))
+        POINTCLOUD_FILE.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+        tmp = POINTCLOUD_FILE.with_suffix(
+            POINTCLOUD_FILE.suffix + ".tmp"
+        )
+        with open(tmp, "wb") as file_handle:
+            file_handle.write(packet)
         os.chmod(tmp, 0o600)
         tmp.replace(POINTCLOUD_FILE)
     except Exception as exc:
-        image_server.logger_mp.debug(f"[G1 camera modes] point-cloud snapshot write failed: {exc}")
+        image_server.logger_mp.debug(
+            "[G1 camera modes] point-cloud "
+            f"snapshot write failed: {exc}"
+        )
 
 
 def _pointcloud_view(
@@ -1046,6 +1107,24 @@ class _LatestDerivedFrameWorker:
         frame_cache = {
             "yolo_detections": detections,
         }
+
+        if self._pointcloud_only:
+            products = _depth_products(
+                depth_z16,
+                depth_scale,
+            )
+            _heat, depth_m, valid = products
+            packet = _build_pointcloud_packet(
+                self._camera,
+                bgr,
+                depth_m,
+                valid,
+            )
+            if packet is not None:
+                self._quest_sender.submit_views({
+                    "pointcloud": packet,
+                })
+            return
 
         if export_pointcloud:
             products = _depth_products(

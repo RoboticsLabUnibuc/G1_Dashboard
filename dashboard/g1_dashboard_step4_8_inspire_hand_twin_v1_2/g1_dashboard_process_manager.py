@@ -31,8 +31,8 @@ CONTROLLER_BASENAME = (
     "dashboard_telemetry_v1_8.py"
 )
 MANAGER_SCHEMA = "g1_dashboard.controller_process.v1"
-MANAGER_VERSION = "g1_dashboard_process_manager.v1.8.0-camera-multiview"
-CONTROLLER_SHA256 = "6a2ac6c3ec7851082caa4f7c40081bbf66935392f15733ad3c8239410a5c2ac7"
+MANAGER_VERSION = "g1_dashboard_process_manager.v1.9.0-quest-locomotion"
+CONTROLLER_SHA256 = "d72adcff0870a790617caf3560fcc1430f9cc25626db764859fbc29e93d12638"
 
 ACTION_REQUEST_SCHEMA = "g1_dashboard.action_request.v1"
 ACTION_RESPONSE_SCHEMA = "g1_dashboard.action_response.v1"
@@ -95,6 +95,7 @@ PARAMETER_SPECS: list[dict[str, Any]] = [
     {"name":"finger_reacquire_stable_frames","flag":"--finger-reacquire-stable-frames","label":"Finger reacquire stable","section":"Hands","type":"int","default":6,"min":1,"max":20,"step":1,"unit":"frames"},
     {"name":"finger_state_stale_s","flag":"--finger-state-stale-s","label":"Finger state stale","section":"Hands","type":"float","default":0.50,"min":0.10,"max":2.00,"step":0.05,"unit":"s"},
 
+    {"name":"enable_quest_locomotion","flag":"--enable-quest-locomotion","label":"Enable Quest locomotion","section":"Behavior","type":"bool","default":False},
     {"name":"allow_locomotion_during_xr","flag":"--allow-locomotion-during-xr","label":"Allow locomotion during XR","section":"Behavior","type":"bool","default":True},
 ]
 
