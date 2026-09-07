@@ -31,8 +31,8 @@ CONTROLLER_BASENAME = (
     "dashboard_telemetry_v1_8.py"
 )
 MANAGER_SCHEMA = "g1_dashboard.controller_process.v1"
-MANAGER_VERSION = "g1_dashboard_process_manager.v1.9.0-quest-locomotion"
-CONTROLLER_SHA256 = "d72adcff0870a790617caf3560fcc1430f9cc25626db764859fbc29e93d12638"
+MANAGER_VERSION = "g1_dashboard_process_manager.v1.9.2-tracking-reentry-defaults"
+CONTROLLER_SHA256 = "86af5c1be94e2b96d294b376f7070a5c152c889dd1e50f6f556b99fc495ab2e8"
 
 ACTION_REQUEST_SCHEMA = "g1_dashboard.action_request.v1"
 ACTION_RESPONSE_SCHEMA = "g1_dashboard.action_response.v1"
@@ -74,28 +74,28 @@ PARAMETER_SPECS: list[dict[str, Any]] = [
     {"name":"frequency","flag":"--frequency","label":"Control rate","section":"Runtime","type":"float","default":30.0,"min":10.0,"max":60.0,"step":1.0,"unit":"Hz"},
     {"name":"status_hz","flag":"--status-hz","label":"Status rate","section":"Runtime","type":"float","default":4.0,"min":1.0,"max":10.0,"step":1.0,"unit":"Hz"},
 
-    {"name":"max_wrist_speed","flag":"--max-wrist-speed","label":"Max wrist speed","section":"Arms","type":"float","default":0.18,"min":0.05,"max":0.30,"step":0.01,"unit":"m/s"},
-    {"name":"max_wrist_rotation_speed_deg","flag":"--max-wrist-rotation-speed-deg","label":"Max wrist rotation","section":"Arms","type":"float","default":90.0,"min":30.0,"max":180.0,"step":5.0,"unit":"deg/s"},
-    {"name":"joint_target_speed_rps","flag":"--joint-target-speed-rps","label":"Joint target speed","section":"Arms","type":"float","default":3.0,"min":0.5,"max":5.0,"step":0.1,"unit":"rad/s"},
-    {"name":"max_ik_target_jump_rad","flag":"--max-ik-target-jump-rad","label":"Max IK target jump","section":"Arms","type":"float","default":0.25,"min":0.05,"max":0.50,"step":0.01,"unit":"rad"},
+    {"name":"max_wrist_speed","flag":"--max-wrist-speed","label":"Max wrist speed","section":"Arms","type":"float","default":0.30,"min":0.02,"max":0.50,"step":0.01,"unit":"m/s"},
+    {"name":"max_wrist_rotation_speed_deg","flag":"--max-wrist-rotation-speed-deg","label":"Max wrist rotation","section":"Arms","type":"float","default":170.0,"min":10.0,"max":300.0,"step":5.0,"unit":"deg/s"},
+    {"name":"joint_target_speed_rps","flag":"--joint-target-speed-rps","label":"Joint target speed","section":"Arms","type":"float","default":4.5,"min":0.25,"max":8.0,"step":0.1,"unit":"rad/s"},
+    {"name":"max_ik_target_jump_rad","flag":"--max-ik-target-jump-rad","label":"Max IK target jump","section":"Arms","type":"float","default":0.30,"min":0.05,"max":0.50,"step":0.01,"unit":"rad"},
     {"name":"bimanual_inward_offset_m","flag":"--bimanual-inward-offset-m","label":"Bimanual inward offset","section":"Arms","type":"float","default":0.00,"min":0.00,"max":0.05,"step":0.005,"unit":"m"},
 
-    {"name":"tracking_fault_frames","flag":"--tracking-fault-frames","label":"Tracking fault frames","section":"Tracking","type":"int","default":3,"min":1,"max":10,"step":1,"unit":"frames"},
-    {"name":"tracking_resume_position_m","flag":"--tracking-resume-position-m","label":"Resume position tolerance","section":"Tracking","type":"float","default":0.07,"min":0.02,"max":0.15,"step":0.005,"unit":"m"},
-    {"name":"tracking_resume_rotation_deg","flag":"--tracking-resume-rotation-deg","label":"Resume rotation tolerance","section":"Tracking","type":"float","default":25.0,"min":5.0,"max":60.0,"step":1.0,"unit":"deg"},
-    {"name":"tracking_resume_stable_frames","flag":"--tracking-resume-stable-frames","label":"Resume stable frames","section":"Tracking","type":"int","default":8,"min":1,"max":30,"step":1,"unit":"frames"},
+    {"name":"tracking_fault_frames","flag":"--tracking-fault-frames","label":"Tracking fault frames","section":"Tracking","type":"int","default":8,"min":1,"max":10,"step":1,"unit":"frames"},
+    {"name":"tracking_resume_position_m","flag":"--tracking-resume-position-m","label":"Resume position tolerance","section":"Tracking","type":"float","default":0.13,"min":0.02,"max":0.15,"step":0.005,"unit":"m"},
+    {"name":"tracking_resume_rotation_deg","flag":"--tracking-resume-rotation-deg","label":"Resume rotation tolerance","section":"Tracking","type":"float","default":50.0,"min":5.0,"max":60.0,"step":1.0,"unit":"deg"},
+    {"name":"tracking_resume_stable_frames","flag":"--tracking-resume-stable-frames","label":"Resume stable frames","section":"Tracking","type":"int","default":4,"min":1,"max":30,"step":1,"unit":"frames"},
 
     {"name":"finger_frequency","flag":"--finger-frequency","label":"Finger command rate","section":"Hands","type":"float","default":90.0,"min":30.0,"max":150.0,"step":5.0,"unit":"Hz"},
-    {"name":"finger_command_speed_per_s","flag":"--finger-command-speed-per-s","label":"Finger command speed","section":"Hands","type":"float","default":1.00,"min":0.20,"max":2.00,"step":0.05,"unit":"norm/s"},
-    {"name":"finger_minimum_command","flag":"--finger-minimum-command","label":"Minimum finger command","section":"Hands","type":"float","default":0.10,"min":0.00,"max":0.40,"step":0.01,"unit":"norm"},
-    {"name":"finger_stable_tracking_frames","flag":"--finger-stable-tracking-frames","label":"Finger stable tracking","section":"Hands","type":"int","default":15,"min":3,"max":40,"step":1,"unit":"frames"},
-    {"name":"finger_tracking_fault_frames","flag":"--finger-tracking-fault-frames","label":"Finger fault frames","section":"Hands","type":"int","default":3,"min":1,"max":10,"step":1,"unit":"frames"},
+    {"name":"finger_command_speed_per_s","flag":"--finger-command-speed-per-s","label":"Finger command speed","section":"Hands","type":"float","default":1.00,"min":0.05,"max":3.00,"step":0.05,"unit":"norm/s"},
+    {"name":"finger_minimum_command","flag":"--finger-minimum-command","label":"Minimum finger command","section":"Hands","type":"float","default":0.00,"min":0.00,"max":0.40,"step":0.01,"unit":"norm"},
+    {"name":"finger_stable_tracking_frames","flag":"--finger-stable-tracking-frames","label":"Finger stable tracking","section":"Hands","type":"int","default":4,"min":3,"max":40,"step":1,"unit":"frames"},
+    {"name":"finger_tracking_fault_frames","flag":"--finger-tracking-fault-frames","label":"Finger fault frames","section":"Hands","type":"int","default":8,"min":1,"max":10,"step":1,"unit":"frames"},
     {"name":"finger_tracking_stale_s","flag":"--finger-tracking-stale-s","label":"Finger tracking stale","section":"Hands","type":"float","default":0.25,"min":0.10,"max":1.00,"step":0.05,"unit":"s"},
     {"name":"finger_reacquire_command_tolerance","flag":"--finger-reacquire-command-tolerance","label":"Finger reacquire tolerance","section":"Hands","type":"float","default":0.18,"min":0.05,"max":0.50,"step":0.01,"unit":"norm"},
-    {"name":"finger_reacquire_stable_frames","flag":"--finger-reacquire-stable-frames","label":"Finger reacquire stable","section":"Hands","type":"int","default":6,"min":1,"max":20,"step":1,"unit":"frames"},
+    {"name":"finger_reacquire_stable_frames","flag":"--finger-reacquire-stable-frames","label":"Finger reacquire stable","section":"Hands","type":"int","default":4,"min":1,"max":20,"step":1,"unit":"frames"},
     {"name":"finger_state_stale_s","flag":"--finger-state-stale-s","label":"Finger state stale","section":"Hands","type":"float","default":0.50,"min":0.10,"max":2.00,"step":0.05,"unit":"s"},
 
-    {"name":"enable_quest_locomotion","flag":"--enable-quest-locomotion","label":"Enable Quest locomotion","section":"Behavior","type":"bool","default":False},
+    {"name":"enable_quest_locomotion","flag":"--enable-quest-locomotion","label":"Enable Quest locomotion","section":"Behavior","type":"bool","default":True},
     {"name":"allow_locomotion_during_xr","flag":"--allow-locomotion-during-xr","label":"Allow locomotion during XR","section":"Behavior","type":"bool","default":True},
 ]
 

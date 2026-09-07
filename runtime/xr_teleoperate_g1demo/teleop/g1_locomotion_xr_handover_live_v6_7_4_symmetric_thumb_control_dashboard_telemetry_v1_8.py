@@ -5543,6 +5543,100 @@ def main() -> int:
                             state.name,
                         )
 
+            # Quest mode requests use the same HMAC key and source-IP
+            # allowlist as Quest locomotion. They are consumed only here in
+            # the main controller loop and pass through the exact same
+            # state/readiness policy as dashboard requests and keyboard c.
+            if quest_locomotion_ingress is not None:
+                for quest_action in quest_locomotion_ingress.pending_actions():
+                    operation = str(
+                        quest_action.get("operation", "")
+                    )
+                    action_sequence = int(
+                        quest_action.get("sequence", 0)
+                    )
+                    action_age = now - float(
+                        quest_action.get(
+                            "received_monotonic",
+                            now,
+                        )
+                    )
+
+                    readiness = evaluate_dashboard_action_readiness(
+                        state=state,
+                        xr_valid=xr_valid,
+                        xr_reason=xr_reason,
+                        lowstate=lowstate,
+                        lowstate_age=lowstate_age,
+                        gate_instant=gate_instant,
+                        gate_ready=gate_ready,
+                        gate_elapsed=gate_elapsed,
+                        safety_fault_reason=safety_fault_reason,
+                        tracking_hold_reason=tracking_hold_reason,
+                        shutdown_after_release=shutdown_after_release,
+                        args=args,
+                        request_channel_enabled=True,
+                    )
+
+                    handover = readiness.get(
+                        "xr_handover",
+                        {},
+                    )
+                    expected_operation = str(
+                        handover.get("operation", "NONE")
+                    )
+                    available = bool(
+                        handover.get("available", False)
+                    )
+                    reason = str(
+                        handover.get(
+                            "reason",
+                            "Action unavailable.",
+                        )
+                    )
+
+                    rejection: Optional[str] = None
+
+                    if action_age > 0.50:
+                        rejection = (
+                            "request expired before execution"
+                        )
+                    elif TOGGLE_REQUESTED:
+                        rejection = (
+                            "another controller toggle request "
+                            "is already pending"
+                        )
+                    elif not available:
+                        rejection = reason
+                    elif operation != expected_operation:
+                        rejection = (
+                            "state changed before request execution; "
+                            f"expected {expected_operation}, "
+                            f"received {operation}"
+                        )
+
+                    if rejection is not None:
+                        LOG.warning(
+                            "Quest action rejected: %s sequence=%d "
+                            "state=%s reason=%s.",
+                            operation,
+                            action_sequence,
+                            state.name,
+                            rejection,
+                        )
+                    else:
+                        # Same internal request as dashboard action and
+                        # keyboard c. No network thread mutates robot state.
+                        TOGGLE_REQUESTED = True
+
+                        LOG.warning(
+                            "Quest action accepted: %s sequence=%d "
+                            "state=%s.",
+                            operation,
+                            action_sequence,
+                            state.name,
+                        )
+
             # A normal q/Ctrl+C requests the same controlled handback as c.
             if QUIT_REQUESTED:
                 QUIT_REQUESTED = False
@@ -6209,6 +6303,7 @@ def main() -> int:
                             tracking_hold_stable_count = 0
                             tracking_hold_position_error = 0.0
                             tracking_hold_rotation_error = 0.0
+                            tracking_hold_reason = ""
 
                             # V6.7: preserve the pre-hold IK smoothing queue.
                             # The arm target remained frozen throughout the hold,
@@ -6398,6 +6493,28 @@ def main() -> int:
                     state_started = now
                     graceful_release_completed = True
 
+                    # A completed handback ends the previous XR tracking
+                    # session. Do not let a stale pair-hold latch block the
+                    # next deliberate alignment/engagement attempt.
+                    tracking_fault_count = 0
+                    tracking_hold_reason = ""
+                    tracking_hold_stable_count = 0
+                    tracking_hold_position_error = math.inf
+                    tracking_hold_rotation_error = math.inf
+                    state_data["tracking_hold_resume_state"] = (
+                        State.XR_ACTIVE
+                    )
+                    state_data["tracking_hold_left"] = None
+                    state_data["tracking_hold_right"] = None
+                    state_data["finger_resume_pending"] = False
+                    xr_state = XrCommandState()
+                    last_guard_state = False
+
+                    LOG.info(
+                        "Cleared XR tracking-hold session state after "
+                        "ownership reached zero."
+                    )
+
                     LOG.warning(
                         "STATE LOCOMOTION_READY. Arm ownership=0. "
                         "The R3 operator may move normally."
@@ -6462,7 +6579,11 @@ def main() -> int:
                     safety_fault_reason=safety_fault_reason,
                     shutdown_after_release=shutdown_after_release,
                     dashboard_action_channel_enabled=bool(
-                        dashboard_actions is not None and dashboard_actions.enabled
+                        (
+                            dashboard_actions is not None
+                            and dashboard_actions.enabled
+                        )
+                        or quest_locomotion_ingress is not None
                     ),
                     args=args,
                 )

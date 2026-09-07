@@ -7,6 +7,7 @@ import hmac
 import json
 import math
 import os
+import queue
 import socket
 import struct
 import threading
@@ -21,6 +22,16 @@ VERSION = 1
 BODY = struct.Struct("<4sHHQQQ5f")
 HMAC_BYTES = 32
 PACKET_BYTES = BODY.size + HMAC_BYTES
+
+ACTION_MAGIC = b"G1A1"
+ACTION_VERSION = 1
+ACTION_BODY = struct.Struct("<4sHHQQQ")
+ACTION_PACKET_BYTES = ACTION_BODY.size + HMAC_BYTES
+ACTION_OPERATIONS = {
+    1: "REQUEST_XR",
+    2: "CANCEL_XR_REQUEST",
+    3: "HAND_BACK_ARMS",
+}
 
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 5059
@@ -74,6 +85,15 @@ class QuestLocomotionIngress:
         self._packet_count = 0
         self._invalid_count = 0
         self._last_error: str | None = None
+
+        self._action_session = 0
+        self._action_sequence = 0
+        self._action_received_at = 0.0
+        self._action_packet_count = 0
+        self._action_duplicate_count = 0
+        self._action_queue: queue.Queue[dict[str, Any]] = (
+            queue.Queue(maxsize=16)
+        )
 
     @classmethod
     def from_environment(
@@ -237,6 +257,22 @@ class QuestLocomotionIngress:
                 "last_error": self._last_error,
             }
 
+    def pending_actions(
+        self,
+        max_items: int = 4,
+    ) -> list[dict[str, Any]]:
+        actions: list[dict[str, Any]] = []
+
+        for _ in range(max(1, int(max_items))):
+            try:
+                actions.append(
+                    self._action_queue.get_nowait()
+                )
+            except queue.Empty:
+                break
+
+        return actions
+
     def _receive_loop(self) -> None:
         while not self._stop.is_set():
             receiver = self._socket
@@ -254,10 +290,21 @@ class QuestLocomotionIngress:
                 continue
 
             try:
-                self._accept_packet(
-                    packet,
-                    str(address[0]),
-                )
+                source_ip = str(address[0])
+
+                if (
+                    len(packet) == ACTION_PACKET_BYTES
+                    and packet[:4] == ACTION_MAGIC
+                ):
+                    self._accept_action_packet(
+                        packet,
+                        source_ip,
+                    )
+                else:
+                    self._accept_packet(
+                        packet,
+                        source_ip,
+                    )
             except Exception as exception:
                 with self._lock:
                     self._invalid_count += 1
@@ -399,6 +446,126 @@ class QuestLocomotionIngress:
 
             self._source_ip = source_ip
             self._packet_count += 1
+            self._last_error = None
+
+    def _accept_action_packet(
+        self,
+        packet: bytes,
+        source_ip: str,
+    ) -> None:
+        if (
+            self._allowed_ip
+            and source_ip != self._allowed_ip
+        ):
+            raise ValueError(
+                f"source IP {source_ip} is not allowed"
+            )
+
+        if len(packet) != ACTION_PACKET_BYTES:
+            raise ValueError(
+                f"action packet size {len(packet)} != "
+                f"{ACTION_PACKET_BYTES}"
+            )
+
+        body = packet[:ACTION_BODY.size]
+        received_mac = packet[ACTION_BODY.size:]
+
+        expected_mac = hmac.new(
+            self._key,
+            body,
+            hashlib.sha256,
+        ).digest()
+
+        if not hmac.compare_digest(
+            expected_mac,
+            received_mac,
+        ):
+            raise ValueError(
+                "action packet HMAC is invalid"
+            )
+
+        (
+            magic,
+            version,
+            operation_code,
+            session,
+            sequence,
+            client_ns,
+        ) = ACTION_BODY.unpack(body)
+
+        if magic != ACTION_MAGIC:
+            raise ValueError("invalid action magic")
+
+        if version != ACTION_VERSION:
+            raise ValueError(
+                f"unsupported action version {version}"
+            )
+
+        operation = ACTION_OPERATIONS.get(
+            int(operation_code)
+        )
+
+        if operation is None:
+            raise ValueError(
+                f"unsupported action operation {operation_code}"
+            )
+
+        if (
+            session <= 0
+            or sequence <= 0
+            or client_ns <= 0
+        ):
+            raise ValueError(
+                "invalid action session, sequence, or timestamp"
+            )
+
+        now = time.monotonic()
+
+        with self._lock:
+            if session != self._action_session:
+                previous_fresh = (
+                    self._action_received_at > 0.0
+                    and now - self._action_received_at <= 0.50
+                )
+
+                if previous_fresh:
+                    raise ValueError(
+                        "another action sender session is active"
+                    )
+
+                self._action_session = session
+                self._action_sequence = 0
+
+            if sequence < self._action_sequence:
+                raise ValueError(
+                    "action sequence moved backwards"
+                )
+
+            # The Quest repeats each action packet three times.
+            # Only its first copy may enter the controller queue.
+            if sequence == self._action_sequence:
+                self._action_duplicate_count += 1
+                return
+
+            request = {
+                "operation": operation,
+                "session": int(session),
+                "sequence": int(sequence),
+                "source_ip": source_ip,
+                "received_monotonic": now,
+            }
+
+            try:
+                self._action_queue.put_nowait(request)
+            except queue.Full as exception:
+                raise ValueError(
+                    "Quest action queue is full"
+                ) from exception
+
+            self._action_sequence = sequence
+            self._action_received_at = now
+            self._action_packet_count += 1
+            self._source_ip = source_ip
             self._last_error = None
 
     def _clear_control(self) -> None:

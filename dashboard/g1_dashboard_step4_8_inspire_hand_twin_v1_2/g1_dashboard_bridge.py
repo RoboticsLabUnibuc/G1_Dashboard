@@ -412,6 +412,11 @@ def unity_telemetry_snapshot(
                 )
             ),
         },
+        "actions": nested(
+            telemetry,
+            "actions",
+            default={},
+        ),
         "motion": {
             "base_speed_mps": base_speed,
             "yaw_rate_rps": yaw_rate,
